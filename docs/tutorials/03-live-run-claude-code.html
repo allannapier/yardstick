@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Measuring a live Claude Code session · yardstick</title>
+  <meta name="description" content="Point a real Claude Code session at the yardstick proxy, understand how attribution works, drive a task through it, and clean up afterward." />
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="../index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sidebar-nav">
+      Menu
+    </button>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav" id="sidebar-nav" aria-label="Tutorials">
+        <p class="sidebar-title">yardstick docs</p>
+        <ul>
+          <li><a class="home-link" href="../index.html">Home</a></li>
+        </ul>
+        <p class="sidebar-title">Tutorials</p>
+        <ul>
+          <li><a href="../tutorials/01-install-first-run.html">1. Install and your first run</a></li>
+          <li><a href="../tutorials/02-experiment-yaml.html">2. Designing an experiment</a></li>
+          <li><a href="../tutorials/03-live-run-claude-code.html">3. Measuring a live Claude Code session</a></li>
+          <li><a href="../tutorials/04-compare-and-report.html">4. Comparing arms and reporting</a></li>
+          <li><a href="../tutorials/05-dashboard.html">5. Using the dashboard</a></li>
+          <li><a href="../tutorials/06-metrics-reference.html">6. Metrics reference</a></li>
+          <li><a href="../tutorials/07-troubleshooting.html">7. Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="content">
+
+        <h1>Measuring a live Claude Code session</h1>
+        <p class="lede">
+          This is the tutorial that spends real API budget: pointing an
+          actual Claude Code session at the yardstick proxy, driving a task
+          through it, and getting back real cost/token/turn numbers instead
+          of the all-zero smoke test from tutorial 1.
+        </p>
+
+        <div class="note">
+          <p>
+            This walkthrough uses <code>experiments/interactive-sonnet.yaml</code>,
+            which routes traffic to the real <code>claude-sonnet-5</code>
+            model (see <a href="../tutorials/02-experiment-yaml.html">tutorial 2</a>
+            for a full field-by-field read of that file). Make sure the
+            proxy is up first -- <code>ys proxy up --exp experiments/interactive-sonnet.yaml</code>,
+            with <code>LITELLM_MASTER_KEY</code> exported, exactly as in
+            tutorial 1.
+          </p>
+        </div>
+
+        <h2>Point Claude Code at the proxy</h2>
+        <p>
+          <code>ys harness point</code> rewrites the config file of a
+          supported agent so it talks to the local proxy instead of the real
+          API. Two agents are supported today, <code>claude-code</code> and
+          <code>opencode</code>; this tutorial uses <code>claude-code</code>.
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>export LITELLM_MASTER_KEY=sk-ys-demo-1234
+ys harness point claude-code</code></pre>
+        </div>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">output</span>
+          </div>
+          <pre data-lang="output"><code>claude-code: pointed at http://localhost:4000 (/home/you/.claude/settings.json)</code></pre>
+        </div>
+        <p>
+          For <code>claude-code</code>, the file it rewrites is
+          <code>~/.claude/settings.json</code>. It deep-sets two keys inside
+          it -- <code>env.ANTHROPIC_BASE_URL</code> to
+          <code>http://localhost:&lt;port&gt;</code>, and
+          <code>env.ANTHROPIC_API_KEY</code> to the key you pass it -- while
+          leaving every other key in the file untouched (it loads the file as
+          strict JSON, sets just those two paths, and writes the whole object
+          back).
+        </p>
+        <div class="warn">
+          <p>
+            <code>LITELLM_MASTER_KEY</code> must be exported in the shell you
+            run <code>ys harness point</code> from. If it isn't set, the
+            command prints
+            "<code>LITELLM_MASTER_KEY is not set -- export the same key you
+            started `ys proxy up` with.</code>" and exits with status 1 --
+            it never writes to your config in that case.
+          </p>
+        </div>
+
+        <h3>The backup, and why it only happens once</h3>
+        <p>
+          The very first time <code>ys harness point</code> touches a given
+          agent's config, it snapshots the file's exact original bytes (or
+          the fact that the file didn't exist at all) into a manifest at
+          <code>&lt;YARDSTICK_HOME&gt;/harness_backups/&lt;agent&gt;.json</code>
+          before writing anything. Every later call to <code>point</code> --
+          even with a different port or key -- leaves that manifest alone;
+          only <code>ys harness reset</code> reads from it. That's
+          deliberate: repeated point/reset cycles can't drift what "the
+          original config" means away from what was really there before
+          yardstick touched anything.
+        </p>
+
+        <h2>Check what's pointed</h2>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys harness status claude-code</code></pre>
+        </div>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">output</span>
+          </div>
+          <pre data-lang="output"><code>claude-code: pointed at proxy  (backup available)  -- /home/you/.claude/settings.json</code></pre>
+        </div>
+        <p>
+          Run it with no argument (or <code>ys harness status all</code>) to
+          check every supported agent at once.
+        </p>
+
+        <h2>Attribution: how a request gets tied to a run</h2>
+        <p>
+          Once the proxy is serving traffic, yardstick still needs to know
+          <em>which run</em> each request belongs to. <code>ys start</code>
+          prints an <code>x-ys-run: &lt;run_id&gt;</code> header for exactly
+          this purpose -- when a harness supports sending custom headers on
+          its API requests, this is the precise attribution mechanism.
+        </p>
+        <p>
+          Claude Code, though, doesn't give you a way to set an arbitrary
+          header on its outgoing requests. So when that header isn't
+          present, yardstick falls back to attributing every incoming
+          request to whatever run is currently marked active in
+          <code>&lt;YARDSTICK_HOME&gt;/active.json</code> -- the same file
+          <code>ys start</code> writes and <code>ys status</code> reads.
+        </p>
+        <div class="warn">
+          <p>
+            This fallback is correct <strong>only as long as exactly one run
+            is active at a time.</strong> If you (or a script) start a second
+            run while a Claude Code session from a first run is still
+            producing traffic, every request from either session with no
+            <code>x-ys-run</code> header gets attributed to whichever run is
+            currently active in the state file -- silently mixing the two
+            runs' requests together. Don't start a new run until you've
+            ended the previous one.
+          </p>
+        </div>
+
+        <h2>Export the proxy environment and start the run</h2>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys start --exp experiments/interactive-sonnet.yaml --arm arm-sonnet</code></pre>
+        </div>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">output</span>
+          </div>
+          <pre data-lang="output"><code>run 7f3e9a02  exp=interactive-sonnet-01  arm=arm-sonnet  repeat=1
+
+point your harness at the proxy:
+
+  export ANTHROPIC_BASE_URL=http://localhost:4000
+  export ANTHROPIC_API_KEY=sk-ys-demo-1234
+
+optional request header:  x-ys-run: 7f3e9a02
+the header is the precise way to attribute traffic, but harnesses like Claude Code may not let you set arbitrary headers. Without it, requests are attributed via the active-run file this command just wrote, which is correct as long as only one run is active at a time.
+
+when the task is finished, run `ys end`</code></pre>
+        </div>
+        <p>
+          Since Claude Code was already pointed at the proxy by
+          <code>ys harness point</code> (which wrote
+          <code>ANTHROPIC_BASE_URL</code>/<code>ANTHROPIC_API_KEY</code>
+          straight into <code>~/.claude/settings.json</code>), you don't
+          strictly need to re-export those two lines yourself for Claude Code
+          specifically -- they're printed because <code>ys start</code>
+          doesn't know which harness you're using, and for a harness that
+          reads its API config from the environment rather than a settings
+          file, exporting them is exactly what you'd do next.
+        </p>
+
+        <h2>Drive the agent through the task</h2>
+        <p>
+          With the proxy up, Claude Code pointed at it, and a run active,
+          open Claude Code and work the task normally -- every request it
+          sends now flows through the proxy and gets logged against this run
+          id (via the active-run fallback described above, since Claude Code
+          can't set the <code>x-ys-run</code> header itself).
+        </p>
+
+        <h2>End the run</h2>
+        <p>
+          <code>interactive-sonnet.yaml</code>'s <code>success_check</code>
+          is just <code>"true"</code> -- a placeholder, not a meaningful
+          automated check for whatever real task you actually gave the
+          agent. For a task like this, score it by hand with
+          <code>--manual-score</code> instead of trusting the check:
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys end --manual-score 1</code></pre>
+        </div>
+        <p>
+          A <code>--manual-score</code> greater than 0 records the run as a
+          success; otherwise it's recorded as a failure. If you omit
+          <code>--manual-score</code>, <code>ys end</code> runs
+          <code>task.success_check</code> as a shell command and gates on its
+          exit code instead -- fine for <code>example.yaml</code>'s smoke
+          test, not meaningful here since the check is just <code>true</code>.
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">output</span>
+          </div>
+          <pre data-lang="output"><code>run 7f3e9a02  exp=interactive-sonnet-01  arm=arm-sonnet
+result: SUCCESS   wall clock: 612.4s
+  turns: 14
+  billable_tokens: 48210
+  cost_usd: 0.3821
+  cache_read_ratio: 0.71
+  context_high_water: 9840
+  tool_calls: 22
+  tool_error_rate: 0.045
+  redundant_tool_calls: 3
+  compaction_events: 0
+  active_s: 58.2</code></pre>
+        </div>
+        <div class="note">
+          <p>
+            The numbers above are illustrative only -- your actual
+            <code>turns</code>, <code>cost_usd</code>, and other metrics
+            depend entirely on the task you gave the agent and how long the
+            session ran. Unlike tutorial 1's mock run, these come from real
+            requests logged by the proxy's collector.
+          </p>
+        </div>
+
+        <h2>Clean up: reset the harness</h2>
+        <div class="warn">
+          <p>
+            Do not skip this step. As long as Claude Code's config still
+            points at <code>http://localhost:4000</code>, every Claude Code
+            session on this machine -- including ones with no yardstick run
+            active -- keeps routing through the proxy, and fails outright
+            once you run <code>ys proxy down</code>. Restore the real config
+            before you're done for the session:
+          </p>
+        </div>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys harness reset claude-code</code></pre>
+        </div>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">output</span>
+          </div>
+          <pre data-lang="output"><code>claude-code: restored (/home/you/.claude/settings.json)</code></pre>
+        </div>
+        <p>
+          <code>reset</code> always restores from the original snapshot taken
+          the first time <code>point</code> ran for this agent -- never from
+          whatever <code>point</code> last wrote -- so it puts back exactly
+          what was there before yardstick touched anything (including
+          deleting the file entirely, if it didn't exist before). If no
+          backup manifest exists yet -- because <code>point</code> was never
+          run for this agent, or the backup directory was cleared --
+          <code>reset</code> raises rather than guessing:
+          "<code>no backup found for 'claude-code' -- `ys harness point` was
+          never run for it (or the backup dir was cleared), so there's
+          nothing to restore.</code>"
+        </p>
+
+        <h2>Overriding a stale active run</h2>
+        <p>
+          If a previous session ended without running <code>ys end</code>
+          (a crash, a forgotten cleanup step), the active-run state file is
+          still sitting there, and a plain <code>ys start</code> refuses:
+          "<code>run &lt;id&gt; (exp=..., arm=...) is already active. Use
+          --force to override, or `ys end` it first.</code>" Check
+          <code>ys status</code> to see what's active, and either finish it
+          properly with <code>ys end</code>, or discard it and claim the slot
+          anyway with:
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys start --exp experiments/interactive-sonnet.yaml --arm arm-sonnet --force</code></pre>
+        </div>
+        <p>
+          Bear in mind that overriding a stale run this way doesn't retroactively
+          close out the old run's row in the database -- it was already
+          left without an <code>ended_at</code>. <code>--force</code> only
+          overrides the active-run <em>slot</em> so a new run can claim it.
+        </p>
+
+        <nav class="pager" aria-label="Page navigation">
+          <a class="pager-prev" href="../tutorials/02-experiment-yaml.html">
+            <span class="pager-dir">Previous</span>
+            <span>Designing an experiment</span>
+          </a>
+          <a class="pager-next" href="../tutorials/04-compare-and-report.html">
+            <span class="pager-dir">Next</span>
+            <span>Comparing arms and reporting</span>
+          </a>
+        </nav>
+      </div>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>

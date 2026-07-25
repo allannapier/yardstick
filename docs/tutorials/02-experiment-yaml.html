@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Designing an experiment · yardstick</title>
+  <meta name="description" content="A field-by-field reference for the experiment YAML schema, plus the two validation rules that will actually stop you, and how to design a good comparison." />
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="../index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sidebar-nav">
+      Menu
+    </button>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav" id="sidebar-nav" aria-label="Tutorials">
+        <p class="sidebar-title">yardstick docs</p>
+        <ul>
+          <li><a class="home-link" href="../index.html">Home</a></li>
+        </ul>
+        <p class="sidebar-title">Tutorials</p>
+        <ul>
+          <li><a href="../tutorials/01-install-first-run.html">1. Install and your first run</a></li>
+          <li><a href="../tutorials/02-experiment-yaml.html">2. Designing an experiment</a></li>
+          <li><a href="../tutorials/03-live-run-claude-code.html">3. Measuring a live Claude Code session</a></li>
+          <li><a href="../tutorials/04-compare-and-report.html">4. Comparing arms and reporting</a></li>
+          <li><a href="../tutorials/05-dashboard.html">5. Using the dashboard</a></li>
+          <li><a href="../tutorials/06-metrics-reference.html">6. Metrics reference</a></li>
+          <li><a href="../tutorials/07-troubleshooting.html">7. Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="content">
+
+        <h1>Designing an experiment</h1>
+        <p class="lede">
+          Every yardstick experiment is one YAML file: a task, one or more
+          models, a set of arms to compare, and the metrics you care about.
+          This page goes through every field in that schema, the two
+          validation rules most likely to trip you up, and what makes a
+          comparison actually meaningful.
+        </p>
+
+        <h2>Where the schema lives</h2>
+        <p>
+          The experiment shape is defined as pydantic models in
+          <code>ys/experiment.py</code>. <code>ys.experiment.load_experiment(path)</code>
+          reads the YAML and validates it against the <code>Experiment</code>
+          model; every field below comes directly from that file, not from a
+          separate spec doc, so it can't drift out of sync with what the CLI
+          actually accepts.
+        </p>
+
+        <h2>Top-level fields</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Type</th>
+                <th>Required</th>
+                <th>Default</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>experiment</code></td>
+                <td>string</td>
+                <td>yes</td>
+                <td>&mdash;</td>
+                <td>Identifies the experiment. Used as the primary key for the <code>experiments</code> table and as the <code>exp=</code> label printed by <code>ys start</code>/<code>ys end</code>.</td>
+              </tr>
+              <tr>
+                <td><code>question</code></td>
+                <td>string</td>
+                <td>no</td>
+                <td><code>None</code></td>
+                <td>Free-text statement of what the experiment is trying to answer. Purely documentation -- stored alongside the experiment row.</td>
+              </tr>
+              <tr>
+                <td><code>task</code></td>
+                <td><code>Task</code></td>
+                <td>yes</td>
+                <td>&mdash;</td>
+                <td>The single task every arm runs (see below).</td>
+              </tr>
+              <tr>
+                <td><code>factors</code></td>
+                <td><code>dict[str, list[str]]</code></td>
+                <td>no</td>
+                <td><code>{}</code></td>
+                <td>Documents the dimensions you're varying (e.g. <code>agent</code>, <code>model</code>) and the values in play. Arms reference these values in their own <code>factors</code> map; nothing enforces that an arm's factor values actually appear in this list.</td>
+              </tr>
+              <tr>
+                <td><code>models</code></td>
+                <td><code>dict[str, dict]</code></td>
+                <td>no</td>
+                <td><code>{}</code></td>
+                <td>Maps a <code>factors.model</code> value to the LiteLLM <code>litellm_params</code> <code>ys proxy up</code> should generate for it. See the dedicated section below.</td>
+              </tr>
+              <tr>
+                <td><code>arms</code></td>
+                <td><code>list[Arm]</code></td>
+                <td>yes</td>
+                <td>&mdash;</td>
+                <td>The arms being compared. Must be non-empty; ids must be unique (enforced, see validation below).</td>
+              </tr>
+              <tr>
+                <td><code>repeats</code></td>
+                <td>int</td>
+                <td>no</td>
+                <td><code>3</code></td>
+                <td>How many times you intend to run each arm. Not enforced by the CLI (nothing stops you running an arm more or fewer times) -- it's a target for how many repeats to actually run and aggregate over.</td>
+              </tr>
+              <tr>
+                <td><code>metrics</code></td>
+                <td><code>Metrics</code></td>
+                <td>no</td>
+                <td>see below</td>
+                <td>Which metrics to gate on and report (see below).</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3><code>task</code> fields</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Type</th>
+                <th>Required</th>
+                <th>Default</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>id</code></td>
+                <td>string</td>
+                <td>yes</td>
+                <td>&mdash;</td>
+                <td>Identifier for the task.</td>
+              </tr>
+              <tr>
+                <td><code>repo</code></td>
+                <td>string</td>
+                <td>no</td>
+                <td><code>None</code></td>
+                <td>Repository the task operates in. Documentation only in the schema -- yardstick itself doesn't clone or check it out for you.</td>
+              </tr>
+              <tr>
+                <td><code>ref</code></td>
+                <td>string</td>
+                <td>no</td>
+                <td><code>None</code></td>
+                <td>Git ref (branch/commit) the task starts from. Same caveat as <code>repo</code>.</td>
+              </tr>
+              <tr>
+                <td><code>prompt_file</code></td>
+                <td>string</td>
+                <td>no</td>
+                <td><code>None</code></td>
+                <td>Path to the file containing the task prompt you'll give the agent.</td>
+              </tr>
+              <tr>
+                <td><code>success_check</code></td>
+                <td>string</td>
+                <td>yes</td>
+                <td>&mdash;</td>
+                <td>A shell command. <code>ys end</code> runs it (via <code>subprocess.run(..., shell=True)</code>) and treats a zero exit code as success. If empty/omitted, <code>ys end</code> refuses unless you pass <code>--manual-score</code>.</td>
+              </tr>
+              <tr>
+                <td><code>timeout_s</code></td>
+                <td>int</td>
+                <td>no</td>
+                <td><code>1800</code></td>
+                <td>Timeout in seconds for <code>success_check</code>. If it's exceeded, the run is scored as failed and the recorded output notes the timeout.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3><code>arms[]</code> fields</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Type</th>
+                <th>Required</th>
+                <th>Default</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>id</code></td>
+                <td>string</td>
+                <td>yes</td>
+                <td>&mdash;</td>
+                <td>The value you pass to <code>ys start --arm</code>. Must be unique across the experiment's arms.</td>
+              </tr>
+              <tr>
+                <td><code>factors</code></td>
+                <td><code>dict[str, str]</code></td>
+                <td>yes</td>
+                <td>&mdash;</td>
+                <td>This arm's concrete factor values, e.g. <code>{agent: claude-code, model: probe-claude-mock}</code>. The <code>model</code> value is what <code>ys proxy up</code> uses to resolve <code>litellm_params</code> against <code>models:</code>.</td>
+              </tr>
+              <tr>
+                <td><code>notes</code></td>
+                <td>string</td>
+                <td>no</td>
+                <td><code>None</code></td>
+                <td>Free-text annotation, stored with the arm row.</td>
+              </tr>
+              <tr>
+                <td><code>baseline</code></td>
+                <td>bool</td>
+                <td>no</td>
+                <td><code>False</code></td>
+                <td>Marks this arm as the control for comparison. At most one arm may set this (see validation below).</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3><code>metrics</code> fields</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Type</th>
+                <th>Required</th>
+                <th>Default</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>gate</code></td>
+                <td>string</td>
+                <td>no</td>
+                <td><code>"task_success"</code></td>
+                <td>Which condition a run must pass to count toward the aggregated efficiency numbers for its arm.</td>
+              </tr>
+              <tr>
+                <td><code>primary</code></td>
+                <td>list[str]</td>
+                <td>no</td>
+                <td><code>[]</code></td>
+                <td>The headline metrics you most care about for this experiment (e.g. <code>cost_usd</code>, <code>turns</code>).</td>
+              </tr>
+              <tr>
+                <td><code>secondary</code></td>
+                <td>list[str]</td>
+                <td>no</td>
+                <td><code>[]</code></td>
+                <td>Supporting metrics worth reporting but not the headline.</td>
+              </tr>
+              <tr>
+                <td><code>derived</code></td>
+                <td>list[str]</td>
+                <td>no</td>
+                <td><code>[]</code></td>
+                <td>Metrics computed from other metrics (e.g. <code>cost_per_success</code>, <code>tokens_per_turn</code>).</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Nothing in <code>ys/experiment.py</code> validates that the metric
+          names in <code>primary</code>/<code>secondary</code>/<code>derived</code>
+          are real, known metric keys -- they're just strings that a renderer
+          (<code>ys compare</code>/<code>ys report</code>) looks up later.
+        </p>
+
+        <h2>The two validation rules that will actually bite you</h2>
+        <p>
+          <code>Experiment</code> has two validators, and both raise a
+          pydantic <code>ValueError</code> at load time (i.e. as soon as you
+          run any <code>ys</code> command that touches this YAML) if violated:
+        </p>
+        <ul>
+          <li>
+            <strong>At least one arm is required, and arm ids must be
+            unique.</strong> The <code>_non_empty_arms</code> field validator
+            rejects an empty <code>arms:</code> list with
+            <code>"experiment must declare at least one arm"</code>, and
+            rejects duplicate ids with
+            <code>"duplicate arm ids: [...]"</code>.
+          </li>
+          <li>
+            <strong>At most one arm may set <code>baseline: true</code>.</strong>
+            The <code>_exactly_one_baseline</code> model validator only
+            objects when <em>more than one</em> arm claims the baseline --
+            despite its name, zero baseline arms is fine (<code>baseline_arm()</code>
+            just returns <code>None</code>). Two or more raises
+            <code>"more than one baseline arm declared: [...]"</code>.
+          </li>
+        </ul>
+
+        <h2>The <code>models:</code> map, carefully</h2>
+        <p>
+          <code>models:</code> is not part of some external experiment spec
+          -- the comment above it in <code>ys/experiment.py</code> is explicit
+          that it was added because <code>ys proxy up</code> needs a concrete
+          source of LiteLLM parameters for each model name, and nothing else
+          in the schema provided one. It maps a <code>factors.model</code>
+          value (the string an arm uses in its own <code>factors.model</code>)
+          to the <code>litellm_params</code> dict that ends up in the
+          generated proxy's <code>model_list</code>.
+        </p>
+        <p>
+          Two shapes show up in the shipped examples:
+        </p>
+        <ul>
+          <li>
+            <strong>A mock double.</strong> In <code>experiments/example.yaml</code>,
+            <code>probe-claude-mock</code> maps to
+            <code>{model: anthropic/claude-3-5-sonnet-20241022, mock_response: "..."}</code>.
+            LiteLLM's <code>mock_response</code> field short-circuits the
+            call and returns that canned string instead of contacting
+            Anthropic -- this is what makes tutorial 1's smoke test free.
+          </li>
+          <li>
+            <strong>A real deployment.</strong> In
+            <code>experiments/interactive-sonnet.yaml</code>,
+            <code>claude-sonnet-5</code> maps to
+            <code>{model: claude-sonnet-5, api_key: os.environ/ANTHROPIC_API_KEY}</code>.
+            The <code>os.environ/...</code> value is LiteLLM's own syntax for
+            "read this from an environment variable at request time" rather
+            than a literal string baked into the generated config file.
+          </li>
+        </ul>
+        <p>
+          If an arm's <code>factors.model</code> value has <strong>no</strong>
+          matching entry under <code>models:</code>, <code>ys proxy up</code>
+          doesn't error -- it falls back to a convention, generating
+          <code>{model: anthropic/&lt;value&gt;, api_key: os.environ/ANTHROPIC_API_KEY}</code>
+          for it (this is exactly what <code>ys/proxy.py</code>'s
+          <code>_fallback_params</code> does). In other words: an
+          unrecognized model factor is assumed to be an Anthropic model name,
+          proxied with whatever <code>ANTHROPIC_API_KEY</code> is set in the
+          proxy process's environment.
+        </p>
+        <div class="note">
+          <p>
+            <code>ys proxy up</code> raises if <em>no</em> model resolves at
+            all across the experiment(s) you pass it: "no models resolved
+            from the given experiments -- each arm needs a <code>model</code>
+            factor, or the experiment needs a <code>models:</code> block."
+          </p>
+        </div>
+
+        <h2>Designing a good comparison</h2>
+        <p>
+          A few practices fall directly out of how <code>ys compare</code>
+          aggregates runs (see <code>ys/metrics.py</code>'s
+          <code>aggregate_run_metrics</code>):
+        </p>
+        <ul>
+          <li>
+            <strong>Change one factor at a time between the arms you want to
+            compare.</strong> If two arms differ in both <code>model</code>
+            and <code>agent</code>, you can't attribute a cost or turns
+            difference to either one specifically.
+          </li>
+          <li>
+            <strong>Mark your control arm <code>baseline: true</code>.</strong>
+            It's how a reader (and later, <code>ys compare</code>/<code>ys report</code>)
+            knows which arm the others are measured against.
+          </li>
+          <li>
+            <strong><code>repeats</code> matters because aggregation is a
+            mean over gate-passing runs, not a single sample.</strong> Per
+            arm, <code>aggregate_run_metrics</code> takes every run's
+            <code>task_success</code> as the default gate, then averages
+            (and computes population stdev of) each efficiency metric only
+            across the runs that passed. An arm you only ran once gives you
+            no signal on how consistent its cost or turn count actually is;
+            an arm that's cheap on one run and expensive on the next needs
+            enough repeats for that spread to show up rather than being
+            silently hidden behind a single lucky (or unlucky) run.
+          </li>
+        </ul>
+
+        <h2>Annotated examples</h2>
+        <h3><code>experiments/example.yaml</code> -- the mock smoke test</h3>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">experiments/example.yaml</span>
+          </div>
+          <pre data-lang="yaml"><code>experiment: mock-smoke-01
+question: >
+  Does the mock harness pipeline work end to end without spending real API budget?
+
+task:
+  id: smoke-000
+  success_check: "true"          # always succeeds -- this experiment is about plumbing, not task quality
+  timeout_s: 60
+
+factors:
+  agent: [claude-code]
+  model: [probe-claude-mock]
+
+models:
+  probe-claude-mock:
+    model: anthropic/claude-3-5-sonnet-20241022
+    mock_response: "This is a mock response used for yardstick smoke testing."
+
+arms:
+  - id: arm-a
+    factors: {agent: claude-code, model: probe-claude-mock}
+    notes: "baseline mock arm"
+    baseline: true               # the one arm marked baseline
+  - id: arm-b
+    factors: {agent: claude-code, model: probe-claude-mock}
+    notes: "second mock arm, deliberately noisier"
+
+repeats: 2
+
+metrics:
+  gate: task_success
+  primary: [cost_usd, billable_tokens, turns, wall_clock_s]
+  secondary: [tool_calls, redundant_tool_calls, tool_error_rate, cache_read_ratio, fixed_overhead_tokens, context_high_water, compaction_events]
+  derived: [cost_per_success, tokens_per_turn]</code></pre>
+        </div>
+
+        <h3><code>experiments/interactive-sonnet.yaml</code> -- a real-model interactive arm</h3>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">experiments/interactive-sonnet.yaml</span>
+          </div>
+          <pre data-lang="yaml"><code>experiment: interactive-sonnet-01
+question: >
+  Ad-hoc arm for routing an interactive Claude Code session through the ys
+  proxy against the real claude-sonnet-5 model (spends real API budget --
+  kept separate from example.yaml's mock smoke test on purpose).
+
+task:
+  id: interactive-000
+  success_check: "true"          # no automated check for this task -- expect --manual-score at `ys end`
+  timeout_s: 3600
+
+factors:
+  agent: [claude-code]
+  model: [claude-sonnet-5]
+
+models:
+  claude-sonnet-5:
+    model: claude-sonnet-5
+    api_key: os.environ/ANTHROPIC_API_KEY   # LiteLLM env-var indirection, not a literal key in the file
+
+arms:
+  - id: arm-sonnet
+    factors: {agent: claude-code, model: claude-sonnet-5}
+    notes: "real Sonnet 5 -- spends real API budget"
+    baseline: true
+
+repeats: 1                       # this experiment only defines one arm to run
+
+metrics:
+  gate: task_success
+  primary: [cost_usd, billable_tokens, turns, wall_clock_s]
+  secondary: [tool_calls, redundant_tool_calls, tool_error_rate, cache_read_ratio, fixed_overhead_tokens, context_high_water, compaction_events]
+  derived: [cost_per_success, tokens_per_turn]</code></pre>
+        </div>
+        <p>
+          This is the file <a href="../tutorials/03-live-run-claude-code.html">tutorial 3</a>
+          drives a real Claude Code session through.
+        </p>
+
+        <nav class="pager" aria-label="Page navigation">
+          <a class="pager-prev" href="../tutorials/01-install-first-run.html">
+            <span class="pager-dir">Previous</span>
+            <span>Install and your first run</span>
+          </a>
+          <a class="pager-next" href="../tutorials/03-live-run-claude-code.html">
+            <span class="pager-dir">Next</span>
+            <span>Measuring a live Claude Code session</span>
+          </a>
+        </nav>
+      </div>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>
