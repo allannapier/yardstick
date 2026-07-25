@@ -256,9 +256,10 @@ def render_html(comparison: Comparison, cur) -> str:
     rows_html = []
     baseline = next((a for a in comparison.arms if a.is_baseline), None)
 
+    uncontrolled = ' <span class="warn">UNCONTROLLED</span>'
     header_cells = "".join(
         f"<th>{html.escape(a.label)}{' *' if a.is_baseline else ''}"
-        f"{' <span class=\"warn\">UNCONTROLLED</span>' if a.fingerprint_drifted else ''}</th>"
+        f"{uncontrolled if a.fingerprint_drifted else ''}</th>"
         for a in comparison.arms
     )
 
