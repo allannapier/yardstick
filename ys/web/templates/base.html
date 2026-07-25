@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}yardstick{% endblock %}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 960px; margin: 0 auto; padding: 1.5rem 1rem 4rem;
+    line-height: 1.45;
+  }
+  a { color: #4f7cff; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  h1 a { text-decoration: none; color: inherit; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.75rem 0; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #8883; font-size: 0.92rem; }
+  th { color: #888; font-weight: 600; }
+  .card {
+    border: 1px solid #8883; border-radius: 10px; padding: 1rem 1.2rem;
+    margin: 1rem 0; background: color-mix(in srgb, currentColor 3%, transparent);
+  }
+  .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+  .pill {
+    display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px;
+    font-size: 0.78rem; font-weight: 600;
+  }
+  .pill.up { background: #2ecc7133; color: #1a9850; }
+  .pill.down { background: #8883; color: #888; }
+  .pill.success { background: #2ecc7133; color: #1a9850; }
+  .pill.fail { background: #e0555f33; color: #c0392b; }
+  .pill.pending { background: #f4c95d33; color: #b8860b; }
+  .flash { padding: 0.6rem 0.9rem; border-radius: 8px; margin: 1rem 0; font-size: 0.92rem; }
+  .flash.ok { background: #2ecc7122; }
+  .flash.error { background: #e0555f22; }
+  form.inline { display: inline; }
+  input, select, textarea, button {
+    font: inherit; padding: 0.4rem 0.55rem; border-radius: 6px;
+    border: 1px solid #8886; background: transparent; color: inherit;
+  }
+  button { cursor: pointer; background: #4f7cff; color: white; border: none; font-weight: 600; }
+  button.secondary { background: transparent; color: inherit; border: 1px solid #8886; }
+  button.danger { background: #e0555f; }
+  button:hover { opacity: 0.9; }
+  .muted { color: #888; font-size: 0.85rem; }
+  .arm-row, .model-row { display: flex; gap: 0.5rem; margin-bottom: 0.4rem; align-items: center; }
+  .arm-row input, .model-row input { flex: 1; }
+  fieldset { border: 1px solid #8883; border-radius: 8px; margin: 1rem 0; }
+  legend { padding: 0 0.4rem; font-weight: 600; }
+  label { font-size: 0.85rem; color: #888; display: block; margin-bottom: 0.15rem; }
+  .field { margin-bottom: 0.75rem; }
+  .field input, .field textarea, .field select { width: 100%; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<h1><a href="/">yardstick</a></h1>
+
+{% if ok %}<div class="flash ok">{{ ok }}</div>{% endif %}
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+{% if active_run %}
+<div class="card">
+  <div class="row">
+    <strong>active run</strong>
+    <span class="muted">{{ active_run.run_id }} &middot; {{ active_run.experiment }} / {{ active_run.arm }} &middot; started {{ active_run.started_at }}</span>
+  </div>
+  <form method="post" action="/runs/end" class="row" style="margin-top:0.5rem">
+    <input type="number" step="any" name="manual_score" placeholder="manual score (optional, skips success_check)">
+    <button type="submit">End run</button>
+  </form>
+</div>
+{% endif %}
+
+<div class="card row">
+  <span>proxy:</span>
+  {% if proxy_alive %}
+    <span class="pill up">running :{{ proxy_port }} (pid {{ proxy_pid }})</span>
+    <form method="post" action="/proxy/down" class="inline">
+      <input type="hidden" name="back" value="{{ request.url.path }}">
+      <button type="submit" class="secondary">stop</button>
+    </form>
+  {% else %}
+    <span class="pill down">not running</span>
+    <span class="muted">start it from an experiment page</span>
+  {% endif %}
+</div>
+
+{% block content %}{% endblock %}
+
+</body>
+</html>

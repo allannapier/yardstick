@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}yardstick -- new experiment{% endblock %}
+{% block content %}
+
+<h2>new experiment</h2>
+
+<form method="post" action="/experiments">
+
+  <div class="field">
+    <label for="name">experiment name (used as the filename -- letters, digits, - and _ only)</label>
+    <input id="name" name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="harness-vs-model-01">
+  </div>
+
+  <div class="field">
+    <label for="question">question (optional)</label>
+    <textarea id="question" name="question" rows="2" placeholder="What are we trying to learn?"></textarea>
+  </div>
+
+  <fieldset>
+    <legend>task -- the fixed constant every arm runs</legend>
+    <div class="field">
+      <label for="task_id">task id</label>
+      <input id="task_id" name="task_id" required placeholder="bughunt-seed-042">
+    </div>
+    <div class="field">
+      <label for="success_check">success check (shell command, exit 0 = success)</label>
+      <input id="success_check" name="success_check" required placeholder="pytest -q tests/test_seeded_bug.py">
+    </div>
+    <div class="field">
+      <label for="timeout_s">timeout (seconds)</label>
+      <input id="timeout_s" name="timeout_s" type="number" value="1800">
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>models -- what a `model` factor value resolves to</legend>
+    <div id="model-rows"></div>
+    <button type="button" class="secondary" onclick="addModelRow()">+ add model</button>
+    <p class="muted">"mock" costs nothing and always returns a canned response -- use it to test the pipeline. "real" routes to Anthropic using the ANTHROPIC_API_KEY you export before <code>ys proxy up</code>.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>arms -- what you're comparing</legend>
+    <div id="arm-rows"></div>
+    <button type="button" class="secondary" onclick="addArmRow()">+ add arm</button>
+  </fieldset>
+
+  <div class="field">
+    <label for="repeats">repeats per arm</label>
+    <input id="repeats" name="repeats" type="number" value="3" style="width: 6rem">
+  </div>
+
+  <button type="submit">create experiment</button>
+</form>
+
+<template id="model-row-template">
+  <div class="model-row">
+    <input name="model_key" placeholder="model key (e.g. probe-claude-mock)" required>
+    <select name="model_kind" onchange="this.nextElementSibling.placeholder = this.value === 'mock' ? 'mock response text' : 'real anthropic model id, e.g. claude-haiku-4-5-20251001'">
+      <option value="mock">mock</option>
+      <option value="real">real</option>
+    </select>
+    <input name="model_value" placeholder="mock response text">
+    <button type="button" class="secondary" onclick="this.parentElement.remove()">remove</button>
+  </div>
+</template>
+
+<template id="arm-row-template">
+  <div class="arm-row">
+    <input name="arm_id" placeholder="arm id (e.g. sonnet-lean)" required>
+    <input name="arm_model" placeholder="model key (must match one above)" required>
+    <label style="display:flex; align-items:center; gap:0.3rem; white-space:nowrap;">
+      <input type="checkbox" name="arm_baseline" value="" style="width:auto">
+      baseline
+    </label>
+    <input name="arm_notes" placeholder="notes (optional)">
+    <button type="button" class="secondary" onclick="this.parentElement.remove()">remove</button>
+  </div>
+</template>
+
+<script>
+function addModelRow() {
+  const tpl = document.getElementById('model-row-template');
+  document.getElementById('model-rows').appendChild(tpl.content.cloneNode(true));
+}
+function addArmRow() {
+  const tpl = document.getElementById('arm-row-template');
+  const node = tpl.content.cloneNode(true);
+  document.getElementById('arm-rows').appendChild(node);
+  // the baseline checkbox's `value` must equal this row's arm_id for the
+  // server to know which arm was marked baseline (getlist("arm_baseline")
+  // is a set of checked *values*, matched against each row's arm_id).
+  const row = document.getElementById('arm-rows').lastElementChild;
+  const idInput = row.querySelector('input[name=arm_id]');
+  const baselineBox = row.querySelector('input[name=arm_baseline]');
+  idInput.addEventListener('input', () => { baselineBox.value = idInput.value; });
+}
+addModelRow();
+addArmRow();
+</script>
+
+{% endblock %}

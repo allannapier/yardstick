@@ -1,0 +1,16 @@
+model_list:
+  - model_name: probe-claude-mock
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20241022
+      mock_response: "This is a mock response used to probe the LiteLLM callback payload shape."
+  - model_name: probe-claude
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  callbacks: _yardstick_shim.yardstick_logger
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

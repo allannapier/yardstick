@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}yardstick -- experiments{% endblock %}
+{% block content %}
+
+<div class="row" style="justify-content: space-between; margin-top: 1.5rem;">
+  <h2 style="margin-top:0">experiments</h2>
+  <a href="/experiments/new"><button type="button">+ new experiment</button></a>
+</div>
+
+{% if not summaries %}
+  <p class="muted">no experiments yet -- <a href="/experiments/new">create one</a>.</p>
+{% else %}
+<table>
+  <tr><th>experiment</th><th>task</th><th>arms</th><th>runs</th><th></th></tr>
+  {% for s in summaries %}
+  <tr>
+    <td><a href="/experiments/{{ s.experiment.experiment }}">{{ s.experiment.experiment }}</a></td>
+    <td class="muted">{{ s.experiment.task.id }}</td>
+    <td>{{ s.experiment.arms | length }}</td>
+    <td>{{ s.run_count }}</td>
+    <td><a href="/experiments/{{ s.experiment.experiment }}/compare">compare</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% endblock %}

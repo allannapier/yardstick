@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}yardstick -- {{ experiment.experiment }}{% endblock %}
+{% block content %}
+
+<h2 style="margin-top:1.5rem">{{ experiment.experiment }}</h2>
+{% if experiment.question %}<p class="muted">{{ experiment.question }}</p>{% endif %}
+<p class="muted">task: <code>{{ experiment.task.id }}</code> &middot; success check: <code>{{ experiment.task.success_check }}</code> &middot; repeats: {{ experiment.repeats }}</p>
+
+<div class="row">
+  <a href="/experiments/{{ experiment.experiment }}/compare"><button type="button" class="secondary">view comparison</button></a>
+  {% if not proxy_alive %}
+  <form method="post" action="/experiments/{{ experiment.experiment }}/proxy/up" class="inline">
+    <button type="submit">start proxy for this experiment</button>
+  </form>
+  {% endif %}
+</div>
+
+{% for entry in arms_data %}
+<div class="card">
+  <div class="row" style="justify-content: space-between;">
+    <div>
+      <strong>{{ entry.arm.id }}</strong>
+      {% if entry.arm.baseline %}<span class="pill pending">baseline</span>{% endif %}
+      {% if entry.arm.notes %}<span class="muted"> -- {{ entry.arm.notes }}</span>{% endif %}
+    </div>
+    {% if not active_run %}
+    <form method="post" action="/experiments/{{ experiment.experiment }}/runs/start" class="row inline">
+      <input type="hidden" name="arm_id" value="{{ entry.arm.id }}">
+      <button type="submit">start run (repeat {{ entry.runs|length + 1 }})</button>
+    </form>
+    {% endif %}
+  </div>
+
+  {% if entry.runs %}
+  <table>
+    <tr><th>repeat</th><th>run</th><th>started</th><th>result</th><th>wall clock</th><th></th></tr>
+    {% for r in entry.runs %}
+    <tr>
+      <td>{{ r.repeat_idx }}</td>
+      <td><a href="/runs/{{ r.id }}">{{ r.id }}</a></td>
+      <td class="muted">{{ r.started_at }}</td>
+      <td>
+        {% if r.task_success is none %}<span class="pill pending">in progress</span>
+        {% elif r.task_success %}<span class="pill success">success</span>
+        {% else %}<span class="pill fail">fail</span>{% endif %}
+      </td>
+      <td>{{ "%.1f"|format(r.wall_clock_s) if r.wall_clock_s is not none else "-" }}s</td>
+      <td>
+        {% if not active_run or active_run.run_id != r.id %}
+        <form method="post" action="/runs/{{ r.id }}/delete" class="inline"
+              onsubmit="return confirm('delete run {{ r.id }}? this cannot be undone.');">
+          <button type="submit" class="danger">delete</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">no runs yet</p>
+  {% endif %}
+</div>
+{% endfor %}
+
+{% endblock %}

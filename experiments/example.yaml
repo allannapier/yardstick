@@ -1,0 +1,34 @@
+experiment: mock-smoke-01
+question: >
+  Does the mock harness pipeline work end to end without spending real API budget?
+
+task:
+  id: smoke-000
+  success_check: "true"
+  timeout_s: 60
+
+factors:
+  agent: [claude-code]
+  model: [probe-claude-mock]
+
+models:
+  probe-claude-mock:
+    model: anthropic/claude-3-5-sonnet-20241022
+    mock_response: "This is a mock response used for yardstick smoke testing."
+
+arms:
+  - id: arm-a
+    factors: {agent: claude-code, model: probe-claude-mock}
+    notes: "baseline mock arm"
+    baseline: true
+  - id: arm-b
+    factors: {agent: claude-code, model: probe-claude-mock}
+    notes: "second mock arm, deliberately noisier"
+
+repeats: 2
+
+metrics:
+  gate: task_success
+  primary: [cost_usd, billable_tokens, turns, wall_clock_s]
+  secondary: [tool_calls, redundant_tool_calls, tool_error_rate, cache_read_ratio, fixed_overhead_tokens, context_high_water, compaction_events]
+  derived: [cost_per_success, tokens_per_turn]

@@ -1,0 +1,33 @@
+experiment: interactive-sonnet-01
+question: >
+  Ad-hoc arm for routing an interactive Claude Code session through the ys
+  proxy against the real claude-sonnet-5 model (spends real API budget --
+  kept separate from example.yaml's mock smoke test on purpose).
+
+task:
+  id: interactive-000
+  success_check: "true"
+  timeout_s: 3600
+
+factors:
+  agent: [claude-code]
+  model: [claude-sonnet-5]
+
+models:
+  claude-sonnet-5:
+    model: claude-sonnet-5
+    api_key: os.environ/ANTHROPIC_API_KEY
+
+arms:
+  - id: arm-sonnet
+    factors: {agent: claude-code, model: claude-sonnet-5}
+    notes: "real Sonnet 5 -- spends real API budget"
+    baseline: true
+
+repeats: 1
+
+metrics:
+  gate: task_success
+  primary: [cost_usd, billable_tokens, turns, wall_clock_s]
+  secondary: [tool_calls, redundant_tool_calls, tool_error_rate, cache_read_ratio, fixed_overhead_tokens, context_high_water, compaction_events]
+  derived: [cost_per_success, tokens_per_turn]
