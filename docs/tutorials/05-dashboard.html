@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Using the dashboard · yardstick</title>
+  <meta name="description" content="Running the yardstick dashboard: creating experiments, starting and ending runs, and browsing results from the browser instead of the CLI." />
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="../index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sidebar-nav">
+      Menu
+    </button>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav" id="sidebar-nav" aria-label="Tutorials">
+        <p class="sidebar-title">yardstick docs</p>
+        <ul>
+          <li><a class="home-link" href="../index.html">Home</a></li>
+        </ul>
+        <p class="sidebar-title">Tutorials</p>
+        <ul>
+          <li><a href="../tutorials/01-install-first-run.html">1. Install and your first run</a></li>
+          <li><a href="../tutorials/02-experiment-yaml.html">2. Designing an experiment</a></li>
+          <li><a href="../tutorials/03-live-run-claude-code.html">3. Measuring a live Claude Code session</a></li>
+          <li><a href="../tutorials/04-compare-and-report.html">4. Comparing arms and reporting</a></li>
+          <li><a href="../tutorials/05-dashboard.html">5. Using the dashboard</a></li>
+          <li><a href="../tutorials/06-metrics-reference.html">6. Metrics reference</a></li>
+          <li><a href="../tutorials/07-troubleshooting.html">7. Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="content">
+
+        <h1>Using the dashboard</h1>
+        <p class="lede">
+          <code>ys web</code> runs a small FastAPI app that walks the same lifecycle as the CLI --
+          create an experiment, start a proxy, start and end runs, compare arms -- without leaving
+          the browser. It's a thin presentation layer with no business logic of its own, so it can
+          never drift from what the CLI does.
+        </p>
+
+        <h2>Starting and stopping the dashboard</h2>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys web up             # start the dashboard (default port 8501)
+ys web up --port 9000 # or on a specific port
+ys web status          # is it running, and what's the pid?
+ys web down            # stop it</code></pre>
+        </div>
+        <p>
+          <code>ys web up</code> launches <code>uvicorn ys.web.app:app</code> as a detached background
+          process, waits for <code>/health</code> to respond, and prints the dashboard's URL. It also
+          calls the same database initialization <code>ys init</code> does, so you don't need to run
+          <code>ys init</code> first just to use the dashboard.
+        </p>
+
+        <div class="warn">
+          <p>
+            The dashboard and the measurement proxy are two completely separate processes with
+            separate pidfiles, port files, and logs: the dashboard's are
+            <code>~/.yardstick/web.pid</code> / <code>web.port</code> / <code>web.log</code> (default
+            port <code>8501</code>), the proxy's are <code>~/.yardstick/proxy.pid</code> /
+            <code>proxy.port</code> / <code>proxy.log</code> (default port <code>4000</code>).
+            <code>ys web down</code> never stops the proxy, and <code>ys proxy down</code> never stops
+            the dashboard -- check each independently with <code>ys web status</code> and
+            <code>ys proxy status</code>.
+          </p>
+        </div>
+
+        <h2>The routes: same lifecycle, different transport</h2>
+        <p>
+          Every page the dashboard serves is either a plain <code>GET</code> (a page you read) or a
+          form <code>POST</code> that redirects back to a page afterward (an action you take) -- there's
+          no client-side routing or JSON API to speak of.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Method &amp; path</th>
+                <th>What it does</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>GET /</code></td><td>Index: every experiment found in <code>~/.yardstick/experiments/</code>, with its task id, arm count, and recorded run count.</td></tr>
+              <tr><td><code>GET /experiments/new</code></td><td>The experiment-creation form.</td></tr>
+              <tr><td><code>POST /experiments</code></td><td>Validates and writes a new experiment YAML, then redirects to its detail page.</td></tr>
+              <tr><td><code>GET /experiments/{name}</code></td><td>Experiment detail: task/success-check/repeats, and every arm's recorded runs.</td></tr>
+              <tr><td><code>GET /experiments/{name}/compare</code></td><td>Renders the same comparison as <code>ys report --html</code>, in the browser.</td></tr>
+              <tr><td><code>POST /experiments/{name}/proxy/up</code></td><td>Starts the measurement proxy, scoped to just this experiment's models.</td></tr>
+              <tr><td><code>POST /proxy/down</code></td><td>Stops the proxy, then redirects back to wherever the form was submitted from.</td></tr>
+              <tr><td><code>POST /experiments/{name}/runs/start</code></td><td>Begins a run of one arm and marks it active.</td></tr>
+              <tr><td><code>POST /runs/end</code></td><td>Ends the currently active run (optionally with a manual score).</td></tr>
+              <tr><td><code>POST /runs/{run_id}/delete</code></td><td>Deletes a run and its requests/tool calls.</td></tr>
+              <tr><td><code>GET /runs/{run_id}</code></td><td>Run detail: metrics summary, full request log, tool call log.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Creating an experiment through the form</h2>
+        <p>
+          <code>/experiments/new</code> accepts the same shape of data as an experiment YAML, entered
+          as plain form fields: an experiment name (letters/digits/<code>-</code>/<code>_</code> only
+          -- it becomes the filename), an optional question, the fixed task (<code>task_id</code>,
+          <code>success_check</code>, <code>timeout_s</code>), one or more repeatable model rows,
+          one or more repeatable arm rows, and a repeats count.
+        </p>
+        <p>
+          Each model row is either <strong>mock</strong> (costs nothing, always returns the canned
+          text you type as its response -- good for testing the pipeline) or <strong>real</strong>
+          (routes to an <code>anthropic/...</code> model id using whatever <code>ANTHROPIC_API_KEY</code>
+          you have exported). Each arm row picks an id, a model key that must match one of the model
+          rows above, an optional baseline checkbox, and optional notes.
+        </p>
+        <p>
+          On submit, the server assembles this into the same dict shape <code>ys.experiment.Experiment</code>
+          validates for the CLI -- so duplicate arm ids, more than one arm marked baseline, and other
+          structural mistakes are rejected identically to a hand-written YAML. On success it writes
+          <code>~/.yardstick/experiments/&lt;name&gt;.yaml</code> and redirects to the new experiment's
+          detail page; on a validation error it redirects back to the form with the error message
+          in the URL.
+        </p>
+        <div class="note">
+          <p>
+            The dashboard's experiment list only shows YAMLs that live in
+            <code>~/.yardstick/experiments/</code>. A CLI-authored experiment file living elsewhere
+            on disk -- like this repo's <code>experiments/example.yaml</code> -- won't appear until
+            you copy or recreate it there.
+          </p>
+        </div>
+
+        <h2>Experiment detail: starting and ending runs</h2>
+        <p>
+          Each arm on the experiment detail page shows a table of its recorded runs (repeat number,
+          run id linking to its detail page, start time, success/fail/in-progress pill, wall clock
+          time, and a delete button) plus a "start run" button. That button is hidden for every arm,
+          on every experiment, whenever any run anywhere is currently active -- the dashboard enforces
+          the exact same single-active-run-at-a-time rule the CLI does, because both call the same
+          <code>ys.runs.begin_run</code>/<code>finish_run</code> functions under <code>ys.state</code>.
+        </p>
+        <p>
+          Whenever a run is active, every page in the dashboard (not just the experiment page) shows
+          an "active run" card at the top with an inline form to end it -- including an optional
+          manual-score field that skips <code>success_check</code>, exactly like <code>ys end
+          --manual-score</code>. Starting a run redirects back to the experiment page with a flash
+          message; a second start attempt while one is already active is refused with an error message
+          rather than silently overriding the active run.
+        </p>
+        <p>
+          A "start proxy for this experiment" button appears on the experiment page whenever the proxy
+          isn't already running. Unlike <code>ys proxy up --exp</code>, which can take several
+          experiment YAMLs at once to serve multiple experiments' models from one proxy, this button
+          always starts the proxy scoped to just that one experiment's models.
+        </p>
+
+        <h2>Compare view</h2>
+        <p>
+          <code>/experiments/{name}/compare</code> calls the exact same <code>render.compare_experiment</code>
+          + <code>render.render_html</code> pipeline as <code>ys report --html</code> and serves the
+          result directly as an HTML response, in the browser, instead of writing it to a file. If no
+          arm has any recorded runs yet, it redirects back to the experiment page with the same
+          "no runs found for any arm" error <code>ys compare</code> would raise on the CLI.
+        </p>
+
+        <h2>Run detail page</h2>
+        <p>
+          <code>/runs/{run_id}</code> shows the run's experiment/arm/repeat and success pill, a
+          summary card of headline metrics (<code>turns</code>, <code>billable_tokens</code>,
+          <code>cost_usd</code>, <code>cache_read_ratio</code>, <code>context_high_water</code>,
+          <code>tool_calls</code>, <code>tool_error_rate</code>, <code>redundant_tool_calls</code>,
+          <code>compaction_events</code>, <code>active_s</code>), the full per-request log (tokens in,
+          cache create/read, tokens out, cost, transition), and the full tool-call log (name, error
+          flag, input size). A delete button appears unless this run is the currently active one.
+        </p>
+
+        <h2>Deleting a run</h2>
+        <p>
+          Delete buttons on the experiment page and the run detail page both post to
+          <code>/runs/{run_id}/delete</code>, which cascades the delete across that run's requests and
+          tool calls and refuses (redirecting back with an error) if the run is currently active --
+          end it first. The "are you sure?" prompt on these buttons is a plain browser
+          <code>confirm()</code> dialog; it's a client-side courtesy, not a server-side safeguard --
+          the only actual server-side protection is the active-run refusal.
+        </p>
+
+        <h2>What the dashboard can't do</h2>
+        <div class="warn">
+          <p>There is no browser equivalent for pointing an agent's config at the proxy or restoring it afterward -- <code>ys harness point</code> / <code>ys harness reset</code> / <code>ys harness status</code> remain CLI-only.</p>
+        </div>
+        <div class="warn">
+          <p>There's no route to edit an existing experiment's YAML -- the form only creates new ones. To change an existing experiment, edit its file in <code>~/.yardstick/experiments/</code> by hand.</p>
+        </div>
+        <div class="warn">
+          <p>The compare view has no download or save-to-file option; it's rendered live on request. To get a portable, self-contained file to email or commit, use <code>ys report --exp ... --html ...</code> from the CLI (see <a href="../tutorials/04-compare-and-report.html">the previous tutorial</a>).</p>
+        </div>
+
+        <nav class="pager" aria-label="Page navigation">
+          <a class="pager-prev" href="../tutorials/04-compare-and-report.html">
+            <span class="pager-dir">Previous</span>
+            <span>Comparing arms and reporting</span>
+          </a>
+          <a class="pager-next" href="../tutorials/06-metrics-reference.html">
+            <span class="pager-dir">Next</span>
+            <span>Metrics reference</span>
+          </a>
+        </nav>
+      </div>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>
