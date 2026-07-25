@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>yardstick -- agent / harness / model efficiency measurement</title>
+  <meta name="description" content="yardstick (ys) sits between a coding agent and the LLM API as a LiteLLM proxy, recording every request so you can compare experiment arms on cost, tokens, turns, tool-call efficiency, and task success." />
+  <link rel="stylesheet" href="assets/site.css" />
+  <script src="assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <main>
+    <div class="content-wide">
+      <section class="hero">
+        <p class="eyebrow">ys -- measurement rig</p>
+        <h1>Measure your coding agent, not just its vibes.</h1>
+        <p class="pitch">
+          yardstick sits between a coding agent (Claude Code, opencode, ...)
+          and the LLM API as a LiteLLM proxy, recording every request and
+          response into a local SQLite database -- so you can compare arms of
+          an experiment (same task, different model or harness config) on
+          cost, tokens, turns, tool-call efficiency, and task success.
+        </p>
+        <p class="pitch">
+          It measures: cost and billable tokens, turns, cache-read ratio,
+          tool-call counts and errors, redundant tool calls, compaction
+          events, context high-water mark, wall-clock time, and task success.
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="tutorials/01-install-first-run.html">Start the first tutorial</a>
+          <a class="btn btn-secondary" href="https://github.com/allannapier/yardstick">View source</a>
+        </div>
+      </section>
+
+      <h2>How it works</h2>
+      <p>The measurement loop is five commands, run once per arm of an experiment.</p>
+      <ol class="steps">
+        <li>
+          <h4>Proxy up</h4>
+          <p>
+            <code>ys proxy up --exp experiments/example.yaml</code> generates a
+            LiteLLM proxy config from your experiment YAML(s) and starts the
+            proxy that will record every request.
+          </p>
+        </li>
+        <li>
+          <h4>Harness point</h4>
+          <p>
+            <code>ys harness point claude-code</code> repoints the agent's
+            config (e.g. Claude Code's <code>~/.claude/settings.json</code>)
+            at that proxy, backing up the original first.
+          </p>
+        </li>
+        <li>
+          <h4>ys start</h4>
+          <p>
+            <code>ys start --exp ... --arm ...</code> marks a run active; you
+            then drive the agent through its task as normal.
+          </p>
+        </li>
+        <li>
+          <h4>ys end</h4>
+          <p>
+            <code>ys end</code> finishes the run, runs the arm's
+            <code>success_check</code>, and prints headline metrics.
+          </p>
+        </li>
+        <li>
+          <h4>Compare / report</h4>
+          <p>
+            <code>ys compare</code> and <code>ys report</code> aggregate
+            recorded runs per arm into a table or a self-contained HTML
+            report.
+          </p>
+        </li>
+      </ol>
+
+      <h2>Quick start</h2>
+      <p>Requires Python &gt;= 3.10. Installs the <code>ys</code> CLI with <code>litellm[proxy]</code>, FastAPI/uvicorn (dashboard), and Pydantic.</p>
+      <div class="code">
+        <div class="code-header">
+          <span class="code-label">bash</span>
+        </div>
+        <pre data-lang="bash"><code>pip install -e .
+
+ys init                                    # create ~/.yardstick and the db
+
+export LITELLM_MASTER_KEY=sk-...           # proxy auth key you choose
+ys proxy up --exp experiments/example.yaml # start the measurement proxy
+
+ys harness point claude-code               # point Claude Code at the proxy
+ys start --exp experiments/example.yaml --arm arm-a
+
+# ... drive the agent through the task ...
+
+ys end                                     # score + print headline metrics
+ys harness reset claude-code               # restore the agent's real config
+ys proxy down</code></pre>
+      </div>
+
+      <h2>Tutorials</h2>
+      <p>Work through these in order, or jump to the one you need.</p>
+      <div class="card-grid">
+        <a class="card" href="tutorials/01-install-first-run.html">
+          <span class="card-index">01</span>
+          <span class="card-title">Install and your first run</span>
+          <p class="card-desc">Install yardstick and take the measurement loop for one lap end to end.</p>
+        </a>
+        <a class="card" href="tutorials/02-experiment-yaml.html">
+          <span class="card-index">02</span>
+          <span class="card-title">Designing an experiment</span>
+          <p class="card-desc">Tasks, models, factors, arms, repeats, and metrics in the experiment YAML.</p>
+        </a>
+        <a class="card" href="tutorials/03-live-run-claude-code.html">
+          <span class="card-index">03</span>
+          <span class="card-title">Measuring a live Claude Code session</span>
+          <p class="card-desc">Point a real Claude Code session at the proxy and record a live run.</p>
+        </a>
+        <a class="card" href="tutorials/04-compare-and-report.html">
+          <span class="card-index">04</span>
+          <span class="card-title">Comparing arms and reporting</span>
+          <p class="card-desc">Aggregate recorded runs with ys compare and generate an HTML report.</p>
+        </a>
+        <a class="card" href="tutorials/05-dashboard.html">
+          <span class="card-index">05</span>
+          <span class="card-title">Using the dashboard</span>
+          <p class="card-desc">Set up experiments and browse runs in a browser with ys web up.</p>
+        </a>
+        <a class="card" href="tutorials/06-metrics-reference.html">
+          <span class="card-index">06</span>
+          <span class="card-title">Metrics reference</span>
+          <p class="card-desc">Every recorded and derived metric, and what it means.</p>
+        </a>
+        <a class="card" href="tutorials/07-troubleshooting.html">
+          <span class="card-index">07</span>
+          <span class="card-title">Troubleshooting</span>
+          <p class="card-desc">Common problems with the proxy, harness pointing, and attribution.</p>
+        </a>
+      </div>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>
