@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Troubleshooting · yardstick</title>
+  <meta name="description" content="Diagnose proxy, harness-pointing, attribution, and comparison problems in yardstick using the real errors the CLI raises." />
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="../index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sidebar-nav">
+      Menu
+    </button>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav" id="sidebar-nav" aria-label="Tutorials">
+        <p class="sidebar-title">yardstick docs</p>
+        <ul>
+          <li><a class="home-link" href="../index.html">Home</a></li>
+        </ul>
+        <p class="sidebar-title">Tutorials</p>
+        <ul>
+          <li><a href="../tutorials/01-install-first-run.html">1. Install and your first run</a></li>
+          <li><a href="../tutorials/02-experiment-yaml.html">2. Designing an experiment</a></li>
+          <li><a href="../tutorials/03-live-run-claude-code.html">3. Measuring a live Claude Code session</a></li>
+          <li><a href="../tutorials/04-compare-and-report.html">4. Comparing arms and reporting</a></li>
+          <li><a href="../tutorials/05-dashboard.html">5. Using the dashboard</a></li>
+          <li><a href="../tutorials/06-metrics-reference.html">6. Metrics reference</a></li>
+          <li><a href="../tutorials/07-troubleshooting.html">7. Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="content">
+        <h1>Troubleshooting</h1>
+        <p class="lede">
+          Every entry below is organized problem &rarr; cause &rarr; fix, and is
+          grounded in an error message yardstick actually raises or a fallback
+          its metrics code actually takes -- not a guess at what might go wrong.
+        </p>
+
+        <h2>Diagnostic checklist</h2>
+        <p>
+          Before digging into a specific symptom, run these five commands.
+          Together they tell you whether the proxy is up, whether your harness
+          is really pointed at it, whether a run is active, and whether the
+          dashboard (if you use it) is running.
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys status           # is a run currently active? which experiment/arm?
+ys proxy status      # is the measurement proxy running, and on what pid?
+ys harness status    # is claude-code (or opencode) actually pointed at the proxy?
+ys web status        # is the dashboard running, if you use it?
+tail -n 50 ~/.yardstick/proxy.log   # the proxy's own stdout/stderr</code></pre>
+        </div>
+        <p>
+          The proxy log is the single most useful file when a run looks empty
+          or the proxy won't start -- it's where litellm's own startup errors,
+          auth failures, and per-request tracebacks from yardstick's collector
+          all land (see <code>procutil.launch_detached</code>, which redirects
+          the proxy subprocess's stdout/stderr into that file).
+        </p>
+
+        <h2><code>LITELLM_MASTER_KEY</code> problems</h2>
+        <p>
+          <code>ys proxy up</code> and <code>ys harness point</code> both need
+          <code>LITELLM_MASTER_KEY</code> exported in the shell that runs them,
+          and it must be the <em>same</em> value in both places.
+        </p>
+        <ul>
+          <li>
+            <strong><code>ys proxy up</code> with the variable unset</strong> --
+            exits 1 with: "<code>LITELLM_MASTER_KEY is not set. Export a key of
+            your choosing before starting the proxy...</code>". Fix: export a
+            key first, e.g. <code>export LITELLM_MASTER_KEY=sk-...</code>, then
+            re-run <code>ys proxy up</code>.
+          </li>
+          <li>
+            <strong><code>ys harness point</code> with the variable unset</strong> --
+            exits 1 with: "<code>LITELLM_MASTER_KEY is not set -- export the same
+            key you started `ys proxy up` with.</code>" This is a separate check
+            in the CLI (not the proxy's), because pointing a harness needs the
+            key too -- it's written into the harness config as the API key the
+            harness will send.
+          </li>
+          <li>
+            <strong>mismatched keys</strong> -- if the shell you ran
+            <code>ys proxy up</code> in exported one value and the shell you ran
+            <code>ys harness point</code> in exported a different one (or none,
+            picked up from a stale terminal), the harness config ends up with an
+            API key the proxy's <code>general_settings.master_key</code> doesn't
+            accept. The proxy will reject every request with an auth error --
+            check <code>~/.yardstick/proxy.log</code> for 401s. There's no
+            cross-check in the code for this; the two commands just don't share
+            state beyond the environment variable.
+          </li>
+        </ul>
+        <div class="tip">
+          <p>
+            Export <code>LITELLM_MASTER_KEY</code> once per terminal session
+            before running either command, so both commands definitely see the
+            same value.
+          </p>
+        </div>
+
+        <h2>"no active run" and blocked starts</h2>
+        <p>
+          <code>ys start</code> and <code>ys end</code> both work against a
+          single active-run slot recorded in <code>~/.yardstick/active.json</code>.
+        </p>
+        <ul>
+          <li>
+            <strong><code>ys end</code> with nothing active</strong> -- exits 1
+            with <code>no active run. Start one with `ys start`.</code> This is
+            <code>runs.NoActiveRun</code>, raised when
+            <code>~/.yardstick/active.json</code> doesn't exist.
+          </li>
+          <li>
+            <strong><code>ys start</code> while a run is already active</strong> --
+            fails with <code>state.RunAlreadyActive</code>: "<code>run &lt;id&gt;
+            (exp=..., arm=...) is already active. Use --force to override, or
+            `ys end` it first.</code>" The safe fix is to finish the in-flight
+            run with <code>ys end</code>. The override is
+            <code>ys start ... --force</code>.
+          </li>
+        </ul>
+        <div class="warn">
+          <p>
+            <code>--force</code> overwrites the active-run file but does
+            <strong>not</strong> end the run it replaces -- that older run's
+            database row is left with no <code>ended_at</code>, no
+            <code>wall_clock_s</code>, and no <code>task_success</code>. It will
+            still show up in <code>ys compare</code> as an unfinished repeat
+            with mostly empty metrics. Only reach for <code>--force</code> if
+            you know the previous run's active-run file is stale (e.g. from a
+            crashed session) -- otherwise <code>ys end</code> the real run
+            first.
+          </p>
+        </div>
+        <p>
+          There's also no active-run row without a database row problem: if the
+          run pointed to by <code>active.json</code> was deleted from the
+          database (directly, or somehow lost), <code>ys end</code> fails with
+          <code>runs.ActiveRunMissingDbRow</code>: "<code>run &lt;id&gt; is
+          active but has no database row</code>". There is no dedicated command
+          to clear the active-run file on its own -- the way out is
+          <code>ys start ... --force</code> against any experiment/arm (which
+          overwrites <code>active.json</code> with a fresh, valid run), followed
+          by a normal <code>ys end</code>.
+        </p>
+
+        <h2>Stale pidfiles</h2>
+        <p>
+          The proxy and dashboard are both started as detached background
+          processes via <code>procutil.launch_detached</code>, which writes the
+          child's pid to a pidfile (<code>proxy.pid</code> /
+          <code>web.pid</code>) and its port to a matching port file. Status
+          checks read the pidfile and then ask the OS whether that pid is still
+          alive (<code>procutil.alive</code>, which sends signal 0 via
+          <code>os.kill</code>).
+        </p>
+        <p>A pidfile is "stale" when the file exists but the process it names is gone -- e.g. the machine rebooted, or the process was killed outside of <code>ys proxy down</code>. <code>ys proxy status</code> and <code>ys web status</code> distinguish this from "never started":</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Situation</th>
+                <th>What <code>ys proxy status</code> prints</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>No pidfile at all</td>
+                <td><code>proxy not running</code></td>
+              </tr>
+              <tr>
+                <td>Pidfile exists, process is alive</td>
+                <td><code>proxy running (pid N)</code></td>
+              </tr>
+              <tr>
+                <td>Pidfile exists, process is gone</td>
+                <td><code>proxy not running (stale pidfile, pid N)</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>ys web status</code> follows the identical pattern for the
+          dashboard. A stale pidfile is harmless to leave around, but
+          <code>ys proxy up</code> and <code>ys web up</code> only refuse to
+          start when the recorded pid is genuinely alive -- so a stale pidfile
+          does not block a fresh <code>ys proxy up</code>. If you do want to
+          clear it explicitly, run <code>ys proxy down</code> (or
+          <code>ys web down</code>): both detect the "already gone" case and
+          remove the pidfile and port file, printing
+          <code>process (pid N) was already gone; removed stale pidfile</code>.
+        </p>
+
+        <h2>Port conflicts</h2>
+        <p>
+          The proxy defaults to port 4000, the dashboard to port 8501. If
+          something else on the machine already owns that port,
+          <code>litellm</code> or <code>uvicorn</code> will fail to bind and the
+          child process exits quickly -- <code>ys proxy up</code> /
+          <code>ys web up</code> then time out waiting for the readiness check
+          and report: "<code>proxy (pid N) did not become ready within 15s.
+          Check the log at ~/.yardstick/proxy.log</code>" (or the equivalent
+          dashboard message pointing at <code>web.log</code>). The log will show
+          the real bind error (e.g. "address already in use").
+        </p>
+        <p>
+          Fix it with the <code>--port</code> flag on either command, e.g.
+          <code>ys proxy up --exp experiments/example.yaml --port 4100</code> or
+          <code>ys web up --port 8600</code>. <code>ys start</code> reads back
+          whichever port the proxy was actually started on (from
+          <code>~/.yardstick/proxy.port</code>) when it prints the
+          <code>ANTHROPIC_BASE_URL</code> to export, so you don't have to
+          remember a non-default port yourself.
+        </p>
+
+        <h2>A run recorded no requests</h2>
+        <p>
+          If you drive the agent through a whole task and then run
+          <code>ys end</code>, but the printed metrics are all zero or missing,
+          the most likely cause is that no requests actually landed in
+          <code>requests</code> for that run's id. Every metric that sums or
+          counts requests degrades to an empty-run default rather than erroring:
+          <code>turns</code> is <code>0</code>, <code>cost_usd</code> is
+          <code>0.0</code>, <code>context_high_water</code> is <code>0</code>,
+          <code>tool_calls</code>/<code>tool_error_rate</code> are
+          <code>0</code>/<code>0.0</code>, and <code>cache_read_ratio</code> is
+          <code>0.0</code> (see <code>ys/metrics.py</code>'s
+          <code>token_metrics</code>, <code>overhead_metrics</code>, and
+          <code>tool_call_metrics</code>, all of which special-case the
+          no-requests case explicitly rather than dividing by zero).
+        </p>
+        <p>Usual causes, in order of likelihood:</p>
+        <ul>
+          <li>
+            <strong>The harness was never actually pointed at the proxy.</strong>
+            Run <code>ys harness status</code> -- if it reports
+            <code>not pointed</code>, <code>ys harness point</code> either
+            wasn't run, or was run for a different agent than the one you
+            actually drove.
+          </li>
+          <li>
+            <strong><code>ANTHROPIC_BASE_URL</code> (and
+            <code>ANTHROPIC_API_KEY</code>) weren't exported in the same shell
+            that launched the agent.</strong> <code>ys harness point</code>
+            rewrites the agent's on-disk config, but some agents/setups also
+            read these from the environment at process start -- if the shell
+            that launched the agent doesn't have them exported, it can end up
+            talking to the real Anthropic API directly rather than the proxy,
+            and nothing gets logged. This is exactly what <code>ys start</code>
+            prints the <code>export ANTHROPIC_BASE_URL=...</code> /
+            <code>export ANTHROPIC_API_KEY=...</code> lines for -- see
+            tutorial 3.
+          </li>
+          <li>
+            <strong>Traffic was attributed to a different run.</strong> See the
+            next section -- the requests may well have been logged, just under
+            another run's id (or under <code>unattributed</code>).
+          </li>
+        </ul>
+        <div class="note">
+          <p>
+            Check <code>~/.yardstick/proxy.log</code> too -- if the proxy never
+            received any HTTP requests at all, that's conclusive evidence the
+            harness wasn't actually talking to it.
+          </p>
+        </div>
+
+        <h2>Attribution going wrong</h2>
+        <p>
+          Requests are attributed to a run in one of two ways (see
+          <code>ys/collector.py</code>'s <code>_resolve_run_id</code>): the
+          <code>x-ys-run</code> request header, if the harness sends one, or --
+          failing that -- whatever run id is currently written in
+          <code>~/.yardstick/active.json</code>. Header-based attribution is
+          precise; file-based attribution is a best-effort fallback that is
+          only correct as long as exactly one run is active at a time (see
+          tutorial 3 and the README's Attribution section).
+        </p>
+        <p>Two situations break it:</p>
+        <ul>
+          <li>
+            <strong>Two runs active "at once."</strong> Normally
+            <code>ys start</code> refuses a second run
+            (<code>RunAlreadyActive</code>), but <code>--force</code> lets you
+            override it. If you do that while the first run's agent process is
+            still making requests, those late requests get attributed to
+            whichever run is currently active in <code>active.json</code> --
+            i.e. the new one -- silently corrupting both runs' numbers.
+          </li>
+          <li>
+            <strong>A stale <code>active.json</code>.</strong> If a run ends
+            abnormally (process killed, machine crash) without
+            <code>ys end</code> running, <code>active.json</code> is never
+            cleared. Any proxy traffic that arrives afterwards -- from an
+            unrelated later session that forgot to run <code>ys start</code>
+            again, for instance -- gets attributed to that old, already-dead
+            run id. Conversely, if the run id in a stale
+            <code>active.json</code> doesn't match any row in the
+            <code>runs</code> table (e.g. the run was deleted with
+            <code>ys delete</code>), the collector's write path detects the
+            missing row and falls back to logging the request under the
+            special <code>unattributed</code> run id (see
+            <code>_write</code>'s explicit re-check in
+            <code>ys/collector.py</code>) rather than dropping the data or
+            attributing it to a stray id that doesn't exist.
+          </li>
+        </ul>
+        <div class="warn">
+          <p>
+            Run <code>ys status</code> before starting a new run in a shell you
+            haven't used in a while. If it reports an active run you don't
+            recognize, either <code>ys end</code> it (if it's real) or use
+            <code>ys start --force</code> deliberately -- don't assume
+            <code>active.json</code> is clean.
+          </p>
+        </div>
+
+        <h2><code>ys end</code> fails: no usable <code>success_check</code></h2>
+        <p>
+          <code>ys end</code> runs the active arm's <code>task.success_check</code>
+          shell command and uses its exit code to decide success/fail. If the
+          experiment YAML has no <code>success_check</code> at all,
+          <code>ys end</code> exits 1 with
+          <code>runs.NoSuccessCheck</code>'s message, followed by the CLI's own
+          hint: "<code>experiment has no task.success_check; finish with a
+          manual score instead (re-run with --manual-score).</code>"
+        </p>
+        <p>
+          The escape hatch is exactly what the message says:
+          <code>ys end --manual-score &lt;value&gt;</code>. Any score
+          <code>&gt; 0</code> is recorded as success, anything
+          <code>&le; 0</code> as failure -- <code>manual_score</code> itself is
+          also stored on the run row so it's visible later. Manual scoring skips
+          running <code>success_check</code> entirely, even if one is present in
+          the YAML.
+        </p>
+
+        <h2>Recovering a harness config</h2>
+        <p>
+          <code>ys harness point</code> snapshots an agent's config exactly
+          once, the first time it touches that agent -- into a manifest under
+          <code>~/.yardstick/harness_backups/&lt;agent&gt;.json</code>. That
+          manifest records the original file's exact bytes (or the fact that no
+          file existed yet), and it never moves, even across repeated
+          <code>point</code> calls with different ports/keys.
+          <code>ys harness reset &lt;agent&gt;</code> always restores from that
+          manifest -- never from whatever <code>point</code> last wrote -- and
+          either rewrites the original bytes verbatim, or deletes the config
+          file if it didn't exist before yardstick touched it.
+        </p>
+        <ul>
+          <li>
+            <strong><code>ys harness reset</code> with no prior
+            <code>point</code></strong> -- fails with
+            <code>HarnessError</code>: "<code>no backup found for '&lt;agent&gt;'
+            -- `ys harness point` was never run for it (or the backup dir was
+            cleared), so there's nothing to restore.</code>" There is nothing to
+            restore to; the config, if pointed at all, was pointed by something
+            other than yardstick.
+          </li>
+          <li>
+            <strong>Hand-editing the config after <code>point</code>.</strong>
+            <code>ys harness point</code> only understands strict JSON -- no
+            <code>//</code> comments, no trailing commas. If you (or another
+            tool) leave the file as JSON with comments (this matters especially
+            for opencode's <code>.jsonc</code>), the next
+            <code>ys harness point</code> or <code>ys harness status</code>
+            call fails/degrades: <code>point</code> raises
+            <code>HarnessError</code> -- "<code>&lt;path&gt; is not strict JSON
+            (comments/trailing commas aren't supported by yardstick's merge) --
+            &lt;details&gt;. Edit it by hand instead, or remove comments
+            temporarily.</code>" <code>ys harness status</code> instead just
+            reports <code>not pointed</code> for that agent, because it
+            silently swallows the same parse error rather than raising through
+            the status command.
+          </li>
+        </ul>
+        <div class="warn">
+          <p>
+            If <code>ys harness reset</code> fails (no backup) while your
+            agent's real config is still pointed at a proxy you've since torn
+            down with <code>ys proxy down</code>, your agent is now configured
+            to talk to a dead <code>localhost</code> proxy and will fail every
+            request until you fix the config by hand. Run <code>ys harness
+            status</code> to confirm what's actually on disk before assuming a
+            reset succeeded.
+          </p>
+        </div>
+
+        <h2>Where to look when nothing else helps</h2>
+        <p>
+          Everything yardstick writes lives under <code>YARDSTICK_HOME</code>
+          (default <code>~/.yardstick</code>, overridable via the
+          <code>YARDSTICK_HOME</code> environment variable -- see
+          <code>ys/paths.py</code>). When metrics look wrong, a command hangs,
+          or a status check disagrees with what you expect, these are the files
+          to open directly.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>What it holds</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>yardstick.db</code></td>
+                <td>SQLite database -- experiments, arms, runs, requests, tool_calls. The source of truth for every metric.</td>
+              </tr>
+              <tr>
+                <td><code>active.json</code></td>
+                <td>The currently active run (run id, experiment, arm, started_at), or absent if no run is active. Deleted by <code>ys end</code>.</td>
+              </tr>
+              <tr>
+                <td><code>proxy_config.yaml</code></td>
+                <td>The generated LiteLLM config <code>ys proxy up</code> wrote from your experiment YAML(s) -- model list, callback, master key setting.</td>
+              </tr>
+              <tr>
+                <td><code>proxy.pid</code> / <code>proxy.port</code> / <code>proxy.log</code></td>
+                <td>The proxy's pid, listening port, and stdout/stderr. <strong>Check the log first</strong> for startup failures, bind errors, and auth rejections.</td>
+              </tr>
+              <tr>
+                <td><code>web.pid</code> / <code>web.port</code> / <code>web.log</code></td>
+                <td>Same, for the dashboard (<code>ys web up</code>).</td>
+              </tr>
+              <tr>
+                <td><code>experiments/</code></td>
+                <td>Directory <code>ensure_home()</code> creates alongside the rest of <code>YARDSTICK_HOME</code>.</td>
+              </tr>
+              <tr>
+                <td><code>harness_backups/&lt;agent&gt;.json</code></td>
+                <td>The one-time-snapshot manifest <code>ys harness reset</code> restores from.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2><code>ys compare</code> / <code>ys report</code> erroring or empty</h2>
+        <p>
+          Both commands call the same aggregation
+          (<code>render.compare_experiment</code>) and raise
+          <code>render.CompareError</code> in two situations:
+        </p>
+        <ul>
+          <li>
+            <strong>No recorded runs for any arm.</strong> "<code>no runs found
+            for any arm of experiment '&lt;name&gt;'. Run `ys start` / `ys end`
+            at least once per arm first.</code>" -- by far the most common
+            cause: you ran <code>ys compare</code> against an experiment id
+            that has never completed a full <code>ys start</code>/<code>ys
+            end</code> cycle (or the experiment id in the YAML doesn't match
+            what earlier runs were recorded under).
+          </li>
+          <li>
+            <strong>Task drift.</strong> If the database already has an
+            experiment row recorded with a different <code>task.id</code> than
+            the YAML you're comparing now, <code>ys compare</code> refuses
+            outright: "<code>stored experiment '&lt;name&gt;' was last run with
+            task.id='&lt;old&gt;', but the YAML you're comparing now has
+            task.id='&lt;new&gt;'. Refusing to compare -- these are not the same
+            fixed task.</code>" This guards against silently comparing runs of
+            two different tasks as if they were arms of the same experiment.
+          </li>
+        </ul>
+        <div class="note">
+          <p>
+            This check only compares against the YAML you pass to
+            <code>ys compare</code> right now, not against what each historical
+            run actually executed at the time (<code>ys start</code> overwrites
+            the stored <code>config_yaml</code>/<code>task_json</code> on every
+            run) -- see the module docstring in <code>ys/render.py</code> for
+            the known limitation.
+          </p>
+        </div>
+
+        <h2>Publishing these docs</h2>
+        <p>
+          This site is deployed by <code>.github/workflows/pages.yml</code>,
+          which publishes the contents of <code>docs/</code> to GitHub Pages on
+          every push to <code>main</code> that touches <code>docs/**</code> (or
+          the workflow itself), and on manual dispatch. The one-time repository
+          setting required for this to work is under
+          <strong>Settings &rarr; Pages &rarr; Source: GitHub Actions</strong> --
+          without it, the workflow's deploy job has nothing to publish to. Once
+          that's set, the live site is at
+          <a href="https://allannapier.github.io/yardstick/">https://allannapier.github.io/yardstick/</a>.
+        </p>
+        <p>
+          <code>docs/.nojekyll</code> exists so GitHub Pages serves every file
+          exactly as committed, with no Jekyll build step in between -- without
+          it, Jekyll's default processing skips any file or directory whose
+          name starts with an underscore, which would silently drop
+          <code>docs/_template.html</code> (and any future <code>_</code>-prefixed
+          asset) from the published site.
+        </p>
+        <p>
+          Because the site is served from the <code>/yardstick/</code> subpath
+          rather than the domain root, every link and asset reference across
+          these pages is relative (<code>../assets/site.css</code>,
+          <code>../tutorials/NN-name.html</code>, and so on) -- see
+          <code>docs/CONTRACT.md</code> section 2. An absolute path like
+          <code>/assets/site.css</code> would resolve against the domain root
+          and 404.
+        </p>
+
+        <nav class="pager" aria-label="Page navigation">
+          <a class="pager-prev" href="../tutorials/06-metrics-reference.html">
+            <span class="pager-dir">Previous</span>
+            <span>Metrics reference</span>
+          </a>
+          <span class="pager-spacer"></span>
+        </nav>
+      </div>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>

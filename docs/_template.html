@@ -1,0 +1,199 @@
+<!doctype html>
+<!--
+  yardstick docs -- canonical page template.
+
+  HOW TO USE THIS FILE
+  --------------------
+  Copy this file to `docs/tutorials/NN-your-page.html` and edit only the
+  regions marked `<!-- REPLACE: ... -->`. Everything else (header, sidebar,
+  footer, asset links, script tag) must be reproduced byte-for-byte so every
+  tutorial page shares the same shell. See docs/CONTRACT.md for the full
+  component list and rules.
+
+  This copy of the template lives at docs/_template.html (repo root of the
+  site), but it is written assuming the page will live one level down, at
+  docs/tutorials/*.html -- that's why asset/nav links below use `../`. If you
+  ever copy this file to docs/ itself (e.g. for index.html) you must change
+  every `../assets/...` to `assets/...` and every `../index.html` to
+  `index.html`, and drop the `../` prefix from tutorial links too.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- REPLACE: page title -- keep the " · yardstick" suffix for consistency -->
+  <title>Page title · yardstick</title>
+  <!-- REPLACE: one-sentence page description (used for <meta description> and search snippets) -->
+  <meta name="description" content="One-sentence description of what this tutorial covers." />
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="../index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sidebar-nav">
+      Menu
+    </button>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <div class="page-shell">
+    <!-- Sidebar: reproduce this block verbatim on every tutorials/*.html page.
+         Exactly these 7 tutorials, in this order, plus the Home link above them.
+         The current page's link gets aria-current="page" set automatically by
+         site.js, but you may also set it by hand for correctness without JS. -->
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav" id="sidebar-nav" aria-label="Tutorials">
+        <p class="sidebar-title">yardstick docs</p>
+        <ul>
+          <li><a class="home-link" href="../index.html">Home</a></li>
+        </ul>
+        <p class="sidebar-title">Tutorials</p>
+        <ul>
+          <li><a href="../tutorials/01-install-first-run.html">1. Install and your first run</a></li>
+          <li><a href="../tutorials/02-experiment-yaml.html">2. Designing an experiment</a></li>
+          <li><a href="../tutorials/03-live-run-claude-code.html">3. Measuring a live Claude Code session</a></li>
+          <li><a href="../tutorials/04-compare-and-report.html">4. Comparing arms and reporting</a></li>
+          <li><a href="../tutorials/05-dashboard.html">5. Using the dashboard</a></li>
+          <li><a href="../tutorials/06-metrics-reference.html">6. Metrics reference</a></li>
+          <li><a href="../tutorials/07-troubleshooting.html">7. Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="content">
+        <!-- REPLACE: everything inside <div class="content"> below with the
+             tutorial's real content. The examples of each component class are
+             left in place so you can see the exact markup pattern; delete the
+             ones you don't use and keep the ones you do, matching this markup
+             shape exactly (class names and structure matter -- see CONTRACT.md). -->
+
+        <h1>Tutorial title</h1>
+        <p class="lede">
+          One or two sentences that tell the reader what they'll be able to do
+          after finishing this page.
+        </p>
+
+        <h2>A section heading</h2>
+        <p>
+          Body copy goes here. Use <code>inline code</code> for flags,
+          filenames, and short commands like <code>ys proxy up</code>.
+        </p>
+
+        <!-- callout: note -->
+        <div class="note">
+          <p>Use <code>.note</code> for neutral, supplementary information.</p>
+        </div>
+
+        <!-- callout: warn -->
+        <div class="warn">
+          <p>Use <code>.warn</code> for things that can break a run or lose data.</p>
+        </div>
+
+        <!-- callout: tip -->
+        <div class="tip">
+          <p>Use <code>.tip</code> for optional shortcuts or nice-to-knows.</p>
+        </div>
+
+        <h2>A walkthrough (numbered steps)</h2>
+        <ol class="steps">
+          <li>
+            <h4>First thing to do</h4>
+            <p>Describe the first action. Each <code>&lt;li&gt;</code> is one step.</p>
+          </li>
+          <li>
+            <h4>Second thing to do</h4>
+            <p>Describe the next action.</p>
+          </li>
+          <li>
+            <h4>Last thing to do</h4>
+            <p>Describe the final action and what success looks like.</p>
+          </li>
+        </ol>
+
+        <h2>A code block with a header and copy button</h2>
+        <p>
+          Wrap a <code>&lt;pre&gt;&lt;code&gt;</code> in <code>&lt;div class="code"&gt;</code>
+          with a <code>.code-header</code> sibling before the <code>&lt;pre&gt;</code>.
+          The label text in <code>.code-label</code> is whatever you want shown
+          (a filename, a shell prompt, "output", etc). site.js finds any
+          <code>.code pre</code> and appends the Copy button into the header
+          automatically -- do not hand-write the button.
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys proxy up --exp experiments/example.yaml
+ys harness point claude-code</code></pre>
+        </div>
+
+        <h2>A table</h2>
+        <p>Wrap every table in <code>.table-wrap</code> so wide tables scroll instead of breaking the page.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>cost_usd</code></td>
+                <td>Total billed cost of the run.</td>
+              </tr>
+              <tr>
+                <td><code>turns</code></td>
+                <td>Number of agent/model turns in the run.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Linking onward with cards (landing page only)</h2>
+        <p>
+          <code>.card-grid</code> / <code>.card</code> are primarily for
+          <code>index.html</code>'s tutorial index. Avoid using them inside a
+          tutorial page unless you're building a similar "see also" grid.
+        </p>
+        <div class="card-grid">
+          <a class="card" href="../tutorials/01-install-first-run.html">
+            <span class="card-index">01</span>
+            <span class="card-title">Example card title</span>
+            <p class="card-desc">One-line description of where this card links.</p>
+          </a>
+        </div>
+
+        <!-- Pager: every tutorial page ends with prev/next links. The first
+             tutorial's "prev" link points back to ../index.html; the last
+             tutorial's pager omits the next link (use .pager-spacer instead,
+             see CONTRACT.md). -->
+        <nav class="pager" aria-label="Page navigation">
+          <a class="pager-prev" href="../index.html">
+            <span class="pager-dir">Previous</span>
+            <span>Home</span>
+          </a>
+          <a class="pager-next" href="../tutorials/02-experiment-yaml.html">
+            <span class="pager-dir">Next</span>
+            <span>Designing an experiment</span>
+          </a>
+        </nav>
+        <!-- REPLACE: end of main content -->
+      </div>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>

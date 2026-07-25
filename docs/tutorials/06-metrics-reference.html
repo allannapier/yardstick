@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Metrics reference · yardstick</title>
+  <meta name="description" content="The definitive, source-verified reference for every metric ys/metrics.py computes: what it means and exactly how it's calculated." />
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="../index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sidebar-nav">
+      Menu
+    </button>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav" id="sidebar-nav" aria-label="Tutorials">
+        <p class="sidebar-title">yardstick docs</p>
+        <ul>
+          <li><a class="home-link" href="../index.html">Home</a></li>
+        </ul>
+        <p class="sidebar-title">Tutorials</p>
+        <ul>
+          <li><a href="../tutorials/01-install-first-run.html">1. Install and your first run</a></li>
+          <li><a href="../tutorials/02-experiment-yaml.html">2. Designing an experiment</a></li>
+          <li><a href="../tutorials/03-live-run-claude-code.html">3. Measuring a live Claude Code session</a></li>
+          <li><a href="../tutorials/04-compare-and-report.html">4. Comparing arms and reporting</a></li>
+          <li><a href="../tutorials/05-dashboard.html">5. Using the dashboard</a></li>
+          <li><a href="../tutorials/06-metrics-reference.html">6. Metrics reference</a></li>
+          <li><a href="../tutorials/07-troubleshooting.html">7. Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="content">
+
+        <h1>Metrics reference</h1>
+        <p class="lede">
+          Every metric below is computed per-run by <code>ys/metrics.py</code>, purely from the
+          <code>requests</code>, <code>tool_calls</code>, and <code>runs</code> rows
+          <code>ys/collector.py</code> writes while the proxy is running -- no network calls, no
+          re-scoring, just arithmetic over already-logged data. Sections follow the source file's own
+          grouping. Where the source itself flags a number as best-effort or approximate, that's called
+          out here too -- read those notes before citing a number in a decision.
+        </p>
+
+        <h2>Tokens and cache efficiency</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Meaning</th><th>Computed as</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>billable_tokens</code></td>
+                <td>The token volume yardstick treats as cost-bearing when comparing arms.</td>
+                <td>
+                  Summed over every request in the run:
+                  <code>input_tokens + cache_creation + output_tokens + cache_read * 0.1</code>.
+                  Cache-read tokens are weighted at 0.1 (a tenth) rather than 1.0 because they're
+                  billed at a steep discount versus fresh input tokens -- counting them at full price
+                  would make a heavily-cached arm look artificially token-expensive even though its
+                  actual dollar cost (<code>cost_usd</code>) is genuinely lower.
+                </td>
+              </tr>
+              <tr>
+                <td><code>cost_usd</code></td>
+                <td>Total billed cost of the run.</td>
+                <td>Sum of each request's <code>response_cost</code> (as reported by the proxy).</td>
+              </tr>
+              <tr>
+                <td><code>context_high_water</code></td>
+                <td>The largest single-request prompt size seen anywhere in the run.</td>
+                <td>
+                  <code>max()</code> of <code>context_tokens</code> (<code>input_tokens +
+                  cache_creation + cache_read</code>) across all requests; <code>0</code> if the run
+                  has no requests.
+                </td>
+              </tr>
+              <tr>
+                <td><code>context_growth_rate</code></td>
+                <td>How fast prompt size trends up (or down) across the run's turns.</td>
+                <td>
+                  Least-squares linear slope of <code>context_tokens</code> against request
+                  <code>seq</code>. <code>None</code> if the run has fewer than two requests with
+                  distinct <code>seq</code> values -- there's no line to fit through one point.
+                  Treat it as directional, not precise: it's a straight-line fit over however many
+                  turns the run happened to have.
+                </td>
+              </tr>
+              <tr>
+                <td><code>cache_read_ratio</code></td>
+                <td>What fraction of the run's total input came from cache instead of being paid for fresh.</td>
+                <td>
+                  <code>cache_read / (cache_read + input + cache_creation)</code>, summed across the
+                  run first, then divided; <code>0.0</code> if that denominator is <code>0</code>
+                  (no input tokens recorded at all).
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Fixed overhead</h2>
+        <p>
+          These metrics isolate the tax a harness pays on every single turn just for repeating its
+          system prompt and tool schemas, as opposed to tokens spent on the actual conversation.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Meaning</th><th>Computed as</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>overhead_tokens_per_turn</code></td>
+                <td>The system-prompt + tool-schema token cost paid on a single turn.</td>
+                <td>
+                  <code>system_tokens + tools_tokens</code> of the run's <strong>first request only</strong>
+                  -- later requests are never inspected for this number, even if they differ.
+                </td>
+              </tr>
+              <tr>
+                <td><code>fixed_overhead_tokens</code></td>
+                <td>Total overhead tokens spent across the whole run purely on repeating the system prompt/tools every turn.</td>
+                <td>
+                  <code>overhead_tokens_per_turn * turns</code> -- this assumes every turn pays exactly
+                  the same fixed tax the first turn did.
+                </td>
+              </tr>
+              <tr>
+                <td><code>overhead_share</code></td>
+                <td>What fraction of all context tokens moved in the run was fixed overhead rather than actual conversation content.</td>
+                <td>
+                  <code>fixed_overhead_tokens / sum(context_tokens across all requests)</code>;
+                  <code>0.0</code> if that sum is <code>0</code>.
+                </td>
+              </tr>
+              <tr>
+                <td><code>overhead_drift</code></td>
+                <td>Whether the harness actually kept its system prompt/tool schemas constant across the run.</td>
+                <td>
+                  Boolean: <code>True</code> if any request after the first has a different
+                  <code>system_tokens</code> or <code>tools_tokens</code> count than the first request.
+                  This is the check on the assumption <code>fixed_overhead_tokens</code> makes above --
+                  it flags a harness that mutates its system prompt or tool definitions mid-run, which
+                  the point-in-time <code>overhead_tokens_per_turn</code> number can't see on its own,
+                  since that number only ever looks at request #1.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Turns and tool calls</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Meaning</th><th>Computed as</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>turns</code></td>
+                <td>Number of model requests recorded for the run.</td>
+                <td>Literally a <code>COUNT(*)</code> over the run's rows in the <code>requests</code> table.</td>
+              </tr>
+              <tr>
+                <td><code>tool_calls</code></td>
+                <td>Total number of tool invocations logged for the run.</td>
+                <td>Count of the run's rows in <code>tool_calls</code>.</td>
+              </tr>
+              <tr>
+                <td><code>tool_calls_per_turn</code></td>
+                <td>Average number of tool calls issued per model turn.</td>
+                <td><code>tool_calls / turns</code>; <code>0.0</code> if <code>turns</code> is <code>0</code>.</td>
+              </tr>
+              <tr>
+                <td><code>tool_error_rate</code></td>
+                <td>Fraction of logged tool calls that came back marked as an error.</td>
+                <td>
+                  <code>n_errors / n_calls</code>, where <code>n_errors</code> counts rows with
+                  <code>is_error</code> truthy; <code>0.0</code> if there are no tool calls at all.
+                  <strong>Caveat:</strong> the denominator is every logged tool call, not just the ones
+                  whose result was actually matched back to it. The schema can't distinguish "no result
+                  seen yet" from "resolved, no error" -- both leave <code>is_error = 0</code> -- so a
+                  tool call whose matching result never arrived (a truncated log, a crash mid-call) is
+                  counted as non-error rather than excluded. This can understate the true error rate.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Redundancy</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Meaning</th><th>Computed as</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>unique_tool_calls</code></td>
+                <td>Number of distinct tool calls in the run.</td>
+                <td>Count of distinct <code>input_hash</code> values across the run's tool calls (the hash covers the tool name and its canonicalized input).</td>
+              </tr>
+              <tr>
+                <td><code>redundant_tool_calls</code></td>
+                <td>Number of tool calls that exactly duplicated an earlier one.</td>
+                <td><code>total tool calls - unique_tool_calls</code>.</td>
+              </tr>
+              <tr>
+                <td><code>redundancy_rate</code></td>
+                <td>Fraction of tool calls that were redundant.</td>
+                <td><code>redundant_tool_calls / tool_calls</code>; <code>0.0</code> if there were no tool calls.</td>
+              </tr>
+              <tr>
+                <td><code>read_amplification</code></td>
+                <td>Average number of times each distinct read/grep/glob-style call was repeated.</td>
+                <td>
+                  Restricted to tool calls whose name contains "read", "grep", or "glob" (case-insensitive
+                  substring match). Those calls are grouped by <code>(name, input_hash)</code>, and the
+                  metric is the mean group size -- total read-like calls divided by the number of distinct
+                  groups. It's <code>None</code>, not <code>0</code>, when the run made no read-like calls
+                  at all, so "never measured" stays distinguishable from "measured as 1".
+                  <strong>Documented undercount:</strong> the schema only stores a hash of the
+                  canonicalized tool input, not the raw file path, so grouping by <code>(name, input_hash)</code>
+                  is a best-effort proxy for "read the same file again" -- reading the same file with
+                  slightly different arguments (e.g. a different line range or offset) hashes differently
+                  and is counted as a different "file", which undercounts true amplification.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Compaction and branching</h2>
+        <p>
+          These metrics key off <code>transition</code>, a per-request classification
+          <code>ys/collector.py</code> assigns by comparing a request's message history against the
+          previous request's: <code>continuation</code> (the history is a strict extension of what
+          came before), <code>compaction</code> (the history got shorter -- the signal these metrics
+          are built around), <code>branch</code> (it diverged partway through without shrinking), or
+          <code>reset</code> (no shared prefix at all); a run's very first request has nothing to
+          compare against and gets no transition.
+        </p>
+        <div class="note">
+          <p>
+            The classifier deliberately keys off "did the history get shorter" rather than literally
+            checking whether the first message changed, because the first message is almost always
+            the stable system prompt -- a real mid-conversation summarization leaves it untouched and
+            would be misclassified as a branch under the naive check.
+          </p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Meaning</th><th>Computed as</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>compaction_events</code></td>
+                <td>Number of requests in the run classified as a compaction.</td>
+                <td>Count of requests with <code>transition == "compaction"</code>.</td>
+              </tr>
+              <tr>
+                <td><code>tokens_dropped</code></td>
+                <td>Total context size actually reclaimed by compaction events.</td>
+                <td>
+                  For each compaction event (skipping the run's first request, which has no prior
+                  request to compare against): <code>context_tokens(previous request) -
+                  context_tokens(this request)</code>, summed only when that difference is positive.
+                  A "compaction" event that didn't actually shrink context contributes <code>0</code>,
+                  never a negative number.
+                </td>
+              </tr>
+              <tr>
+                <td><code>turns_to_recompaction</code></td>
+                <td>Average gap, in request sequence number, between consecutive compaction events.</td>
+                <td>
+                  Needs at least two compaction events in the run -- with zero or one event there's no
+                  gap to measure, so it's <code>None</code>.
+                </td>
+              </tr>
+              <tr>
+                <td><code>post_compaction_regrowth</code></td>
+                <td>How fast context tokens climb back up right after a compaction.</td>
+                <td>
+                  <strong>Best-effort:</strong> for each compaction event, fits a linear slope of
+                  <code>context_tokens</code> vs <code>seq</code> over up to the next 5 requests
+                  (the regrowth window) following that event, then averages the per-event slopes across
+                  the run. An event with fewer than 2 following requests contributes no slope; if none
+                  do, the result is <code>None</code>. The window is <strong>not</strong> truncated if
+                  it runs into a subsequent compaction event -- a real drop happening inside the window
+                  is treated as part of "what happens after compaction" rather than excluded, which can
+                  pull the slope down (or negative) when compactions happen close together.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Outcome</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Metric</th><th>Meaning</th><th>Computed as</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>task_success</code></td>
+                <td>Whether the run's success check passed.</td>
+                <td>
+                  Read straight from the run's <code>task_success</code> column (set by <code>ys end</code>
+                  from the arm's <code>success_check</code>, or from <code>--manual-score</code>).
+                  <code>True</code>/<code>False</code> once the run has ended; <code>None</code> if the
+                  run hasn't ended yet, or its row is missing entirely.
+                </td>
+              </tr>
+              <tr>
+                <td><code>wall_clock_s</code></td>
+                <td>Total real time from <code>ys start</code> to <code>ys end</code>.</td>
+                <td>Read directly from the run row; <code>None</code> until the run has ended.</td>
+              </tr>
+              <tr>
+                <td><code>active_s</code></td>
+                <td>Total time the model itself spent generating responses.</td>
+                <td>
+                  Sum of <code>latency_ms</code> over every request in the run, divided by 1000.
+                  Contrast with <code>wall_clock_s</code>: <code>active_s</code> only counts time
+                  inside model requests (network + inference latency per call), while
+                  <code>wall_clock_s</code> spans the whole run -- including whatever happens between
+                  calls: a human reading output, editing files, running tests, thinking. A run can have
+                  a large <code>wall_clock_s</code> and a comparatively tiny <code>active_s</code> if
+                  most of the wall-clock time was spent outside the model.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Which metrics get aggregated across repeats</h2>
+        <p>
+          When <code>ys compare</code>/<code>ys report</code> aggregate an arm's repeats (see
+          <a href="../tutorials/04-compare-and-report.html">the previous tutorial</a> for the
+          gate-filtering rules), every metric above is averaged (mean + population stdev) across the
+          arm's gate-passing runs <strong>except</strong> two: <code>task_success</code> and
+          <code>overhead_drift</code> are deliberately left out of that list. Per the source comment,
+          <code>task_success</code> is excluded because it's the gate itself, and
+          <code>overhead_drift</code> because it's a boolean finding, not a magnitude -- a mean/stdev
+          of a true/false flag wouldn't mean anything.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Aggregated across repeats</th><th>Not aggregated</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>
+                  <code>billable_tokens</code>, <code>cost_usd</code>, <code>context_high_water</code>,
+                  <code>context_growth_rate</code>, <code>cache_read_ratio</code>,
+                  <code>overhead_tokens_per_turn</code>, <code>fixed_overhead_tokens</code>,
+                  <code>overhead_share</code>, <code>turns</code>, <code>tool_calls</code>,
+                  <code>tool_calls_per_turn</code>, <code>tool_error_rate</code>,
+                  <code>unique_tool_calls</code>, <code>redundant_tool_calls</code>,
+                  <code>redundancy_rate</code>, <code>read_amplification</code>,
+                  <code>compaction_events</code>, <code>tokens_dropped</code>,
+                  <code>turns_to_recompaction</code>, <code>post_compaction_regrowth</code>,
+                  <code>wall_clock_s</code>, <code>active_s</code>
+                </td>
+                <td><code>task_success</code> (the gate itself) and <code>overhead_drift</code> (a boolean finding, not a magnitude)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2>Reading the caveats</h2>
+        <div class="warn">
+          <p>
+            A handful of these numbers are explicitly best-effort in the source, and worth keeping in
+            mind before citing them in a decision: <code>read_amplification</code> undercounts when the
+            same file is read with different arguments; <code>tool_error_rate</code>'s denominator
+            counts an unmatched tool call as non-error rather than excluding it;
+            <code>fixed_overhead_tokens</code> assumes the first turn's overhead applies flatly to every
+            turn (cross-check with <code>overhead_drift</code>); and <code>post_compaction_regrowth</code>'s
+            regrowth window isn't truncated at a following compaction event. <code>context_growth_rate</code>
+            and <code>post_compaction_regrowth</code> are both least-squares slopes fit over however many
+            data points a run happens to have -- treat them as directional trends, not precise rates.
+          </p>
+        </div>
+
+        <nav class="pager" aria-label="Page navigation">
+          <a class="pager-prev" href="../tutorials/05-dashboard.html">
+            <span class="pager-dir">Previous</span>
+            <span>Using the dashboard</span>
+          </a>
+          <a class="pager-next" href="../tutorials/07-troubleshooting.html">
+            <span class="pager-dir">Next</span>
+            <span>Troubleshooting</span>
+          </a>
+        </nav>
+      </div>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,60 @@
+name: Deploy docs to GitHub Pages
+
+# Publish the static docs/ site to GitHub Pages whenever it changes on the
+# default branch, or on demand. There is no build step: docs/ is already
+# plain, self-contained HTML/CSS/JS (see docs/CONTRACT.md), so this workflow
+# only needs to package and deploy that directory as-is.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment should run at a time, but a deployment already in
+# flight should be allowed to finish rather than being cancelled by the next
+# push -- so this group queues new runs instead of using cancel-in-progress.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # Job 1: package docs/ into a Pages artifact. Kept separate from the deploy
+  # job so the upload step's output (the artifact) can be consumed by the
+  # dedicated `github-pages` deployment environment below, which is what
+  # gives the deploy job its `page_url` output and GitHub's deployment
+  # history/audit trail for Pages specifically.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs/ as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  # Job 2: deploy the artifact built above to the github-pages environment.
+  # Separated from `build` because deploy-pages targets a GitHub-managed
+  # environment (with its own protection rules and URL output) that only
+  # makes sense once an artifact already exists to deploy.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
