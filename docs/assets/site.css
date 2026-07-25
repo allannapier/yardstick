@@ -54,6 +54,9 @@
   --ys-font-size: 16px;
   --ys-line-height: 1.6;
   --ys-measure: 72ch;
+  /* how far .table-wrap may bleed past the prose measure; raised at wider
+     viewports by the media queries below */
+  --ys-table-bleed: 0rem;
 
   /* layout */
   --ys-header-h: 3.25rem;
@@ -452,6 +455,9 @@ kbd {
   border: 1px solid var(--ys-border);
   border-radius: var(--ys-radius-sm);
   padding: 0.1em 0.4em;
+  /* long inline snippets (a full base-URL export, a config path) are wider
+     than a phone screen; break them rather than pushing the page sideways */
+  overflow-wrap: break-word;
 }
 
 kbd {
@@ -551,9 +557,13 @@ pre.bare {
 
 /* ---- tables --------------------------------------------------------------- */
 
+/* Reference tables carry more than prose does, so let them bleed symmetrically
+   out of the --ys-measure column and use the room <main> actually has. The
+   bleed is 0 until there's width to spare, so narrow screens are unaffected. */
 .table-wrap {
   overflow-x: auto;
-  margin: 0 0 var(--ys-space-5);
+  margin: 0 calc(-1 * var(--ys-table-bleed)) var(--ys-space-5);
+  width: calc(100% + 2 * var(--ys-table-bleed));
   border: 1px solid var(--ys-border);
   border-radius: var(--ys-radius-md);
 }
@@ -574,6 +584,22 @@ td {
   padding: var(--ys-space-2) var(--ys-space-3);
   text-align: left;
   border-bottom: 1px solid var(--ys-border);
+  vertical-align: top;
+}
+
+/* Cell prose must wrap -- a nowrap default makes any table with an
+   explanation column overflow instead of using the height available.
+   break-word keeps short identifiers intact while letting a long formula
+   wrap rather than dictating how wide its column has to be. */
+th code,
+td code {
+  overflow-wrap: break-word;
+}
+
+/* The leading column is the row's key (a metric or field name); keeping it on
+   one line stops it collapsing to one word per line and makes rows scannable. */
+th:first-child,
+td:first-child {
   white-space: nowrap;
 }
 
@@ -884,6 +910,15 @@ tbody tr:hover {
 
   .page-shell {
     flex-direction: column;
+    /* stretch, not flex-start: in column mode flex-start makes children
+       shrink-to-fit, so <main> would size to its widest table and get
+       clipped by the body's overflow-x guard instead of fitting the screen */
+    align-items: stretch;
+  }
+
+  main {
+    width: 100%;
+    max-width: 100%;
   }
 
   .nav-toggle {
@@ -943,4 +978,42 @@ tbody tr:hover {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* ---- wide-viewport table bleed -------------------------------------------- */
+
+/* Only widen tables once the layout has room to spare: below these widths the
+   bleed stays 0 and tables sit flush with the prose column as before. */
+@media (min-width: 1120px) {
+  :root {
+    --ys-table-bleed: 5rem;
+  }
+}
+
+@media (min-width: 1400px) {
+  :root {
+    --ys-table-bleed: 9rem;
+  }
+}
+
+/* ---- responsive: header at phone widths ----------------------------------- */
+
+/* Below ~480px the header row (brand + link + Menu + theme toggle) is wider
+   than the screen and pushes the toggle off the edge. Tighten the chrome and
+   drop the GitHub link, which every page also carries in its footer. */
+@media (max-width: 480px) {
+  .site-header {
+    padding: 0 var(--ys-space-3);
+    gap: var(--ys-space-2);
+  }
+
+  .site-header nav.top-links {
+    display: none;
+  }
+
+  .site-header .brand {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
