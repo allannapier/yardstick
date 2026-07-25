@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Install and your first run · yardstick</title>
-  <meta name="description" content="Install yardstick, initialise its home directory, and take a full start-to-end run through the proxy using the mock model so it costs nothing." />
+  <meta name="description" content="Install yardstick and take the same first run two ways -- the ys CLI and the browser dashboard -- using a mocked model so it costs nothing." />
   <link rel="stylesheet" href="../assets/site.css" />
   <script src="../assets/site.js" defer></script>
 </head>
@@ -48,25 +48,19 @@
 
         <h1>Install and your first run</h1>
         <p class="lede">
-          By the end of this page you'll have yardstick installed, its home
-          directory initialised, and one complete run started and ended
-          through the measurement proxy -- using a mocked model response, so
-          the whole exercise costs exactly $0.
+          There are two ways to drive yardstick: the <code>ys</code> command line, or the
+          browser dashboard started with <code>ys web up</code>. This page takes the exact
+          same first run through both -- start a proxy, start a run of <code>arm-a</code>,
+          end it, look at the result -- using the repo's mocked smoke-test experiment, so
+          either path costs exactly $0. Read Path A, Path B, or both; pick whichever fits
+          how you like to work.
         </p>
 
-        <h2>Prerequisites</h2>
+        <h2>Shared setup</h2>
         <p>
-          You need Python 3.10 or newer and a clone of the
-          <a href="https://github.com/allannapier/yardstick">yardstick repository</a>.
-          Everything below is run from the repo root.
-        </p>
-
-        <h2>Install</h2>
-        <p>
-          Install yardstick in editable mode. This pulls in the <code>ys</code>
-          CLI (a Typer app), <code>litellm[proxy]</code> to run the measurement
-          proxy, <code>fastapi</code>/<code>uvicorn</code> for the optional
-          dashboard, and <code>pydantic</code> for the experiment schema.
+          Both paths need the same three things first. You need Python 3.10 or newer and a
+          clone of the <a href="https://github.com/allannapier/yardstick">yardstick repository</a>;
+          everything below is run from the repo root.
         </p>
         <div class="code">
           <div class="code-header">
@@ -75,20 +69,51 @@
           <pre data-lang="bash"><code>pip install -e .</code></pre>
         </div>
         <p>
-          This installs the <code>ys</code> command itself; every step from
-          here on is a call to <code>ys</code>.
+          This installs the <code>ys</code> CLI (a Typer app), <code>litellm[proxy]</code> to run
+          the measurement proxy, <code>fastapi</code>/<code>uvicorn</code> for the dashboard, and
+          <code>pydantic</code> for the experiment schema -- everything both paths below need.
+        </p>
+        <p>
+          yardstick keeps all of its own state -- the SQLite database of every proxied request,
+          the active-run marker, the generated proxy config, pid/port files, and the
+          dashboard's own experiment YAMLs -- under one directory, <code>YARDSTICK_HOME</code>.
+          If you don't set that environment variable it defaults to <code>~/.yardstick</code>.
+          Both paths below assume the default.
+        </p>
+        <p>
+          Before starting either the CLI's proxy or the dashboard, you need a
+          <code>LITELLM_MASTER_KEY</code>. This is <strong>not</strong> a key anyone issues
+          you -- it's a shared secret you make up yourself, that authenticates your local
+          harness to your local proxy. LiteLLM's proxy reads it as
+          <code>general_settings.master_key</code>, and rejects any request that doesn't send
+          it as a bearer token.
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>export LITELLM_MASTER_KEY=sk-ys-demo-1234</code></pre>
+        </div>
+        <div class="note">
+          <p>
+            The exact same value has to be exported wherever you run <code>ys proxy up</code>
+            <em>and</em> wherever you later run <code>ys harness point</code> (covered in
+            <a href="../tutorials/03-live-run-claude-code.html">tutorial 3</a>) -- the harness
+            sends this value back to the proxy as its API key, so a mismatch just looks like
+            an auth failure. Pick one string and export it once per shell session.
+          </p>
+        </div>
+
+        <h2>Path A -- the CLI</h2>
+        <p>
+          Five commands: <code>ys init</code>, <code>ys proxy up</code>, <code>ys start</code>,
+          <code>ys end</code>, <code>ys proxy down</code>. This path is entirely terminal-driven.
         </p>
 
-        <h2>Initialise yardstick's home directory</h2>
+        <h3>Initialise yardstick's home directory</h3>
         <p>
-          yardstick keeps all of its own state -- the SQLite database of
-          every proxied request, the active-run marker, the generated proxy
-          config, pid/port files -- under one directory,
-          <code>YARDSTICK_HOME</code>. If you don't set that environment
-          variable it defaults to <code>~/.yardstick</code>.
-          <code>ys init</code> creates that directory (and an
-          <code>experiments/</code> subdirectory inside it) and initialises
-          the database schema.
+          <code>ys init</code> creates <code>YARDSTICK_HOME</code> (and an
+          <code>experiments/</code> subdirectory inside it) and initialises the database schema.
         </p>
         <div class="code">
           <div class="code-header">
@@ -104,49 +129,17 @@
 database initialised</code></pre>
         </div>
         <p>
-          "<code>/home/you/.yardstick</code>" will actually print as your own
-          home directory, expanded from <code>~/.yardstick</code> (or
-          wherever <code>YARDSTICK_HOME</code> points, if you've set it). The
-          database file itself lands at
-          <code>&lt;YARDSTICK_HOME&gt;/yardstick.db</code>.
+          "<code>/home/you/.yardstick</code>" will actually print as your own home directory.
+          The database file itself lands at <code>&lt;YARDSTICK_HOME&gt;/yardstick.db</code>.
         </p>
 
-        <h2>Choose a master key</h2>
+        <h3>Start the proxy against the mock experiment</h3>
         <p>
-          Before starting the proxy you need a <code>LITELLM_MASTER_KEY</code>.
-          This is <strong>not</strong> a key anyone issues you -- it's a
-          shared secret you make up yourself, that authenticates your local
-          harness to your local proxy. LiteLLM's proxy reads it as
-          <code>general_settings.master_key</code> (yardstick generates that
-          into the proxy config as <code>os.environ/LITELLM_MASTER_KEY</code>),
-          and rejects any request that doesn't send it as a bearer token.
-        </p>
-        <div class="note">
-          <p>
-            The exact same value has to be exported wherever you run
-            <code>ys proxy up</code> <em>and</em> wherever you later run
-            <code>ys harness point</code> (covered in
-            <a href="../tutorials/03-live-run-claude-code.html">tutorial 3</a>) --
-            the harness sends this value back to the proxy as its API key, so
-            a mismatch just looks like an auth failure. Pick one string and
-            export it once per shell session.
-          </p>
-        </div>
-        <div class="code">
-          <div class="code-header">
-            <span class="code-label">bash</span>
-          </div>
-          <pre data-lang="bash"><code>export LITELLM_MASTER_KEY=sk-ys-demo-1234</code></pre>
-        </div>
-
-        <h2>Start the proxy against the mock experiment</h2>
-        <p>
-          <code>experiments/example.yaml</code> is a smoke-test experiment
-          shipped in the repo. Its single model, <code>probe-claude-mock</code>,
-          is configured with litellm's <code>mock_response</code> field --
-          every request served under that model name gets back a canned
-          string instead of ever reaching Anthropic. That's exactly what
-          makes it safe to run end-to-end for free.
+          <code>experiments/example.yaml</code> is a smoke-test experiment shipped in the repo.
+          Its single model, <code>probe-claude-mock</code>, is configured with litellm's
+          <code>mock_response</code> field -- every request served under that model name gets
+          back a canned string instead of ever reaching Anthropic. That's exactly what makes it
+          safe to run end-to-end for free.
         </p>
         <div class="code">
           <div class="code-header">
@@ -161,12 +154,11 @@ database initialised</code></pre>
           <pre data-lang="output"><code>proxy ready at http://localhost:4000</code></pre>
         </div>
         <p>
-          Under the hood this reads every <code>models:</code> entry (and any
-          arm's <code>model</code> factor with no matching entry) out of the
-          experiment YAML(s) you pass, writes a LiteLLM config to
-          <code>&lt;YARDSTICK_HOME&gt;/proxy_config.yaml</code>, and launches
-          <code>litellm</code> as a detached background process on port
-          4000 by default.
+          Under the hood this reads every <code>models:</code> entry (and any arm's
+          <code>model</code> factor with no matching entry) out of the experiment YAML(s) you
+          pass, writes a LiteLLM config to <code>&lt;YARDSTICK_HOME&gt;/proxy_config.yaml</code>,
+          and launches <code>litellm</code> as a detached background process on port 4000 by
+          default.
         </p>
         <div class="code">
           <div class="code-header">
@@ -181,24 +173,22 @@ database initialised</code></pre>
           <pre data-lang="output"><code>proxy running (pid 48213)</code></pre>
         </div>
 
-        <h2>Run lifecycle: start, then end</h2>
+        <h3>Run lifecycle: start, then end</h3>
         <p>
-          A run in yardstick has two halves. <code>ys start</code> claims the
-          "active run" slot and records a new row in the database; you (or
-          your harness) then do whatever the task calls for; <code>ys end</code>
-          closes that slot out, runs the arm's success check, and prints a
-          summary. This walkthrough doesn't drive any agent traffic through
-          the proxy at all -- it only exercises the start/end mechanics -- so
-          you can see the full lifecycle before adding a real harness in
-          later tutorials.
+          A run in yardstick has two halves. <code>ys start</code> claims the "active run" slot
+          and records a new row in the database; you (or your harness) then do whatever the task
+          calls for; <code>ys end</code> closes that slot out, runs the arm's success check, and
+          prints a summary. This walkthrough doesn't drive any agent traffic through the proxy at
+          all -- it only exercises the start/end mechanics -- so you can see the full lifecycle
+          before adding a real harness in later tutorials.
         </p>
         <ol class="steps">
           <li>
             <h4>Start a run of arm-a</h4>
             <p>
-              <code>experiments/example.yaml</code> declares two arms,
-              <code>arm-a</code> (marked <code>baseline: true</code>) and
-              <code>arm-b</code>. Start a run of <code>arm-a</code>:
+              <code>experiments/example.yaml</code> declares two arms, <code>arm-a</code>
+              (marked <code>baseline: true</code>) and <code>arm-b</code>. Start a run of
+              <code>arm-a</code>:
             </p>
             <div class="code">
               <div class="code-header">
@@ -224,23 +214,18 @@ when the task is finished, run `ys end`</code></pre>
             </div>
             <p>
               The run id (<code>a1b2c3d4</code> above) is random per run, and
-              <code>repeat=1</code> means this is the first recorded run of
-              <code>arm-a</code> -- start it again later and you'll see
-              <code>repeat=2</code>, and so on. What <code>ys start</code>
-              actually <em>did</em> is write a small JSON file at
-              <code>&lt;YARDSTICK_HOME&gt;/active.json</code> (the "active-run
-              state file") holding this run id, the experiment name, the arm,
-              and a start timestamp, plus insert a row for the run in the
-              database. It's this file, not anything printed to your
-              terminal, that <code>ys end</code> and <code>ys status</code>
-              read from.
+              <code>repeat=1</code> means this is the first recorded run of <code>arm-a</code>.
+              <code>ys start</code> wrote a small JSON file at
+              <code>&lt;YARDSTICK_HOME&gt;/active.json</code> (the "active-run state file")
+              holding this run id, the experiment name, the arm, and a start timestamp, plus
+              inserted a row for the run in the database.
             </p>
           </li>
           <li>
             <h4>Check what's active</h4>
             <p>
-              At any point while a run is active, <code>ys status</code> just
-              dumps the contents of that active-run state file:
+              At any point while a run is active, <code>ys status</code> just dumps the contents
+              of that active-run state file:
             </p>
             <div class="code">
               <div class="code-header">
@@ -263,12 +248,10 @@ when the task is finished, run `ys end`</code></pre>
           <li>
             <h4>End the run</h4>
             <p>
-              Since nothing sent any requests through the proxy in this
-              walkthrough, ending the run now will score it and print a
-              summary where every efficiency metric is zero -- which is
-              exactly the point of a smoke test: the whole start-to-end
-              pipeline works, and it cost nothing, because the mock model was
-              never even called.
+              Since nothing sent any requests through the proxy in this walkthrough, ending the
+              run now will score it and print a summary where every efficiency metric is zero --
+              which is exactly the point of a smoke test: the whole start-to-end pipeline works,
+              and it cost nothing, because the mock model was never even called.
             </p>
             <div class="code">
               <div class="code-header">
@@ -296,34 +279,18 @@ result: SUCCESS   wall clock: 2.1s
   active_s: 0</code></pre>
             </div>
             <p>
-              <code>ys end</code> ran the arm's <code>task.success_check</code>
-              (in <code>example.yaml</code> this is literally the shell
-              command <code>true</code>, so it always passes), recorded the
-              result, cleared the active-run state file, and printed the
-              headline metrics -- <code>turns</code>, <code>billable_tokens</code>,
-              <code>cost_usd</code>, <code>cache_read_ratio</code>,
-              <code>context_high_water</code>, <code>tool_calls</code>,
-              <code>tool_error_rate</code>, <code>redundant_tool_calls</code>,
-              <code>compaction_events</code>, and <code>active_s</code>. Every
-              one of these is derived from rows in the requests/tool_calls
-              tables for this run id; with no traffic recorded, they're all
-              zero. <code>wall_clock_s</code> reflects real elapsed time
-              between your <code>ys start</code> and <code>ys end</code>, so
-              yours will differ.
+              <code>ys end</code> ran the arm's <code>task.success_check</code> (in
+              <code>example.yaml</code> this is literally the shell command <code>true</code>,
+              so it always passes), recorded the result, cleared the active-run state file, and
+              printed the headline metrics. Every one of these is derived from rows in the
+              requests/tool_calls tables for this run id; with no traffic recorded, they're all
+              zero. <code>wall_clock_s</code> reflects real elapsed time between your
+              <code>ys start</code> and <code>ys end</code>, so yours will differ.
             </p>
           </li>
         </ol>
 
-        <div class="tip">
-          <p>
-            In <a href="../tutorials/03-live-run-claude-code.html">tutorial 3</a>
-            you'll point a real Claude Code session at the proxy so these
-            same metrics reflect an actual agent session instead of all
-            zeros.
-          </p>
-        </div>
-
-        <h2>Stop the proxy</h2>
+        <h3>Stop the proxy</h3>
         <p>
           When you're done, stop the background proxy process:
         </p>
@@ -340,11 +307,242 @@ result: SUCCESS   wall clock: 2.1s
           <pre data-lang="output"><code>stopped process (pid 48213)</code></pre>
         </div>
 
+        <h2>Path B -- the dashboard</h2>
+        <p>
+          <code>ys web up</code> runs a small FastAPI app that walks the same lifecycle as
+          Path A -- create an experiment, start a proxy, start and end a run, browse the result
+          -- entirely by clicking through pages in a browser. It's a thin presentation layer
+          over the same functions the CLI calls, so it can't drift from what Path A does.
+        </p>
+
+        <div class="warn">
+          <p>
+            <code>ys web up</code> launches the dashboard as a <strong>detached background
+            process</strong>. When you later click "start proxy" in the browser, that click
+            calls the same <code>proxy.proxy_up()</code> function the CLI uses, and it reads
+            <code>LITELLM_MASTER_KEY</code> from <code>os.environ</code> -- but <code>os.environ</code>
+            <strong>inside that already-running dashboard process</strong>, not your current
+            shell. If you export the key <em>after</em> starting the dashboard, the button will
+            fail with:
+          </p>
+        </div>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">output</span>
+          </div>
+          <pre data-lang="output"><code>LITELLM_MASTER_KEY is not set. Export a key of your choosing before starting the proxy, e.g.
+    export LITELLM_MASTER_KEY=sk-...
+The same value is what your harness sends as its API key.</code></pre>
+        </div>
+        <p>
+          Exporting the key in your terminal afterward does nothing until you
+          <code>ys web down</code> and start the dashboard again in a shell that already has it
+          exported. So export <code>LITELLM_MASTER_KEY</code> <em>before</em> the next command.
+        </p>
+
+        <ol class="steps">
+          <li>
+            <h4>Start the dashboard</h4>
+            <p>
+              With <code>LITELLM_MASTER_KEY</code> already exported in this shell:
+            </p>
+            <div class="code">
+              <div class="code-header">
+                <span class="code-label">bash</span>
+              </div>
+              <pre data-lang="bash"><code>ys web up</code></pre>
+            </div>
+            <div class="code">
+              <div class="code-header">
+                <span class="code-label">output</span>
+              </div>
+              <pre data-lang="output"><code>dashboard ready at http://127.0.0.1:8501</code></pre>
+            </div>
+            <p>
+              This launches <code>uvicorn ys.web.app:app</code> as its own detached process,
+              bound to <code>127.0.0.1</code> on port <code>8501</code> by default (use
+              <code>ys web up --port ...</code> for a different one) -- a separate process from
+              the proxy, which is still port 4000. <code>ys web up</code> also calls the same
+              database initialisation <code>ys init</code> does, so <code>ys init</code> is
+              optional on this path; you don't need to run it first just to use the dashboard.
+            </p>
+          </li>
+          <li>
+            <h4>Open the dashboard</h4>
+            <p>
+              Visit <code>http://127.0.0.1:8501</code>. This is <code>GET /</code>: a list of
+              every experiment found in <code>~/.yardstick/experiments/</code>, each with its
+              task id, arm count, and recorded run count. Right now that list is empty.
+            </p>
+          </li>
+          <li>
+            <h4>Get the experiment into the dashboard</h4>
+            <div class="warn">
+              <p>
+                The dashboard's list only reads YAML files that already live in
+                <code>~/.yardstick/experiments/</code>. This repo's <code>experiments/example.yaml</code>
+                is <strong>not</strong> in that directory, so it will never show up on its own --
+                you have to either recreate it through the form (recommended, since that's the
+                dashboard's own workflow) or copy the file in yourself.
+              </p>
+            </div>
+            <p>
+              <strong>Option 1 -- the form.</strong> Click "new experiment" (<code>GET
+              /experiments/new</code>) and fill in the same shape of data as
+              <code>experiments/example.yaml</code>:
+            </p>
+            <ul>
+              <li>experiment name: <code>mock-smoke-01</code> (this becomes the filename, and
+                must match <code>^[A-Za-z0-9][A-Za-z0-9_-]*$</code>)</li>
+              <li>task id: <code>smoke-000</code>, success check: <code>true</code>, timeout:
+                <code>60</code></li>
+              <li>one model row: key <code>probe-claude-mock</code>, kind <strong>mock</strong>,
+                response text <code>This is a mock response used for yardstick smoke testing.</code>
+                -- a mock model row costs nothing and always returns the text you type, instead
+                of calling Anthropic</li>
+              <li>two arm rows, both using model key <code>probe-claude-mock</code>:
+                <code>arm-a</code> with the baseline checkbox ticked, and <code>arm-b</code></li>
+              <li>repeats: <code>2</code></li>
+            </ul>
+            <p>
+              Submitting posts to <code>POST /experiments</code>, which assembles the form fields
+              into the same dict shape <code>ys.experiment.Experiment</code> validates for the
+              CLI -- so duplicate arm ids, more than one arm marked baseline, and other
+              structural mistakes are rejected identically to a hand-written YAML. On success it
+              writes <code>~/.yardstick/experiments/mock-smoke-01.yaml</code> and redirects you
+              straight to the new experiment's detail page.
+            </p>
+            <p>
+              <strong>Option 2 -- copy the file.</strong> If you'd rather reuse the repo's YAML
+              verbatim:
+            </p>
+            <div class="code">
+              <div class="code-header">
+                <span class="code-label">bash</span>
+              </div>
+              <pre data-lang="bash"><code>cp experiments/example.yaml ~/.yardstick/experiments/mock-smoke-01.yaml</code></pre>
+            </div>
+            <div class="warn">
+              <p>
+                The filename has to match the YAML's <code>experiment:</code> name exactly --
+                <code>mock-smoke-01</code> here. Every dashboard link builds the file path as
+                <code>EXPERIMENTS_DIR/&lt;name&gt;.yaml</code>, while the list view will happily
+                show any <code>*.yaml</code> it finds. Copy the file in under any other name
+                (like <code>example.yaml</code>) and it <em>will</em> appear in the list -- as
+                <code>mock-smoke-01</code>, read from inside the file -- but clicking it, or any
+                start-proxy/start-run button on it, fails with
+                <code>no experiment named 'mock-smoke-01'</code>, because the dashboard looks
+                for <code>mock-smoke-01.yaml</code> and finds <code>example.yaml</code> instead.
+                Name the copy after the experiment, not after the source file.
+              </p>
+            </div>
+          </li>
+          <li>
+            <h4>Open the experiment</h4>
+            <p>
+              From the list, open <code>mock-smoke-01</code> (<code>GET
+              /experiments/mock-smoke-01</code>). The detail page shows the task id and success
+              check, the repeat count, a "view comparison" button, a "start proxy for this
+              experiment" button (shown because the proxy isn't running yet), and one card per
+              arm -- each with a "start run" button and, once there are any, a table of that
+              arm's recorded runs (repeat number, run id, started time, success/fail/in-progress
+              pill, wall clock, delete).
+            </p>
+          </li>
+          <li>
+            <h4>Start the proxy from the experiment page</h4>
+            <p>
+              Click "start proxy for this experiment". This posts to <code>POST
+              /experiments/mock-smoke-01/proxy/up</code>, which calls the same
+              <code>proxy.proxy_up()</code> as <code>ys proxy up --exp</code> -- but scoped to
+              just this one experiment's models, rather than every experiment you might pass on
+              a CLI invocation. It redirects back to the experiment page with either "proxy
+              started" or (see the warning above) the missing-key error.
+            </p>
+          </li>
+          <li>
+            <h4>Start a run on arm-a</h4>
+            <p>
+              In the <code>arm-a</code> card, click "start run (repeat 1)". This posts to
+              <code>POST /experiments/mock-smoke-01/runs/start</code> with the arm id, which
+              calls the same run-start logic <code>ys start</code> does. It redirects back to
+              the experiment page with a flash message showing the new run id and repeat number.
+              From here on, every page the dashboard serves -- not just this one -- shows an
+              "active run" card at the top, because the dashboard enforces the same
+              single-active-run-at-a-time rule the CLI does.
+            </p>
+          </li>
+          <li>
+            <h4>End the run</h4>
+            <p>
+              Use the inline form inside that "active run" card (it's the same form on every
+              page, including this one) to end the run -- optionally with a manual-score field
+              that skips the success check, exactly like <code>ys end --manual-score</code>.
+              Submitting posts to <code>POST /runs/end</code>, which calls the same
+              <code>runs.finish_run</code> the CLI's <code>ys end</code> calls: it runs
+              <code>true</code> as the success check (always passes), clears the active-run
+              state, and redirects to the experiment page with a "run ... finished: SUCCESS"
+              message. As with Path A, no traffic went through the proxy in this walkthrough, so
+              every efficiency metric on the finished run is zero.
+            </p>
+          </li>
+          <li>
+            <h4>View the run detail</h4>
+            <p>
+              Back on the experiment page, click the run id in the <code>arm-a</code> table
+              (<code>GET /runs/{run_id}</code>). It shows the run's experiment/arm/repeat and
+              success pill, a summary card of the same headline metrics <code>ys end</code>
+              prints (<code>turns</code>, <code>billable_tokens</code>, <code>cost_usd</code>,
+              <code>cache_read_ratio</code>, <code>context_high_water</code>,
+              <code>tool_calls</code>, <code>tool_error_rate</code>,
+              <code>redundant_tool_calls</code>, <code>compaction_events</code>,
+              <code>active_s</code>), plus the full per-request log and tool-call log -- both
+              empty here, since nothing called the proxy.
+            </p>
+          </li>
+          <li>
+            <h4>View the compare page</h4>
+            <p>
+              Back on the experiment page, click "view comparison" (<code>GET
+              /experiments/mock-smoke-01/compare</code>). This renders the exact same
+              <code>render.compare_experiment</code> + <code>render.render_html</code> pipeline
+              as <code>ys report --html</code>, served directly as a page instead of written to
+              a file.
+            </p>
+          </li>
+        </ol>
+
+        <div class="tip">
+          <p>
+            Everything in Path B has a CLI equivalent covered in
+            <a href="../tutorials/05-dashboard.html">tutorial 5</a>, including the full route
+            table, the deletion/active-run rules, and what the dashboard deliberately can't do.
+          </p>
+        </div>
+
+        <h2>Where the two paths meet</h2>
+        <p>
+          Path A and Path B are two front ends over the same state: both read and write the
+          same SQLite database at <code>~/.yardstick/yardstick.db</code>. Start a run with
+          <code>ys start</code> and you'll see it appear as the dashboard's "active run" card;
+          start one from the dashboard and <code>ys status</code> will print its run id from
+          your terminal. Mixing them across one run is fine -- there's only ever one active-run
+          slot, checked the same way from both sides.
+        </p>
         <div class="note">
           <p>
-            You now have a working install and have seen every stage of the
-            run lifecycle without spending any API budget. Next up:
-            understanding the experiment YAML itself, field by field.
+            Neither path here drove a real coding agent through the proxy -- both just exercised
+            the start/end mechanics with the mock model. Pointing an actual agent's config at the
+            proxy (<code>ys harness point</code>) is CLI-only; there's no dashboard equivalent.
+            That's <a href="../tutorials/03-live-run-claude-code.html">tutorial 3</a>.
+          </p>
+        </div>
+
+        <div class="note">
+          <p>
+            You now have a working install and have seen the full run lifecycle from both the
+            terminal and the browser, without spending any API budget. Next up: understanding
+            the experiment YAML itself, field by field.
           </p>
         </div>
 
