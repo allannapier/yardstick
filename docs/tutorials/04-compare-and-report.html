@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Comparing arms and reporting · yardstick</title>
+  <meta name="description" content="How ys compare and ys report aggregate recorded runs into a table or a self-contained HTML report, and exactly what the numbers mean." />
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script src="../assets/site.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="../index.html">
+      <span class="mark">ys</span><span>yardstick docs</span>
+    </a>
+    <span class="tagline">agent / harness / model efficiency measurement</span>
+    <nav class="top-links" aria-label="External links">
+      <a href="https://github.com/allannapier/yardstick">GitHub</a>
+    </nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sidebar-nav">
+      Menu
+    </button>
+    <button type="button" id="theme-toggle" aria-label="Toggle color theme">☽</button>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav" id="sidebar-nav" aria-label="Tutorials">
+        <p class="sidebar-title">yardstick docs</p>
+        <ul>
+          <li><a class="home-link" href="../index.html">Home</a></li>
+        </ul>
+        <p class="sidebar-title">Tutorials</p>
+        <ul>
+          <li><a href="../tutorials/01-install-first-run.html">1. Install and your first run</a></li>
+          <li><a href="../tutorials/02-experiment-yaml.html">2. Designing an experiment</a></li>
+          <li><a href="../tutorials/03-live-run-claude-code.html">3. Measuring a live Claude Code session</a></li>
+          <li><a href="../tutorials/04-compare-and-report.html">4. Comparing arms and reporting</a></li>
+          <li><a href="../tutorials/05-dashboard.html">5. Using the dashboard</a></li>
+          <li><a href="../tutorials/06-metrics-reference.html">6. Metrics reference</a></li>
+          <li><a href="../tutorials/07-troubleshooting.html">7. Troubleshooting</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="content">
+
+        <h1>Comparing arms and reporting</h1>
+        <p class="lede">
+          Once every arm of an experiment has at least one recorded run, <code>ys compare</code>
+          and <code>ys report</code> aggregate those runs into a table you can read at a glance --
+          this page explains exactly what each number means and where the subtleties are.
+        </p>
+
+        <h2>The two commands</h2>
+        <p>
+          Both read the same already-recorded runs from <code>~/.yardstick/yardstick.db</code>;
+          neither one runs anything or talks to a model.
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">bash</span>
+          </div>
+          <pre data-lang="bash"><code>ys compare --exp experiments/example.yaml
+ys report  --exp experiments/example.yaml --html report.html</code></pre>
+        </div>
+        <p>
+          <code>ys compare</code> prints a Rich table straight to the terminal. <code>ys report</code>
+          computes the same comparison and writes it out as a single self-contained HTML file --
+          no external stylesheets, scripts, or fonts, so it opens correctly straight from disk, can be
+          emailed as an attachment, or committed alongside a PR as a record of what a change did to
+          the numbers.
+        </p>
+
+        <h2>How runs are grouped into arms</h2>
+        <p>
+          Every run is stored under an arm row id of the form <code>{experiment}::{arm}</code>.
+          <code>ys compare</code>/<code>ys report</code> pull all recorded run ids for each arm in
+          the experiment YAML, skip any arm with zero runs, and sort the results so the baseline arm
+          (the one arm with <code>baseline: true</code> in the YAML, if any) comes first -- every
+          other arm follows in alphabetical order by arm id. The baseline's column header gets a
+          trailing <code>*</code> so you can always tell which column the percentage deltas are
+          measured against.
+        </p>
+        <div class="note">
+          <p>
+            If no arm in the experiment has any recorded runs yet, both commands fail with an error
+            telling you to run <code>ys start</code> / <code>ys end</code> at least once per arm first.
+          </p>
+        </div>
+
+        <h2>The gate: which runs count as a "success"</h2>
+        <p>
+          Before anything is averaged, every run in an arm is passed through a gate -- by default,
+          a run passes the gate if its <code>task_success</code> flag (set by <code>ys end</code>
+          from the arm's <code>success_check</code>) is true. This is the subtlest part of reading
+          the table:
+        </p>
+        <ul>
+          <li>
+            <strong>Every</strong> run in the arm counts toward <code>n_runs</code> and toward the
+            success count/rate, whether it passed the gate or not.
+          </li>
+          <li>
+            Only gate-passing runs contribute to the mean and spread of every efficiency metric
+            (cost, tokens, turns, tool calls, and so on). A failed run's cost, token counts, and
+            turn count are excluded from those averages entirely.
+          </li>
+        </ul>
+        <p>
+          The reasoning, straight from <code>aggregate_run_metrics</code>'s docstring: an arm that's
+          cheap but fails half the time should not look cheap. If failed runs were folded into the
+          efficiency means, an arm that gives up after one cheap turn would drag its own average cost
+          down and look like a bargain -- even though it didn't finish the task.
+        </p>
+
+        <h2>cost_per_success</h2>
+        <p>
+          <code>cost_per_success</code> is deliberately computed differently from the other metrics:
+          it sums <code>cost_usd</code> over <strong>all</strong> of the arm's runs -- successful or
+          not, because a failed run still spent real money on tokens -- and divides by the count of
+          successful runs. If an arm has zero successes, <code>cost_per_success</code> is <code>None</code>
+          (shown as <code>-</code>) rather than a divide-by-zero.
+        </p>
+
+        <h2>Spread is population standard deviation</h2>
+        <p>
+          The "spread" shown next to a mean (in the HTML report; the terminal table doesn't show it,
+          see below) is <code>statistics.pstdev</code> over the gate-passing runs' values for that
+          metric. Population stdev is <code>0.0</code> for a single observation rather than undefined,
+          which is what keeps a <code>repeats: 1</code> arm's row usable instead of blank. One wrinkle:
+          the HTML report only prints the <code>± spread (n=...)</code> annotation when more than one
+          run contributed (<code>n &gt; 1</code>) -- so a single-success arm's cell shows a bare mean
+          with no <code>±</code>, even though the spread value being suppressed is <code>0.0</code>,
+          not missing.
+        </p>
+
+        <h2>Percentage deltas against the baseline</h2>
+        <p>
+          Every non-baseline arm's row also shows a percentage delta against the baseline arm's mean
+          for that metric: <code>(value - baseline) / abs(baseline) * 100</code>. <code>_delta_str</code>
+          renders nothing at all -- not <code>0%</code>, not a dash, just an empty string -- when the
+          baseline's mean is missing (no gate-passing runs for that metric) or exactly zero, since a
+          percentage change against zero is meaningless. You'll see this in the example below:
+          <code>tool_error_rate</code> and <code>compaction_events</code> both start at <code>0</code>
+          for the baseline arm, so the comparison arm's values for those two rows carry no delta at all,
+          even though something clearly changed.
+        </p>
+
+        <h2>The fingerprint-drift signal</h2>
+        <p>
+          <code>_fingerprint_drifted</code> checks, for any arm with two or more repeats, whether the
+          <code>(model, toolset_hash, system_prompt_hash)</code> triple recorded on each run actually
+          stayed the same across every repeat (a run whose fingerprint is still unset -- no requests
+          logged yet -- isn't counted as drift, just as not-yet-observed). If more than one distinct
+          triple shows up among an arm's repeats, that arm is flagged: its header gets
+          <code>[UNCONTROLLED]</code> appended in the terminal table, or an <code>UNCONTROLLED</code>
+          badge in the HTML report.
+        </p>
+        <p>
+          This is a broken-control warning, not a metrics warning: it means the repeats you're
+          averaging together didn't actually run the same treatment. A common cause is editing
+          <code>~/.claude/settings.json</code> or the experiment's model config mid-experiment, or
+          pointing a harness at a different model between repeats without realizing the arm's factor
+          value didn't change accordingly.
+        </p>
+
+        <div class="warn">
+          <p>
+            <code>ys compare</code>/<code>ys report</code> also refuse to compare at all if the
+            experiment already has a database row recorded under a different <code>task.id</code>
+            than the YAML you're pointing <code>--exp</code> at now. This guardrail only checks the
+            experiment's stored task against the <em>current</em> YAML, though -- it can't detect
+            that some individual historical run actually executed a since-changed task, since
+            <code>ys start</code> overwrites the stored config/task on every run. Keep <code>task.id</code>
+            stable for the life of an experiment rather than relying on this check to catch drift after
+            the fact.
+          </p>
+        </div>
+
+        <h2>Example: reading the table</h2>
+        <p>
+          Here's a realistic two-arm comparison: <code>arm-a</code> is the baseline (3 repeats, all
+          successful); <code>arm-b</code> (3 repeats, one failed) is noisier and more expensive. This
+          is the shape <code>ys report --html</code> renders each metric row in -- mean, then
+          <code>± spread (n=...)</code> when more than one run contributed, then the percentage delta
+          against the baseline:
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th></th>
+                <th>arm-a *</th>
+                <th>arm-b</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><th>success rate</th><td>3/3</td><td>2/3</td></tr>
+              <tr><th>cost_per_success</th><td>0.0410</td><td>0.1250</td></tr>
+              <tr><th>cost_usd</th><td>0.041 ± 0.0025 (n=3)</td><td>0.05 ± 0.0050 (n=2)  +22%</td></tr>
+              <tr><th>billable_tokens</th><td>2270 ± 98 (n=3)</td><td>2960 ± 160 (n=2)  +30%</td></tr>
+              <tr><th>turns</th><td>3 ± 0 (n=3)</td><td>4.5 ± 0.5 (n=2)  +50%</td></tr>
+              <tr><th>wall_clock_s</th><td>42 ± 1.6 (n=3)</td><td>51.8 ± 3.8 (n=2)  +23%</td></tr>
+              <tr><th>tool_calls</th><td>5 ± 0.8 (n=3)</td><td>7 ± 1 (n=2)  +40%</td></tr>
+              <tr><th>redundant_tool_calls</th><td>2 ± 0.8 (n=3)</td><td>3 ± 1 (n=2)  +50%</td></tr>
+              <tr><th>tool_error_rate</th><td>0 ± 0 (n=3)</td><td>0.14 ± 0.04 (n=2)</td></tr>
+              <tr><th>cache_read_ratio</th><td>0.63 ± 0.024 (n=3)</td><td>0.41 ± 0.03 (n=2)  -35%</td></tr>
+              <tr><th>fixed_overhead_tokens</th><td>2400 ± 82 (n=3)</td><td>3600 ± 200 (n=2)  +50%</td></tr>
+              <tr><th>context_high_water</th><td>1250 ± 41 (n=3)</td><td>1900 ± 100 (n=2)  +52%</td></tr>
+              <tr><th>compaction_events</th><td>0 ± 0 (n=3)</td><td>1 ± 0 (n=2)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Notice <code>cost_per_success</code> (0.1250) for <code>arm-b</code> is much higher than
+          its <code>cost_usd</code> mean (0.05) -- that's the failed run's cost folded into the
+          numerator while being excluded from the mean, exactly as described above.
+        </p>
+
+        <p>
+          The terminal table from <code>ys compare</code> carries the same means and deltas, but
+          no spread and no per-run charts:
+        </p>
+        <div class="code">
+          <div class="code-header">
+            <span class="code-label">output</span>
+          </div>
+          <pre data-lang="output"><code>          mock-smoke-01   task: smoke-000   repeats: 3
+┏━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━┓
+┃ metric                ┃  arm-a* ┃      arm-b  ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━┩
+│ success rate          │    3/3  │        2/3  │
+│ cost_per_success      │ 0.0410  │     0.1250  │
+│ cost_usd              │  0.041  │ 0.05  +22%  │
+│ billable_tokens       │   2270  │ 2960  +30%  │
+│ turns                 │      3  │  4.5  +50%  │
+│ wall_clock_s          │     42  │ 51.8  +23%  │
+│ tool_calls            │      5  │    7  +40%  │
+│ redundant_tool_calls  │      2  │    3  +50%  │
+│ tool_error_rate       │      0  │ 0.14        │
+│ cache_read_ratio      │   0.63  │ 0.41  -35%  │
+│ fixed_overhead_tokens │   2400  │ 3600  +50%  │
+│ context_high_water    │   1250  │ 1900  +52%  │
+│ compaction_events     │      0  │    1        │
+└───────────────────────┴─────────┴─────────────┘</code></pre>
+        </div>
+
+        <h2>What the HTML report adds</h2>
+        <p>
+          <code>ys report --html</code> renders the identical comparison table plus a per-run detail
+          section the terminal can't show. For every run of every arm it draws two small inline SVGs,
+          computed straight from that run's requests:
+        </p>
+        <ul>
+          <li>
+            <strong>Context sparkline</strong> -- a polyline of <code>input + cache_creation +
+            cache_read</code> tokens for each request in the run, in turn order, scaled to that
+            run's own min/max so the shape of context growth is visible regardless of the run's
+            absolute size. Shown as "not enough data" for a run with fewer than two requests.
+          </li>
+          <li>
+            <strong>Compaction timeline</strong> -- one colored bar per request, colored by that
+            request's <code>transition</code> classification (continuation, compaction, branch,
+            reset, or gray for a request with nothing to compare against). A quick visual read of
+            when and how often a run's context got reset or summarized -- see
+            <a href="../tutorials/06-metrics-reference.html">the metrics reference</a> for what each
+            transition means.
+          </li>
+        </ul>
+        <div class="tip">
+          <p>
+            Because the report is one self-contained HTML string with everything inlined -- no
+            external CSS, JS, fonts, or images -- it's safe to open directly from disk, attach to an
+            email, or commit into a repo as a durable snapshot of a comparison. There's nothing else
+            to ship alongside it.
+          </p>
+        </div>
+
+        <nav class="pager" aria-label="Page navigation">
+          <a class="pager-prev" href="../tutorials/03-live-run-claude-code.html">
+            <span class="pager-dir">Previous</span>
+            <span>Measuring a live Claude Code session</span>
+          </a>
+          <a class="pager-next" href="../tutorials/05-dashboard.html">
+            <span class="pager-dir">Next</span>
+            <span>Using the dashboard</span>
+          </a>
+        </nav>
+      </div>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>yardstick -- agent / harness / model efficiency measurement rig.</p>
+    <p><a href="https://github.com/allannapier/yardstick">Source on GitHub</a></p>
+  </footer>
+</body>
+</html>
