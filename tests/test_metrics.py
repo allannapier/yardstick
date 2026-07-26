@@ -339,3 +339,48 @@ def test_main_thread_fingerprint_prefers_largest_thread_over_first_request():
         fp = metrics.main_thread_fingerprint(cur, "r_fp")
 
     assert fp["model"] == "main-model"
+
+
+# ---------------------------------------------------------------------------
+# finding 26: the largest thread isn't always the one that started the run.
+# ---------------------------------------------------------------------------
+
+def test_main_thread_started_run_true_when_largest_thread_contains_seq1():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_started")
+        _mk_request(cur, "r_started", 1, thread_key="main")
+        _mk_request(cur, "r_started", 2, thread_key="main")
+        _mk_request(cur, "r_started", 3, thread_key="bg")
+
+    with db.cursor() as cur:
+        m = metrics.compute_run_metrics(cur, "r_started")
+
+    assert m["main_thread_started_run"] is True
+
+
+def test_main_thread_started_run_false_when_subagent_outnumbers_driving_conversation():
+    """Regression test for finding 26: a long-running Task subagent can
+    issue more requests than the conversation that spawned it, so the
+    largest-thread rule (_main_thread_key, finding 4) picks the subagent as
+    "main" instead of the conversation that actually started the run (seq
+    1). _main_thread_key keeps its size-based rule -- see its docstring for
+    why overriding to "whichever thread has seq=1" isn't a strict
+    improvement, given test_main_thread_fingerprint_prefers_largest_thread_over_first_request
+    above pins the opposite failure mode -- but main_thread_started_run must
+    surface the disagreement instead of resolving it silently."""
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_sub")
+        _mk_request(cur, "r_sub", 1, thread_key="main")
+        _mk_request(cur, "r_sub", 2, thread_key="main")
+        _mk_request(cur, "r_sub", 3, thread_key="subagent")
+        _mk_request(cur, "r_sub", 4, thread_key="subagent")
+        _mk_request(cur, "r_sub", 5, thread_key="subagent")
+
+    with db.cursor() as cur:
+        main_key = metrics._main_thread_key(cur, "r_sub")
+        m = metrics.compute_run_metrics(cur, "r_sub")
+
+    assert main_key == "subagent"  # largest thread still wins -- unchanged from finding 4
+    assert m["main_thread_started_run"] is False

@@ -236,6 +236,55 @@ def test_harness_point_without_exp_arm_warns(fake_claude_agent):
     assert "no --exp/--arm given" in plain(result.stdout)
 
 
+def test_end_warns_when_largest_thread_is_not_the_driving_conversation(tmp_path):
+    """Regression test for finding 26: a Task subagent that issues more
+    requests than the conversation that started the run becomes the
+    "main thread" (finding 4's largest-thread rule, kept deliberately --
+    see IMPROVEMENTS.md). `ys end` must surface that as a visible warning
+    instead of silently reporting subagent-derived turns/compaction metrics
+    as if they were the driving conversation's."""
+    exp = _write_exp(tmp_path)
+    start = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    assert start.exit_code == 0, start.stdout
+    run_id = re.search(r"run (\S+)", plain(start.stdout)).group(1)
+
+    with db.cursor() as cur:
+        # the driving conversation: 2 requests, holds seq=1
+        for seq in (1, 2):
+            cur.execute(
+                "INSERT INTO requests (run_id, seq, ts, thread_key) VALUES (?,?,?,?)",
+                (run_id, seq, "2026-01-01T00:00:00Z", "main"),
+            )
+        # a Task subagent that out-issues it
+        for seq in (3, 4, 5):
+            cur.execute(
+                "INSERT INTO requests (run_id, seq, ts, thread_key) VALUES (?,?,?,?)",
+                (run_id, seq, "2026-01-01T00:00:00Z", "subagent"),
+            )
+
+    end = runner.invoke(app, ["end"])
+    assert end.exit_code == 0, end.stdout
+    assert "doesn't contain its first request" in unwrapped(end.stdout)
+
+
+def test_end_does_not_warn_when_largest_thread_holds_seq1(tmp_path):
+    exp = _write_exp(tmp_path)
+    start = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    assert start.exit_code == 0, start.stdout
+    run_id = re.search(r"run (\S+)", plain(start.stdout)).group(1)
+
+    with db.cursor() as cur:
+        for seq in (1, 2, 3):
+            cur.execute(
+                "INSERT INTO requests (run_id, seq, ts, thread_key) VALUES (?,?,?,?)",
+                (run_id, seq, "2026-01-01T00:00:00Z", "main"),
+            )
+
+    end = runner.invoke(app, ["end"])
+    assert end.exit_code == 0, end.stdout
+    assert "doesn't contain its first request" not in unwrapped(end.stdout)
+
+
 def test_start_warns_when_proxy_missing_arm_model(tmp_path, monkeypatch):
     monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-test")
     monkeypatch.setattr(proxy, "model_available", lambda model, port, key: False)

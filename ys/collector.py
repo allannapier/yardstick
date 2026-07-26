@@ -99,6 +99,39 @@ def _shared_prefix_len(prev: list, cur: list) -> int:
     return k
 
 
+# Finding 25: `_classify_transition` calls *any* shorter history a
+# "compaction" as long as it isn't a byte-for-byte continuation -- that's
+# deliberate (a real compaction rewrites message[0], which is the same
+# thing an unrelated conversation does, so the classifier can't use
+# position-0 equality to tell them apart either; see its docstring). That
+# leaves `_resolve_thread`'s system_prompt_hash match as the *only* thing
+# standing between a same-system-prompt subagent/background call and being
+# absorbed into the main thread as a fabricated compaction event -- exactly
+# what finding 4 exists to prevent.
+#
+# A second, coarser signal: a genuine compaction is lossy but not
+# annihilative -- it summarizes old turns while keeping the conversation
+# going, so a meaningful fraction of the message count survives. An
+# unrelated conversation restarts from a small, roughly constant handful of
+# messages (a subagent's task instructions, a title-gen prompt) regardless
+# of how long the thread it's mistaken for has grown -- the longer the real
+# conversation gets, the more implausible it is that an unrelated exchange
+# would happen to retain a third of its message count. Requiring at least
+# that fraction to survive is a low bar for a real compaction to clear and,
+# per finding 25's own caveat, not a precise boundary (hashes alone can't
+# fully disambiguate a same-system-prompt impostor from a real compaction)
+# -- just a deliberately conservative floor against the worst case: a tiny
+# unrelated exchange landing right after a long thread and being read as
+# "compaction" on message-count alone.
+_MIN_COMPACTION_RATIO = 1 / 3
+
+
+def _plausible_compaction(prev: list, cur: list) -> bool:
+    if not prev:
+        return True
+    return len(cur) >= len(prev) * _MIN_COMPACTION_RATIO
+
+
 def _resolve_thread(cur, run_id: str, system_prompt_hash, msg_hashes: list) -> tuple:
     """Assigns a request to a thread and classifies its transition within
     that thread in one pass, so transition classification and conversation
@@ -117,6 +150,19 @@ def _resolve_thread(cur, run_id: str, system_prompt_hash, msg_hashes: list) -> t
     anchor would have pinned on -- still resolve to the same thread instead
     of registering as a new one. Ties go to the larger shared-message-
     prefix match. No candidate (or an empty run) starts a new thread.
+
+    Assumption (finding 25): matching system_prompt_hash is treated as
+    strong evidence of "same conversation", and a "compaction" transition
+    is accepted as a plausible parent on top of that. That combination is
+    only safe because, in every harness this rig currently drives, a
+    subagent or background call carries a different system prompt from the
+    main conversation -- a property of those harnesses at their current
+    versions, not a guarantee. If a harness ever reused the main system
+    prompt for background/subagent traffic, `_plausible_compaction` above
+    is the second signal that keeps that traffic from being absorbed into
+    the main thread as a fabricated compaction event: a candidate whose
+    message count collapsed far more than a real compaction plausibly would
+    is rejected here and falls through to starting its own thread instead.
     """
     rows = cur.execute(
         """
@@ -138,6 +184,8 @@ def _resolve_thread(cur, run_id: str, system_prompt_hash, msg_hashes: list) -> t
         prev_hashes = json.loads(row["msg_hashes_json"]) if row["msg_hashes_json"] else []
         transition = _classify_transition(prev_hashes, msg_hashes)
         if transition is None or transition == "reset":
+            continue
+        if transition == "compaction" and not _plausible_compaction(prev_hashes, msg_hashes):
             continue
         overlap = _shared_prefix_len(prev_hashes, msg_hashes)
         if best is None or overlap > best[0]:

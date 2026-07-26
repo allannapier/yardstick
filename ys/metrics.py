@@ -38,13 +38,54 @@ def _main_thread_key(cur, run_id: str):
     actual driving conversation, as opposed to interleaved background or
     Task-subagent traffic. Ties (e.g. a run with no thread_key data at all,
     grouped under NULL) broken toward whichever thread started first. See
-    finding 4 in IMPROVEMENTS.md."""
+    finding 4 in IMPROVEMENTS.md.
+
+    Assumption (finding 26): "most requests" and "the conversation that
+    started the run" are usually the same thread, but not always -- a
+    long-running Task subagent can plausibly issue more requests than the
+    conversation that spawned it, and this rule would then pick the
+    subagent as "main". The rule is kept as-is rather than overridden to
+    "whichever thread contains seq=1", because that alternative has its own
+    failure mode already pinned by
+    test_main_thread_fingerprint_prefers_largest_thread_over_first_request:
+    a background call (e.g. title generation) that happens to be logged as
+    the run's very first request, ahead of the real conversation's first
+    turn, is a singleton that must not win just for being first. Neither
+    signal (size, chronology) dominates the other, so overriding to
+    chronology would only trade one mis-attribution for the other rather
+    than fixing it. Instead, `_main_thread_started_run` below surfaces the
+    disagreement so a run where the two signals conflict is visible rather
+    than silently resolved one way. `cost_usd`/`billable_tokens` stay
+    run-wide regardless of which thread this function picks, since that
+    spend is real either way; only the conversation-shaped metrics
+    (turns, compaction, overhead, the fingerprint) depend on this choice.
+    """
     row = cur.execute(
         "SELECT thread_key FROM requests WHERE run_id = ? "
         "GROUP BY thread_key ORDER BY COUNT(*) DESC, MIN(seq) ASC LIMIT 1",
         (run_id,),
     ).fetchone()
     return row["thread_key"] if row else None
+
+
+def _main_thread_started_run(cur, run_id: str, main_key=None) -> bool:
+    """True if the thread `_main_thread_key` picked also contains the run's
+    first request (seq=1). False is the finding-26 warning signal: the
+    largest-thread rule and "whichever thread started the run" disagree,
+    which happens when a Task subagent or other secondary thread racks up
+    more requests than the conversation that spawned it. Doesn't change
+    which thread is treated as main -- see `_main_thread_key`'s docstring
+    for why overriding to chronology isn't a strict improvement -- just
+    flags the case so it's visible instead of silently resolved."""
+    if main_key is None:
+        main_key = _main_thread_key(cur, run_id)
+    row = cur.execute(
+        "SELECT thread_key FROM requests WHERE run_id = ? ORDER BY seq LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return True
+    return row["thread_key"] == main_key
 
 
 def _main_requests(cur, run_id: str) -> list[dict]:
@@ -80,12 +121,32 @@ def background_metrics(cur, run_id: str) -> dict:
     }
 
 
+def main_thread_metrics(cur, run_id: str) -> dict:
+    """Finding 26 diagnostic: whether the thread `_main_thread_key` picked
+    (most requests) is also the thread that contains the run's first
+    request (seq=1). These agree in the overwhelmingly common case; they
+    disagree exactly when a Task subagent or other secondary thread issues
+    more requests than the conversation that actually started the run, in
+    which case every conversation-shaped metric (turns, compaction,
+    overhead, the corrected fingerprint) is being computed over the
+    subagent instead. `main_thread_started_run` is a boolean finding, not a
+    magnitude -- like `overhead_drift`, it's deliberately excluded from
+    `_EFFICIENCY_METRICS` below rather than averaged across repeats."""
+    return {"main_thread_started_run": _main_thread_started_run(cur, run_id)}
+
+
 def main_thread_fingerprint(cur, run_id: str) -> Optional[dict]:
     """model/toolset_hash/system_prompt_hash of the first successful request
     in the run's main thread. Used to correct `runs`' fingerprint columns
     once a run finishes, in case the eager per-request fill in
     ys.collector (which can't yet know which thread will end up largest)
-    stamped them from a background or subagent request instead."""
+    stamped them from a background or subagent request instead.
+
+    Inherits `_main_thread_key`'s finding-26 assumption: on the rare run
+    where a Task subagent out-issues the conversation that spawned it, this
+    fingerprint is the subagent's, not the driving conversation's. Check
+    `main_thread_metrics`'s `main_thread_started_run` alongside this to know
+    whether that's happened."""
     main_key = _main_thread_key(cur, run_id)
     row = cur.execute(
         "SELECT model, toolset_hash, system_prompt_hash FROM requests "
@@ -348,6 +409,7 @@ def compute_run_metrics(cur, run_id: str) -> dict:
     metrics.update(redundancy_metrics(cur, run_id))
     metrics.update(compaction_metrics(cur, run_id))
     metrics.update(background_metrics(cur, run_id))
+    metrics.update(main_thread_metrics(cur, run_id))
     metrics.update(outcome_metrics(cur, run_id))
     return metrics
 

@@ -305,6 +305,18 @@ def end(
             value = f"{value:.4g}"
         console.print(f"  {key}: {value}")
 
+    # finding 26: the largest thread (what turns/compaction/the fingerprint
+    # are computed over) isn't always the conversation that started the run
+    # -- a long-running Task subagent can out-issue it. A boolean doesn't
+    # belong in the metrics table above, so it's a separate line.
+    if result.summary_metrics.get("main_thread_started_run") is False:
+        console.print(
+            "\n[yellow]warning: the run's largest thread doesn't contain its "
+            "first request -- turns, compaction metrics and the fingerprint "
+            "were computed over a secondary thread (likely a Task subagent), "
+            "not the conversation that started the run[/yellow]"
+        )
+
     dropped_count = dropped.count()
     if dropped_count:
         console.print(

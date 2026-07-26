@@ -383,6 +383,105 @@ def test_write_thread_survives_a_compaction_that_rewrites_the_anchor_message():
     assert rows[2]["thread_key"] == rows[0]["thread_key"] == rows[1]["thread_key"]
 
 
+def _messages(n, prefix):
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"{prefix}-{i}"}
+        for i in range(n)
+    ]
+
+
+def test_write_rejects_a_same_system_prompt_short_unrelated_call_as_compaction():
+    """Regression test for finding 25 (IMPROVEMENTS.md): _resolve_thread's
+    system_prompt_hash match is currently the *only* thing keeping an
+    unrelated conversation from being absorbed into the main thread, since
+    _classify_transition calls any shorter history "compaction" regardless
+    of shared prefix. If a subagent or background call ever reused the
+    main thread's system prompt, it must not be pulled in just because it's
+    shorter -- a message count collapsing from 12 to 2 (dropping to a
+    sixth) is far more consistent with "unrelated short conversation" than
+    "compaction", and must start its own thread instead."""
+    db.init_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}','','2026-01-01')"
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+
+    system = "You are a coding agent."
+    main_history = _messages(12, "main")
+    # An unrelated exchange that happens to carry the *same* system prompt
+    # (the coincidence finding 25 is about) and shares no prefix with the
+    # main history -- exactly the shape a same-system-prompt subagent or
+    # background call would have.
+    unrelated_short = _messages(2, "unrelated")
+
+    def emit(messages):
+        rec = extract_record(_fake_kwargs(system=system, messages=messages), FakeResponse([]), None, None)
+        _write("r", rec)
+
+    emit(main_history)
+    emit(unrelated_short)
+
+    with db.cursor() as cur:
+        rows = cur.execute(
+            "SELECT seq, transition, thread_key FROM requests WHERE run_id='r' ORDER BY seq"
+        ).fetchall()
+
+    assert rows[1]["transition"] is None  # not absorbed as a fabricated compaction
+    assert rows[1]["thread_key"] != rows[0]["thread_key"]
+
+
+def test_write_still_follows_a_plausible_large_compaction():
+    """The fix for finding 25 must not make real compactions look like new
+    threads (that's an explicit non-goal in IMPROVEMENTS.md). A compaction
+    that drops a long history to a third of its length -- summary plus a
+    handful of recent turns, the shape a real harness-side compaction
+    takes -- must still resolve to the same thread."""
+    db.init_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}','','2026-01-01')"
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+
+    system = "You are a coding agent."
+    main_history = _messages(12, "main")
+    # Summary + a handful of recent turns -- retains exactly a third of the
+    # pre-compaction message count, the ratio's inclusive boundary.
+    compacted = _messages(4, "summary")
+
+    def emit(messages):
+        rec = extract_record(_fake_kwargs(system=system, messages=messages), FakeResponse([]), None, None)
+        _write("r", rec)
+
+    emit(main_history)
+    emit(compacted)
+
+    with db.cursor() as cur:
+        rows = cur.execute(
+            "SELECT seq, transition, thread_key FROM requests WHERE run_id='r' ORDER BY seq"
+        ).fetchall()
+
+    assert rows[1]["transition"] == "compaction"
+    assert rows[1]["thread_key"] == rows[0]["thread_key"]
+
+
 def test_write_does_not_stamp_fingerprint_from_a_failed_request():
     """A harness's rejected/throwaway first call (e.g. opencode's title-gen
     ping hitting a model the proxy doesn't recognise) must not permanently
