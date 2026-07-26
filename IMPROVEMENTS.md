@@ -244,12 +244,15 @@ the new unique index well before all 20 landed.
   `busy_timeout`) until this one commits, instead of racing it.
 - A migration adds `CREATE UNIQUE INDEX ... ON requests(run_id, seq)` as a hard
   backstop, so a collision that somehow still occurred would raise instead of
-  silently corrupting the transition chain. Since a database written before the
-  `BEGIN IMMEDIATE` fix may already have real duplicate `(run_id, seq)` rows on
-  disk — which would make `CREATE UNIQUE INDEX` fail outright — the same
-  migration first renumbers every run's requests densely in `(seq, id)` order
-  (a no-op for a run with no duplicates; `id`, the autoincrement rowid,
-  preserves actual write order for one that has them).
+  silently corrupting the transition chain, and drops the now-redundant plain
+  index from migration 1 (same leftmost columns, so keeping both would only be
+  write-amplification). Since a database written before the `BEGIN IMMEDIATE`
+  fix may already have real duplicate `(run_id, seq)` rows on disk — which
+  would make `CREATE UNIQUE INDEX` fail outright — the migration checks for
+  duplicates first and, only if any exist, renumbers every run's requests
+  densely in `(seq, id)` order (`id`, the autoincrement rowid, preserves
+  actual write order) before indexing; a database with no duplicates — every
+  one created after this fix — skips that full-table rewrite entirely.
 - `YardstickLogger._handle`'s existing write-retry loop now also retries on
   `sqlite3.IntegrityError`, not just `OperationalError`, so a request that
   still lost the unique-index race self-heals on the next attempt (fresh

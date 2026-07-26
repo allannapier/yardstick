@@ -55,6 +55,22 @@ def test_init_db_creates_tables():
     assert {"experiments", "arms", "runs", "requests", "tool_calls"} <= tables
 
 
+def test_migration_3_drops_the_superseded_plain_index():
+    """idx_requests_run_seq (migration 1) covers the same leftmost columns
+    as the new idx_requests_run_seq_unique -- keeping both is pure
+    write-amplification, so migration 3 drops the old one."""
+    db.init_db()
+    with db.cursor() as cur:
+        indexes = {
+            r["name"]
+            for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='requests'"
+            )
+        }
+    assert "idx_requests_run_seq" not in indexes
+    assert "idx_requests_run_seq_unique" in indexes
+
+
 def test_foreign_key_enforcement():
     db.init_db()
     with db.cursor() as cur:
@@ -178,7 +194,7 @@ def test_migration_3_renumbers_pre_existing_seq_duplicates_before_indexing():
     conn = db.connect()
     try:
         conn.execute("PRAGMA user_version = 2")  # pretend migration 3 never ran
-        conn.execute("DROP INDEX idx_requests_run_seq_unique")  # ...including its index
+        conn.execute("DROP INDEX IF EXISTS idx_requests_run_seq_unique")  # ...including its index
         _insert_experiment_arm_run(conn)
         # two requests that raced to the same seq under the old code, plus a
         # normal non-colliding one
