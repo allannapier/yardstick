@@ -276,7 +276,7 @@ change has every table but `user_version = 0`; replaying migration 1's
 no-op that still advances the version, which `tests/test_db.py` covers
 directly.
 
-### 9. Cost is silently $0 for models LiteLLM cannot price [by inspection]
+### 9. Cost is silently $0 for models LiteLLM cannot price [by inspection] — fixed
 
 `response_cost` comes straight from LiteLLM's cost map. For a model id not in that
 map — which includes `claude-sonnet-5` as configured in
@@ -287,22 +287,73 @@ computed from them then read as zero with no indication anything is wrong.
 For a tool whose headline output is a cost comparison, silently reporting $0 is
 the worst available failure mode.
 
-**Fix:** record a `cost_source` per request (`litellm` / `declared` / `unknown`).
-Flag any request with non-zero tokens and zero cost. Let an experiment declare
-per-model input/output/cache prices and compute cost from tokens when LiteLLM
-can't. Surface "cost unavailable for model X" prominently in `compare` and
-`report` rather than printing a confident 0.0000.
+**Fix:**
 
-### 10. `billable_tokens` hardcodes one vendor's cache weights [by inspection]
+- `requests` gained a `cost_source` column (migration 4, `ys/db.py`, following
+  migration 2's `_add_column_if_missing` pattern) recording how
+  `ys/collector.py`'s new `_resolve_cost` obtained a request's cost: `litellm`
+  when LiteLLM's own number is nonzero; `declared` when it was zero but an
+  experiment's `pricing:` block could price the tokens instead; `unknown` when
+  neither could — i.e. exactly the silent-$0 case this finding is about, now
+  tagged instead of trusted.
+- `Experiment` gained a `pricing: dict[str, ModelPricing]` field
+  (`ys/experiment.py`), keyed by `factors.model` value exactly like the
+  existing `models:` block rather than a parallel mechanism — declaring
+  optional `input_per_mtok` / `output_per_mtok` / `cache_write_per_mtok` /
+  `cache_read_per_mtok` prices. `experiments/interactive-sonnet.yaml` (the
+  file this finding was reproduced against) now declares them for
+  `claude-sonnet-5`.
+- The collector runs inside the separate proxy process, not the CLI process
+  that loaded the experiment YAML, so it recovers a run's declared pricing
+  from `experiments.config_yaml` — already stored verbatim at `ys start`
+  (`ys/runs.py`'s `begin_run`) and the same field `finish_run` reads for
+  `task.success_check` — rather than needing new plumbing between the two.
+  `resolve_model_key` (`ys/experiment.py`) bridges a provider-prefixed
+  recorded model id (`anthropic/claude-sonnet-5`) against the bare
+  `factors.model` key `pricing:` is declared under.
+- `ys compare`/`ys report` (`ys/render.py`) now surface any arm with an
+  `unknown`-cost request the way `UNCONTROLLED` surfaces fingerprint drift: a
+  `[COST UNKNOWN]` marker on the arm's header *and* on its `cost_usd`/
+  `cost_per_success` cells specifically (in the HTML report, a `<span
+  class="warn">COST UNKNOWN</span>` header badge plus a `?` marker on the
+  same cells), plus an explicit, unmissable line per (arm, model) — e.g.
+  "cost unavailable for model 'claude-sonnet-5' in arm 'arm-sonnet' (12
+  request(s)) — LiteLLM has no price for it and the experiment declares no
+  `pricing:` override for it. cost_usd and cost_per_success for this arm are
+  undercounted, not merely imprecise." — printed after the table by `ys
+  compare` and rendered as a bordered banner (not a footnote) right under the
+  `<h1>` in the HTML report.
+
+### 10. `billable_tokens` hardcodes one vendor's cache weights [by inspection] — fixed
 
 `input + cache_creation + output + cache_read * 0.1` bakes in Anthropic's
 cache-read discount, and treats cache *writes* at 1.0 when Anthropic prices them
 at roughly 1.25x. It is also meaningless across providers with different cache
 economics — which the rig otherwise wants to compare.
 
-**Fix:** make the weights per-model configuration with the current values as the
-Anthropic default, and document that `billable_tokens` is a pricing-weighted
-proxy, not a token count.
+**Fix:**
+
+- `Experiment` gained a `billable_weights: dict[str, BillableWeights]` field
+  (`ys/experiment.py`), keyed by `factors.model` value like `models:`/
+  `pricing:`. `BillableWeights` has four fields (`input`, `output`,
+  `cache_creation`, `cache_read`) defaulting to Anthropic's shape — and the
+  cache-write default is now `1.25`, not the old `1.0`, which was simply
+  wrong (Anthropic bills a 5-minute cache write at a premium over a plain
+  input token, not at parity).
+- `ys/metrics.py`'s `token_metrics` computes `billable_tokens` per request,
+  weighted by *that request's own* `model` (a run can in principle mix
+  models — background/catch-all traffic), via a new
+  `billable_weights_by_model` parameter threaded through
+  `compute_run_metrics`/`aggregate_run_metrics`. A model with no declared
+  override falls back to the Anthropic-shaped `DEFAULT_BILLABLE_WEIGHTS`. `ys
+  compare`/`ys report` (`ys/render.py`) pass the experiment's declared
+  weights explicitly; `ys end`'s immediate single-run summary (`ys/runs.py`)
+  uses the default, since it has no `Experiment` object at hand — a
+  deliberate scope cut (see the PR description) rather than an oversight.
+- The module comment above `token_metrics`, and `BillableWeights`'s own
+  docstring, now say explicitly that `billable_tokens` is a
+  *pricing-weighted proxy* for spend, not a token count, and are meaningless
+  as a cross-provider constant.
 
 ### 11. `ys end` drops in-flight requests [by inspection]
 
@@ -476,7 +527,7 @@ Two new tests in `tests/test_metrics.py` cover both the ordinary case and the
 finding-26 scenario (a 3-request `subagent` thread outnumbering a 2-request
 `main` thread that holds `seq = 1`).
 
-### 27. Pinning the small/fast model routes background traffic through the arm's model [by inspection]
+### 27. Pinning the small/fast model routes background traffic through the arm's model [by inspection] — fixed
 
 Finding 3's fix writes `ANTHROPIC_SMALL_FAST_MODEL` and
 `ANTHROPIC_DEFAULT_HAIKU_MODEL` to the arm's model alongside `ANTHROPIC_MODEL`.
@@ -492,10 +543,29 @@ default for a mock experiment — unpinned background traffic would bypass
 `mock_response` and hit the real API during what is supposed to be a dry smoke
 test — so this is a trade-off to make explicit rather than a bug to reverse.
 
-**Fix:** document the effect where `point()` writes the variables, and consider
-`ys harness point --no-pin-background` (or pinning only when the arm's model
-declares a `mock_response`) so a real cost comparison can opt out. Overlaps
-findings 9 and 10, which have to price this traffic correctly either way.
+**Fix:**
+
+- `harness.point()`'s docstring now spells out the trade-off in full where
+  the two background-model variables are written: pinning them is what keeps
+  a `mock_response` experiment a dry smoke test, at the cost of inflating
+  run-wide `cost_usd`/`billable_tokens` relative to an unmeasured session,
+  since Claude Code's background traffic then runs on — and is billed/
+  weighted as — the arm's own model instead of a real session's cheap
+  small/fast model.
+- `point()` gained a `pin_background: bool = True` parameter gating the two
+  `_deep_set` calls that write `ANTHROPIC_SMALL_FAST_MODEL`/
+  `ANTHROPIC_DEFAULT_HAIKU_MODEL`; `ANTHROPIC_MODEL` itself is always set
+  when a model is given, since the main turn still needs to be pinned either
+  way. Exposed as `ys harness point --pin-background/--no-pin-background`
+  (default: on, unchanged behaviour), per the plan's suggested opt-out; `ys
+  start`'s own model-check warning is untouched. Passing `--no-pin-background`
+  with a model also prints an explicit warning that background requests will
+  use the harness's own default model instead of the arm's.
+- Left as a documented trade-off, not reversed: the default is still to pin,
+  because `experiments/example.yaml`'s mock smoke test — and any
+  `mock_response`-based experiment — genuinely needs it to stay a dry run.
+  Overlaps findings 9 and 10, which now price/weight this traffic correctly
+  either way it's routed.
 
 ### 28. Only the collector retries a locked write [by inspection]
 

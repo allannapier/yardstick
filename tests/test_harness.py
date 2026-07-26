@@ -58,6 +58,49 @@ def test_point_without_model_does_not_set_model_env_vars(fake_agents):
     assert "ANTHROPIC_MODEL" not in config.get("env", {})
 
 
+# --- finding 27: --no-pin-background opt-out --------------------------------
+
+
+def test_point_pins_background_small_fast_model_by_default(fake_agents):
+    """Default behaviour (pin_background=True) is unchanged from before
+    finding 27 -- this is the same assertion as
+    test_point_with_model_sets_claude_code_model_env_vars, pinned here too
+    so a future change to the default can't silently widen finding 27's
+    hole without a test noticing."""
+    path = harness.point("claude-code", 4000, "sk-test", model="claude-sonnet-5")
+    with open(path) as f:
+        config = json.load(f)
+    assert config["env"]["ANTHROPIC_SMALL_FAST_MODEL"] == "claude-sonnet-5"
+    assert config["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-sonnet-5"
+
+
+def test_point_no_pin_background_leaves_small_fast_model_env_vars_unset(fake_agents):
+    """Regression test for finding 27: with pin_background=False, background
+    (title-generation) traffic is left to request the harness's own default
+    small/fast model instead of being routed through the arm's model --
+    ANTHROPIC_MODEL still gets set (the main turn still needs to be pinned),
+    but the two background-model env vars must not be touched."""
+    path = harness.point(
+        "claude-code", 4000, "sk-test", model="claude-sonnet-5", pin_background=False
+    )
+    with open(path) as f:
+        config = json.load(f)
+    assert config["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-5"
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in config["env"]
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in config["env"]
+
+
+def test_point_no_pin_background_is_a_no_op_without_a_model(fake_agents):
+    """pin_background only matters once a model is being pinned at all --
+    with no model, there's nothing to pin the background traffic to
+    either."""
+    path = harness.point("claude-code", 4000, "sk-test", pin_background=False)
+    with open(path) as f:
+        config = json.load(f)
+    assert "ANTHROPIC_MODEL" not in config.get("env", {})
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in config.get("env", {})
+
+
 def test_point_with_model_sets_opencode_model(fake_agents):
     path = harness.point("opencode", 4010, "sk-test", model="claude-sonnet-5")
     with open(path) as f:
