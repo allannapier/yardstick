@@ -220,18 +220,43 @@ silently mid-run.
   `ys status` and `ys end` surface the count so a lossy run is visible rather
   than quietly short.
 
-### 7. `seq` assignment races [by inspection]
+### 7. `seq` assignment races [verified] — fixed on this branch
 
-`_next_seq` does `SELECT COALESCE(MAX(seq),0)+1` outside any explicit
-transaction, and the writes are dispatched through a thread pool executor. Two
-concurrent requests — routine with parallel tool use or a subagent — can read the
-same maximum and both write it. There is no `UNIQUE(run_id, seq)` constraint to
-catch it, and `_last_msg_hashes` orders by `seq DESC`, so a collision also
+`_next_seq` did `SELECT COALESCE(MAX(seq),0)+1` outside any explicit
+transaction, and writes are dispatched through a thread pool executor. Two
+concurrent requests — routine with parallel tool use or a subagent — could read
+the same maximum and both write it. There was no `UNIQUE(run_id, seq)`
+constraint to catch it, and thread resolution (`_resolve_thread`, finding 4)
+picks each thread's most recent request by `MAX(seq)`, so a collision also
 corrupts the transition chain.
 
-**Fix:** add `UNIQUE(run_id, seq)`, allocate inside a `BEGIN IMMEDIATE`
-transaction, and retry on conflict. Consider ordering by the autoincrement `id`
-and treating `seq` as a derived presentation value.
+Reproduced directly: 20 threads calling `_write` concurrently against the same
+run, with the fix below reverted, reliably raised `sqlite3.IntegrityError` from
+the new unique index well before all 20 landed.
+
+**Fix:**
+
+- `collector._write` now allocates seq inside an explicit `BEGIN IMMEDIATE`
+  transaction (previously the read and the insert were separate statements
+  under SQLite's default deferred-transaction behavior, with no lock held
+  between them). `BEGIN IMMEDIATE` takes the write lock up front, so a
+  concurrent `_write` on the same database file blocks (honoring
+  `busy_timeout`) until this one commits, instead of racing it.
+- A migration adds `CREATE UNIQUE INDEX ... ON requests(run_id, seq)` as a hard
+  backstop, so a collision that somehow still occurred would raise instead of
+  silently corrupting the transition chain, and drops the now-redundant plain
+  index from migration 1 (same leftmost columns, so keeping both would only be
+  write-amplification). Since a database written before the `BEGIN IMMEDIATE`
+  fix may already have real duplicate `(run_id, seq)` rows on disk — which
+  would make `CREATE UNIQUE INDEX` fail outright — the migration checks for
+  duplicates first and, only if any exist, renumbers every run's requests
+  densely in `(seq, id)` order (`id`, the autoincrement rowid, preserves
+  actual write order) before indexing; a database with no duplicates — every
+  one created after this fix — skips that full-table rewrite entirely.
+- `YardstickLogger._handle`'s existing write-retry loop now also retries on
+  `sqlite3.IntegrityError`, not just `OperationalError`, so a request that
+  still lost the unique-index race self-heals on the next attempt (fresh
+  transaction, fresh seq) instead of being dropped.
 
 ### 8. No schema versioning [verified] — fixed
 
@@ -496,8 +521,8 @@ can complete the README quick start with a real agent.
 
 **Milestone 2 — make the numbers trustworthy.** Finding 8 (migrations, done —
 this is what the rest of the milestone builds its schema changes on), then 4
-(done), 6 (done), 7, 9, 11, 12, 13, 14. This is the batch that decides whether
-the tool's output can be believed; nothing above it matters if
+(done), 6 (done), 7 (done), 9, 11, 12, 13, 14. This is the batch that decides
+whether the tool's output can be believed; nothing above it matters if
 `compaction_events` and `cost_usd` are wrong.
 
 **Milestone 3 — make it usable.** The dashboard defect table (19–24), the HTML and

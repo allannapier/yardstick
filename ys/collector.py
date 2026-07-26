@@ -19,9 +19,11 @@ from ys import db, dropped, paths
 _SECRET_KEYS = {"api_key", "authorization", "x-api-key", "api-key"}
 
 # db.connect()'s busy_timeout already makes SQLite itself wait out a
-# conflicting writer, but a burst of concurrent requests (parallel tool use,
-# a subagent) can still collide on the Python side. A few retries with a
-# short backoff covers that without masking a persistently broken database.
+# conflicting writer, and _write's BEGIN IMMEDIATE serializes seq allocation
+# against every other writer (finding 7), but a few retries with a short
+# backoff still covers residual contention -- OperationalError from a lock
+# that outlasts busy_timeout, or IntegrityError from the UNIQUE(run_id, seq)
+# backstop -- without masking a persistently broken database.
 _MAX_WRITE_ATTEMPTS = 3
 _RETRY_BACKOFF_S = 0.2
 
@@ -186,6 +188,12 @@ def _resolve_run_id(kwargs: dict) -> str:
 
 
 def _next_seq(cur, run_id: str) -> int:
+    """Must run inside a transaction that already holds the write lock (see
+    `_write`'s `BEGIN IMMEDIATE`) -- read-then-insert with no lock held is
+    exactly the race finding 7 in IMPROVEMENTS.md describes: two concurrent
+    requests (parallel tool use, a subagent) read the same MAX(seq) and both
+    insert it, corrupting the seq-ordered transition chain with no
+    constraint to catch it."""
     row = cur.execute(
         "SELECT COALESCE(MAX(seq), 0) AS m FROM requests WHERE run_id = ?", (run_id,)
     ).fetchone()
@@ -349,6 +357,13 @@ def _run_row_exists(cur, run_id: str) -> bool:
 
 def _write(run_id: str, rec: dict):
     with db.cursor() as cur:
+        # BEGIN IMMEDIATE grabs the write lock up front instead of at the
+        # first DML statement, so the seq read in `_next_seq` and the insert
+        # that uses it are atomic with respect to every other writer on this
+        # database file -- a concurrent `_write` blocks (honoring
+        # `busy_timeout`) until this transaction commits, rather than racing
+        # it. See finding 7 in IMPROVEMENTS.md.
+        cur.execute("BEGIN IMMEDIATE")
         if run_id != "unattributed" and not _run_row_exists(cur, run_id):
             # A run_id was claimed (header or stale active.json) that doesn't
             # exist in the DB -- e.g. ys start crashed, or a request arrived
@@ -439,7 +454,7 @@ class YardstickLogger(CustomLogger):
                 try:
                     await asyncio.get_running_loop().run_in_executor(None, _write, run_id, rec)
                     break
-                except sqlite3.OperationalError:
+                except (sqlite3.OperationalError, sqlite3.IntegrityError):
                     if attempt == _MAX_WRITE_ATTEMPTS:
                         raise
                     await asyncio.sleep(_RETRY_BACKOFF_S * attempt)

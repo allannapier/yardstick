@@ -37,6 +37,45 @@ def _migration_2(conn: sqlite3.Connection):
     )
 
 
+def _migration_3(conn: sqlite3.Connection):
+    """UNIQUE(run_id, seq) backstop for finding 7 -- `_next_seq` in
+    ys/collector.py read MAX(seq) and inserted with no constraint to catch a
+    collision, so two concurrent writers (parallel tool use, a subagent)
+    could read the same max and both write it, corrupting the transition
+    chain that `_resolve_thread` orders by seq. The collector now allocates
+    seq inside a `BEGIN IMMEDIATE` transaction, which serializes writers
+    against this same database file and should make a collision impossible
+    going forward; the index is a hard backstop in case some future write
+    path doesn't go through that transaction.
+
+    A database written before the collector fix may already have real
+    (run_id, seq) duplicates on disk, which would make `CREATE UNIQUE INDEX`
+    fail outright -- if any exist, every run's requests are renumbered
+    densely in (seq, id) order first (id, the autoincrement rowid, reflects
+    actual write order, so this preserves relative order). Checked first and
+    skipped when absent, since this is a full-table rewrite and every
+    database created after the collector fix will never have a duplicate to
+    fix. `idx_requests_run_seq` (migration 1) is dropped in favour of the
+    new unique index, which covers the same leftmost columns and makes the
+    old one redundant -- keeping both would only add write-amplification."""
+    has_dupes = conn.execute(
+        "SELECT 1 FROM requests GROUP BY run_id, seq HAVING COUNT(*) > 1 LIMIT 1"
+    ).fetchone()
+    if has_dupes:
+        conn.execute(
+            """
+            WITH ranked AS (
+                SELECT id, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq, id) AS rn
+                FROM requests
+            )
+            UPDATE requests SET seq = (SELECT rn FROM ranked WHERE ranked.id = requests.id)
+            """
+        )
+    conn.execute("DROP INDEX IF EXISTS idx_requests_run_seq")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_run_seq_unique ON requests(run_id, seq)"
+    )
+
 # Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
 # Each entry is gated by user_version, so it runs at most once per database
 # file in the normal case -- but every entry must still converge cleanly if
@@ -132,6 +171,8 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id,
 """,
     # 2: see _migration_2 above.
     _migration_2,
+    # 3: see _migration_3 above.
+    _migration_3,
 ]
 
 
