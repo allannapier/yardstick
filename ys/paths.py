@@ -2,6 +2,7 @@ import os
 
 YARDSTICK_HOME = os.path.expanduser(os.environ.get("YARDSTICK_HOME", "~/.yardstick"))
 DB_PATH = os.path.join(YARDSTICK_HOME, "yardstick.db")
+DROPPED_LOG_PATH = os.path.join(YARDSTICK_HOME, "dropped_requests.jsonl")
 ACTIVE_RUN_PATH = os.path.join(YARDSTICK_HOME, "active.json")
 PROXY_CONFIG_PATH = os.path.join(YARDSTICK_HOME, "proxy_config.yaml")
 PROXY_PID_PATH = os.path.join(YARDSTICK_HOME, "proxy.pid")

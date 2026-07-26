@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import warnings
 from contextlib import contextmanager
 
 from ys import paths
@@ -135,10 +136,30 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id,
 
 
 def connect() -> sqlite3.Connection:
+    """The collector writes from inside the proxy process while the CLI and
+    the dashboard read/write the same file -- WAL lets readers and the
+    writer proceed concurrently instead of blocking on each other, and
+    busy_timeout makes a writer wait out a conflicting writer instead of
+    failing immediately with "database is locked". synchronous=NORMAL is
+    the pairing WAL's own docs recommend: still durable across an OS crash,
+    just not fsync-per-commit. See finding 6 in IMPROVEMENTS.md."""
     paths.ensure_home()
-    conn = sqlite3.connect(paths.DB_PATH)
+    conn = sqlite3.connect(paths.DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    journal_mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+    if journal_mode.lower() != "wal":
+        # SQLite silently falls back to another journal mode when WAL isn't
+        # supported (e.g. a network filesystem) -- surface that instead of
+        # letting this whole fix quietly be a no-op.
+        warnings.warn(
+            f"could not enable SQLite WAL mode (got journal_mode={journal_mode!r}); "
+            "concurrent readers/writer will contend more than expected",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 

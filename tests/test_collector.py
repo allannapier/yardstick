@@ -1,7 +1,10 @@
+import asyncio
 import datetime
+import sqlite3
 
-from ys import db
+from ys import db, dropped
 from ys.collector import (
+    YardstickLogger,
     _classify_transition,
     _extract_tool_calls,
     _extract_tool_results,
@@ -413,3 +416,68 @@ def test_write_does_not_stamp_fingerprint_from_a_failed_request():
         run_row = cur.execute("SELECT model FROM runs WHERE id='r'").fetchone()
 
     assert run_row["model"] == "anthropic/claude-sonnet-5"
+
+
+# --- write retry / drop accounting ------------------------------------------
+
+
+def test_handle_retries_a_locked_database_and_still_writes(monkeypatch):
+    """A transient `sqlite3.OperationalError` (e.g. a losing race against
+    another writer) must not drop the record outright -- it should be
+    retried and succeed once the lock clears."""
+    db.init_db()
+    calls = {"n": 0}
+    real_write = _write
+
+    def flaky_write(run_id, rec):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        real_write(run_id, rec)
+
+    monkeypatch.setattr("ys.collector._write", flaky_write)
+
+    logger = YardstickLogger()
+    kwargs = _fake_kwargs()
+    asyncio.run(logger._handle(kwargs, FakeResponse([]), None, None))
+
+    assert calls["n"] == 3
+    assert dropped.count() == 0
+    with db.cursor() as cur:
+        row = cur.execute("SELECT run_id FROM requests WHERE run_id = 'unattributed'").fetchone()
+    assert row is not None
+
+
+def test_handle_drops_and_records_after_exhausting_retries(monkeypatch):
+    """Once retries are exhausted the request is genuinely lost -- it must
+    be counted so a lossy run is visible (`ys status`), not just logged to
+    a file nobody watches mid-run."""
+    db.init_db()
+
+    def always_locked(run_id, rec):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("ys.collector._write", always_locked)
+
+    logger = YardstickLogger()
+    kwargs = _fake_kwargs()
+    asyncio.run(logger._handle(kwargs, FakeResponse([]), None, None))
+
+    assert dropped.count() == 1
+
+
+def test_handle_counts_non_operational_errors_as_dropped_too(monkeypatch):
+    """Any failure that keeps a request from landing in the database is a
+    dropped request, not only lock contention."""
+    db.init_db()
+
+    def boom(run_id, rec):
+        raise ValueError("boom")
+
+    monkeypatch.setattr("ys.collector._write", boom)
+
+    logger = YardstickLogger()
+    kwargs = _fake_kwargs()
+    asyncio.run(logger._handle(kwargs, FakeResponse([]), None, None))
+
+    assert dropped.count() == 1

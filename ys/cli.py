@@ -5,7 +5,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from ys import db, harness, paths, proxy, runs, state, webserver
+from ys import db, dropped, harness, paths, proxy, runs, state, webserver
 from ys.experiment import load_experiment
 
 app = typer.Typer(help="yardstick -- measure agent/harness/model efficiency")
@@ -305,6 +305,14 @@ def end(
             value = f"{value:.4g}"
         console.print(f"  {key}: {value}")
 
+    dropped_count = dropped.count()
+    if dropped_count:
+        console.print(
+            f"\n[red]{dropped_count} request(s) could not be written to the database "
+            f"and were dropped (cumulative across all runs recorded in "
+            f"{paths.DROPPED_LOG_PATH}, not just this one)[/red]"
+        )
+
 
 @app.command()
 def delete(
@@ -336,8 +344,16 @@ def status():
     active = state.get_active()
     if active is None:
         console.print("no active run")
-        return
-    console.print(json.dumps(active, indent=2))
+    else:
+        console.print(json.dumps(active, indent=2))
+
+    dropped_count = dropped.count()
+    if dropped_count:
+        console.print(
+            f"\n[red]{dropped_count} request(s) could not be written to the database "
+            f"and were dropped (cumulative across all runs recorded in "
+            f"{paths.DROPPED_LOG_PATH}, not just this one)[/red]"
+        )
 
 
 @app.command()

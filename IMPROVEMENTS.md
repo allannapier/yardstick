@@ -196,18 +196,29 @@ message that points at a log file rather than at the real cause.
 
 ## P1 — data integrity and robustness
 
-### 6. SQLite is configured for a single writer [by inspection]
+### 6. SQLite is configured for a single writer [by inspection] — fixed on this branch
 
-`db.connect()` sets `foreign_keys` and nothing else. The collector writes from
+`db.connect()` set `foreign_keys` and nothing else. The collector writes from
 inside the proxy process while the CLI and the dashboard read and write the same
 file. Without WAL mode and a busy timeout, "database is locked" under concurrent
-access is a matter of when, not if — and the collector's only failure handling is
+access is a matter of when, not if — and the collector's only failure handling was
 `traceback.print_exc()` into the proxy log, so measurements would be lost
 silently mid-run.
 
-**Fix:** `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`,
-`PRAGMA synchronous=NORMAL`. Retry the collector write, and count dropped records
-so a lossy run is visible rather than quietly short.
+**Fix:**
+
+- `db.connect()` now sets `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`
+  and `PRAGMA synchronous=NORMAL` (plus a 5s `sqlite3.connect` timeout), so
+  readers and the writer no longer block each other and a conflicting writer
+  is waited out instead of failing immediately.
+- `YardstickLogger._handle` retries a write up to 3 times with a short backoff
+  on `sqlite3.OperationalError`, covering contention that outlasts the
+  busy timeout.
+- A request that still can't be written — lock contention exhausted, or any
+  other failure — is now counted via `ys/dropped.py` (an append-only log
+  under `YARDSTICK_HOME`) instead of only being printed to the proxy log.
+  `ys status` and `ys end` surface the count so a lossy run is visible rather
+  than quietly short.
 
 ### 7. `seq` assignment races [by inspection]
 
@@ -485,9 +496,9 @@ can complete the README quick start with a real agent.
 
 **Milestone 2 — make the numbers trustworthy.** Finding 8 (migrations, done —
 this is what the rest of the milestone builds its schema changes on), then 4
-(done), 6, 7, 9, 11, 12, 13, 14. This is the batch that decides whether the
-tool's output can be believed; nothing above it matters if `compaction_events`
-and `cost_usd` are wrong.
+(done), 6 (done), 7, 9, 11, 12, 13, 14. This is the batch that decides whether
+the tool's output can be believed; nothing above it matters if
+`compaction_events` and `cost_usd` are wrong.
 
 **Milestone 3 — make it usable.** The dashboard defect table (19–24), the HTML and
 experiment-discovery fixes, `ys doctor`, `ys runs list`, and the unattributed
