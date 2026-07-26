@@ -463,7 +463,12 @@ where the two rules disagree, i.e. where a secondary thread has out-issued the
 conversation that started the run. It's surfaced as `main_thread_started_run`
 in `compute_run_metrics`'s output (via the new `main_thread_metrics`), a
 boolean finding excluded from `_EFFICIENCY_METRICS` the same way
-`overhead_drift` is — not a magnitude to average across repeats. `cost_usd`/
+`overhead_drift` is — not a magnitude to average across repeats, and,
+crucially, actually visible: `ys end` now prints a `[yellow]warning: ...[/yellow]`
+line when it's false, rather than leaving the flag sitting unread in the
+metrics dict (`compare`/`report`/the dashboard don't surface it yet — folded
+into the later `ys doctor`/diagnostics pass instead, alongside findings 12 and
+29, rather than reaching into `render.py`/the dashboard here). `cost_usd`/
 `billable_tokens` are unaffected either way (still run-wide); `turns`, the
 compaction metrics, and the corrected fingerprint still come from the
 largest thread, now with a way to tell when that choice is questionable.
