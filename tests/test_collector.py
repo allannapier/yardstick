@@ -3,14 +3,19 @@ import concurrent.futures
 import datetime
 import sqlite3
 
+import pytest
+
 from ys import db, dropped
 from ys.collector import (
     YardstickLogger,
     _classify_transition,
+    _declared_cost,
     _extract_tool_calls,
     _extract_tool_results,
     _msg_hashes,
+    _pricing_table_for_run,
     _redact,
+    _resolve_cost,
     _write,
     extract_record,
 )
@@ -560,6 +565,205 @@ def test_write_seq_allocation_is_race_free_under_concurrent_writers():
             for r in cur.execute("SELECT seq FROM requests WHERE run_id = 'r' ORDER BY seq")
         ]
     assert seqs == list(range(1, n + 1))
+
+
+# --- finding 9: cost_source / declared pricing ------------------------------
+
+
+def test_resolve_cost_prefers_nonzero_litellm_cost():
+    rec = {"response_cost": 0.05, "input_tokens": 100, "output_tokens": 20,
+           "cache_creation": 0, "cache_read": 0, "model": "anthropic/claude-sonnet-5"}
+    cost, source = _resolve_cost(rec, pricing_table={})
+    assert cost == 0.05
+    assert source == "litellm"
+
+
+def test_resolve_cost_zero_cost_and_zero_tokens_is_not_flagged():
+    """A failed request with no usage genuinely costs $0 -- not the failure
+    mode finding 9 is about, so it must not be flagged as unknown."""
+    rec = {"response_cost": 0.0, "input_tokens": 0, "output_tokens": 0,
+           "cache_creation": 0, "cache_read": 0, "model": "anthropic/claude-sonnet-5"}
+    cost, source = _resolve_cost(rec, pricing_table={})
+    assert cost == 0.0
+    assert source == "litellm"
+
+
+def test_resolve_cost_unknown_when_litellm_returns_zero_for_unpriced_model_with_tokens():
+    """Regression for finding 9: LiteLLM silently returns 0.0 for a model id
+    it has no price for (verified true for `claude-sonnet-5` as configured
+    in experiments/interactive-sonnet.yaml). With no declared `pricing:`
+    override, that must be tagged 'unknown', not accepted as a real $0."""
+    rec = {"response_cost": 0.0, "input_tokens": 1000, "output_tokens": 200,
+           "cache_creation": 0, "cache_read": 0, "model": "claude-sonnet-5"}
+    cost, source = _resolve_cost(rec, pricing_table={})
+    assert cost == 0.0
+    assert source == "unknown"
+
+
+def test_resolve_cost_uses_declared_pricing_when_litellm_returns_zero():
+    rec = {"response_cost": 0.0, "input_tokens": 1_000_000, "output_tokens": 1_000_000,
+           "cache_creation": 0, "cache_read": 0, "model": "claude-sonnet-5"}
+    pricing_table = {"claude-sonnet-5": {"input_per_mtok": 3.0, "output_per_mtok": 15.0}}
+    cost, source = _resolve_cost(rec, pricing_table)
+    assert source == "declared"
+    assert cost == 18.0  # 1M input @ $3/M + 1M output @ $15/M
+
+
+def test_declared_cost_matches_provider_prefixed_model_against_bare_pricing_key():
+    """The `pricing:` key is the bare `factors.model` value, but the
+    recorded `model` may carry a provider prefix -- resolve_model_key must
+    bridge the two (see ys/experiment.py)."""
+    pricing_table = {"claude-sonnet-5": {"input_per_mtok": 2.0}}
+    cost = _declared_cost("anthropic/claude-sonnet-5", 500_000, 0, 0, 0, pricing_table)
+    assert cost == 1.0  # 500k tokens @ $2/M
+
+
+def test_declared_cost_returns_none_when_no_matching_pricing_entry():
+    assert _declared_cost("claude-sonnet-5", 100, 0, 0, 0, {}) is None
+
+
+def test_pricing_table_for_run_reads_the_experiment_config_yaml():
+    """The collector runs inside the proxy process, separate from the CLI
+    that loaded the experiment YAML -- it recovers a run's declared
+    `pricing:` block from `experiments.config_yaml`, stored verbatim at
+    `ys start` (see ys/runs.py's begin_run), the same field `finish_run`
+    already reads for `task.success_check`."""
+    db.init_db()
+    config_yaml = """
+experiment: e
+task: {id: t0, success_check: "true"}
+pricing:
+  claude-sonnet-5:
+    input_per_mtok: 3.0
+    output_per_mtok: 15.0
+arms: [{id: a, factors: {}}]
+"""
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}',?,'2026-01-01')",
+            (config_yaml,),
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+        table = _pricing_table_for_run(cur, "r")
+
+    assert table["claude-sonnet-5"]["input_per_mtok"] == 3.0
+
+
+def test_pricing_table_for_run_empty_when_no_pricing_block_or_unknown_run():
+    db.init_db()
+    with db.cursor() as cur:
+        assert _pricing_table_for_run(cur, "no-such-run") == {}
+
+
+def test_write_records_cost_source_litellm_when_litellm_cost_is_nonzero():
+    db.init_db()
+    rec = extract_record(_fake_kwargs(), FakeResponse([]), None, None)
+    assert rec["response_cost"] == 0.001  # sanity: fixture's litellm cost is nonzero
+    _write("some-run", rec)
+
+    with db.cursor() as cur:
+        row = cur.execute(
+            "SELECT response_cost, cost_source FROM requests WHERE run_id='unattributed'"
+        ).fetchone()
+    assert row["cost_source"] == "litellm"
+    assert row["response_cost"] == pytest.approx(0.001)
+
+
+def test_write_end_to_end_computes_declared_cost_for_model_litellm_cannot_price():
+    """End-to-end regression for finding 9: a model id LiteLLM's cost map
+    doesn't recognise (verified true for `claude-sonnet-5` as configured in
+    experiments/interactive-sonnet.yaml) makes LiteLLM report
+    response_cost=0.0 even though real tokens were spent. Without this fix,
+    that $0 lands in the database and every downstream total (cost_usd,
+    cost_per_success) silently reads as free. With the fix, the run's
+    declared `pricing:` block (stored on experiments.config_yaml) prices it
+    instead and the request is tagged 'declared'."""
+    db.init_db()
+    config_yaml = """
+experiment: e
+task: {id: t0, success_check: "true"}
+pricing:
+  claude-sonnet-5:
+    input_per_mtok: 3.0
+    output_per_mtok: 15.0
+    cache_write_per_mtok: 3.75
+    cache_read_per_mtok: 0.3
+arms: [{id: a, factors: {model: claude-sonnet-5}}]
+"""
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}',?,'2026-01-01')",
+            (config_yaml,),
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+
+    kwargs = _fake_kwargs(model="claude-sonnet-5")
+    # Simulate LiteLLM's real behaviour for a model id it has no price for:
+    # response_cost comes back 0.0 despite real usage.
+    kwargs["standard_logging_object"]["response_cost"] = 0.0
+    rec = extract_record(kwargs, FakeResponse([]), None, None)
+    assert rec["input_tokens"] == 100 and rec["output_tokens"] == 20  # sanity: real usage
+    _write("r", rec)
+
+    with db.cursor() as cur:
+        row = cur.execute(
+            "SELECT response_cost, cost_source FROM requests WHERE run_id='r'"
+        ).fetchone()
+
+    assert row["cost_source"] == "declared"
+    # 100 input @ $3/M + 20 output @ $15/M + 5 cache-write @ $3.75/M + 50 cache-read @ $0.3/M
+    expected = 100 * 3.0 / 1_000_000 + 20 * 15.0 / 1_000_000 + 5 * 3.75 / 1_000_000 + 50 * 0.3 / 1_000_000
+    assert row["response_cost"] == pytest.approx(expected)
+    assert row["response_cost"] > 0.0
+
+
+def test_write_records_cost_source_unknown_when_litellm_zero_and_no_pricing_declared():
+    """Same LiteLLM-returns-zero scenario as above, but the experiment
+    declares no `pricing:` override -- must be flagged 'unknown', not
+    silently accepted as a real $0."""
+    db.init_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}','','2026-01-01')"
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+
+    kwargs = _fake_kwargs(model="claude-sonnet-5")
+    kwargs["standard_logging_object"]["response_cost"] = 0.0
+    rec = extract_record(kwargs, FakeResponse([]), None, None)
+    _write("r", rec)
+
+    with db.cursor() as cur:
+        row = cur.execute(
+            "SELECT response_cost, cost_source FROM requests WHERE run_id='r'"
+        ).fetchone()
+
+    assert row["cost_source"] == "unknown"
+    assert row["response_cost"] == 0.0
 
 
 # --- write retry / drop accounting ------------------------------------------

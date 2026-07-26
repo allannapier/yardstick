@@ -12,9 +12,11 @@ import time
 import traceback
 import uuid
 
+import yaml
 from litellm.integrations.custom_logger import CustomLogger
 
 from ys import db, dropped, paths
+from ys.experiment import resolve_model_key
 
 _SECRET_KEYS = {"api_key", "authorization", "x-api-key", "api-key"}
 
@@ -403,6 +405,102 @@ def _run_row_exists(cur, run_id: str) -> bool:
     return cur.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None
 
 
+def _pricing_table_for_run(cur, run_id: str) -> dict:
+    """The `pricing:` block (ys/experiment.py) of the experiment YAML behind
+    this run, keyed by `factors.model` value -- used to price a request
+    LiteLLM's own cost map can't (finding 9). Read from
+    `experiments.config_yaml`, which is stored verbatim at `ys start`
+    (ys/runs.py's begin_run) and is the same field `finish_run` already
+    reads for `task.success_check` -- reusing it here means the collector
+    (running inside the separate proxy process) needs no new plumbing to
+    the CLI/experiment-loading side to find an experiment's declared
+    prices. Best-effort: a missing run/experiment row, unparseable YAML, or
+    no `pricing:` block at all all just mean "nothing declared", not an
+    error -- the caller falls back to reporting the cost as unknown."""
+    row = cur.execute(
+        "SELECT e.config_yaml FROM runs r JOIN experiments e ON e.id = r.experiment_id "
+        "WHERE r.id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row or not row["config_yaml"]:
+        return {}
+    try:
+        cfg = yaml.safe_load(row["config_yaml"]) or {}
+    except yaml.YAMLError:
+        return {}
+    pricing = cfg.get("pricing") if isinstance(cfg, dict) else None
+    return pricing if isinstance(pricing, dict) else {}
+
+
+def _declared_cost(model, input_tokens, cache_creation, cache_read, output_tokens, pricing_table: dict):
+    """Compute cost from tokens using a declared `pricing:` entry (USD per
+    million tokens), or return None if no entry matches this model. Pure
+    function -- `pricing_table` is passed in rather than loaded here, so
+    this is testable without a database."""
+    key = resolve_model_key(model, pricing_table)
+    if key is None:
+        return None
+    price = pricing_table.get(key) or {}
+    if not isinstance(price, dict):
+        return None
+
+    def per_tok(field):
+        rate = price.get(field)
+        return (rate or 0) / 1_000_000
+
+    return (
+        (input_tokens or 0) * per_tok("input_per_mtok")
+        + (output_tokens or 0) * per_tok("output_per_mtok")
+        + (cache_creation or 0) * per_tok("cache_write_per_mtok")
+        + (cache_read or 0) * per_tok("cache_read_per_mtok")
+    )
+
+
+def _resolve_cost(rec: dict, pricing_table: dict) -> tuple:
+    """Decide this request's cost and how it was obtained (finding 9).
+    LiteLLM's own cost map silently returns 0.0 for any model id it has no
+    price for -- verified true for `claude-sonnet-5` as configured in
+    experiments/interactive-sonnet.yaml, and true in general for any
+    custom/self-hosted deployment name. A confident $0.0000 in `ys
+    compare`/`ys report` is the worst available failure mode for a tool
+    whose headline output is a cost comparison, so:
+
+    - LiteLLM's own number wins whenever it's nonzero ("litellm").
+    - If it's zero and this request actually spent tokens, an experiment's
+      declared `pricing:` block is used instead if one matches this model
+      ("declared").
+    - If neither can price it, cost stays 0.0 but is tagged "unknown" so
+      the zero can be flagged instead of silently trusted.
+    - Zero cost with zero tokens (e.g. a failed request with no usage) is
+      not the failure mode this guards against, so it's left as "litellm"
+      rather than flagged.
+    """
+    cost = rec.get("response_cost") or 0.0
+    if cost:
+        return cost, "litellm"
+
+    total_tokens = (
+        (rec.get("input_tokens") or 0)
+        + (rec.get("output_tokens") or 0)
+        + (rec.get("cache_creation") or 0)
+        + (rec.get("cache_read") or 0)
+    )
+    if not total_tokens:
+        return cost, "litellm"
+
+    declared = _declared_cost(
+        rec.get("model"),
+        rec.get("input_tokens"),
+        rec.get("cache_creation"),
+        rec.get("cache_read"),
+        rec.get("output_tokens"),
+        pricing_table,
+    )
+    if declared is not None:
+        return declared, "declared"
+    return 0.0, "unknown"
+
+
 def _write(run_id: str, rec: dict):
     with db.cursor() as cur:
         # BEGIN IMMEDIATE grabs the write lock up front instead of at the
@@ -422,14 +520,18 @@ def _write(run_id: str, rec: dict):
         thread_key, transition = _resolve_thread(
             cur, run_id, rec["system_prompt_hash"], rec["msg_hashes"]
         )
+        # See finding 9 in IMPROVEMENTS.md: LiteLLM's own cost map silently
+        # returns 0.0 for a model id it can't price, which would otherwise
+        # read as a confident (and wrong) $0 in every downstream total.
+        response_cost, cost_source = _resolve_cost(rec, _pricing_table_for_run(cur, run_id))
 
         cur.execute(
             """INSERT INTO requests
                (run_id, seq, ts, provider, model, stream, input_tokens, cache_creation,
                 cache_read, output_tokens, response_cost, latency_ms, ttft_ms, status_code,
                 error, msg_count, msg_hashes_json, system_tokens, tools_tokens, transition,
-                thread_key, toolset_hash, system_prompt_hash)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                thread_key, toolset_hash, system_prompt_hash, cost_source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id,
                 seq,
@@ -441,7 +543,7 @@ def _write(run_id: str, rec: dict):
                 rec["cache_creation"],
                 rec["cache_read"],
                 rec["output_tokens"],
-                rec["response_cost"],
+                response_cost,
                 rec["latency_ms"],
                 rec["ttft_ms"],
                 rec["status_code"],
@@ -454,6 +556,7 @@ def _write(run_id: str, rec: dict):
                 thread_key,
                 rec["toolset_hash"],
                 rec["system_prompt_hash"],
+                cost_source,
             ),
         )
         request_id = cur.lastrowid

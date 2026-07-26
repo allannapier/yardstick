@@ -11,6 +11,23 @@ See spec section 5 for the metric definitions this module implements.
 import statistics
 from typing import Callable, Optional
 
+from ys.experiment import resolve_model_key
+
+# Anthropic-shaped default weights for `billable_tokens` (finding 10): a
+# pricing-*weighted proxy* for spend, not a token count. A 5-minute cache
+# write costs ~1.25x a plain input token under Anthropic's pricing (the
+# previous hardcoded formula used 1.0 for this -- simply wrong); a cache
+# read costs ~0.1x (a ~90% discount). Meaningless for a provider with
+# different cache economics -- an experiment can override these per model
+# via `Experiment.billable_weights` (ys/experiment.py); a model with no
+# override falls back to this default.
+DEFAULT_BILLABLE_WEIGHTS = {
+    "input": 1.0,
+    "output": 1.0,
+    "cache_creation": 1.25,
+    "cache_read": 0.1,
+}
+
 
 # ---------------------------------------------------------------------------
 # Row loading helpers
@@ -157,6 +174,41 @@ def main_thread_fingerprint(cur, run_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _billable_weights_for(model, billable_weights_by_model: Optional[dict]) -> dict:
+    """The BillableWeights (as a plain dict) declared for `model`, or the
+    Anthropic-shaped default if none was declared / none matches. See
+    finding 10 in IMPROVEMENTS.md."""
+    if billable_weights_by_model:
+        key = resolve_model_key(model, billable_weights_by_model)
+        if key is not None:
+            return billable_weights_by_model[key]
+    return DEFAULT_BILLABLE_WEIGHTS
+
+
+def _request_billable_tokens(req: dict, billable_weights_by_model: Optional[dict]) -> float:
+    w = _billable_weights_for(req.get("model"), billable_weights_by_model)
+    return (
+        (req.get("input_tokens") or 0) * w.get("input", 1.0)
+        + (req.get("cache_creation") or 0) * w.get("cache_creation", 1.25)
+        + (req.get("output_tokens") or 0) * w.get("output", 1.0)
+        + (req.get("cache_read") or 0) * w.get("cache_read", 0.1)
+    )
+
+
+def unpriced_models(cur, run_id: str) -> list[dict]:
+    """Models with at least one request in this run whose cost LiteLLM
+    couldn't price and no declared `pricing:` override could price either
+    (`cost_source == 'unknown'`, ys/collector.py's `_resolve_cost`) --
+    finding 9's silent-$0 case. Returned as {"model", "count"} so callers
+    can report how many requests are affected, not just which model."""
+    rows = cur.execute(
+        "SELECT model, COUNT(*) AS n FROM requests "
+        "WHERE run_id = ? AND cost_source = 'unknown' GROUP BY model",
+        (run_id,),
+    ).fetchall()
+    return [{"model": r["model"], "count": r["n"]} for r in rows if r["model"]]
+
+
 def context_tokens(req: dict) -> int:
     """Full prompt size for one request: new + cache-write + cache-read tokens."""
     return (req.get("input_tokens") or 0) + (req.get("cache_creation") or 0) + (req.get("cache_read") or 0)
@@ -180,15 +232,17 @@ def _linear_slope(xs: list[float], ys: list[float]) -> Optional[float]:
 # 5.1 / 5.2 -- token accounting and cache efficiency
 # ---------------------------------------------------------------------------
 
-def token_metrics(cur, run_id: str) -> dict:
+def token_metrics(cur, run_id: str, billable_weights_by_model: Optional[dict] = None) -> dict:
     reqs = _requests(cur, run_id)
 
-    input_sum = sum(r.get("input_tokens") or 0 for r in reqs)
-    cache_creation_sum = sum(r.get("cache_creation") or 0 for r in reqs)
-    cache_read_sum = sum(r.get("cache_read") or 0 for r in reqs)
-    output_sum = sum(r.get("output_tokens") or 0 for r in reqs)
-
-    billable_tokens = input_sum + cache_creation_sum + output_sum + cache_read_sum * 0.1
+    # billable_tokens is a pricing-*weighted proxy* for spend, not a token
+    # count (finding 10) -- weighted per request by that request's own
+    # model, since a run can in principle mix models (background/catch-all
+    # traffic). `billable_weights_by_model` is the experiment's declared
+    # `Experiment.billable_weights` (ys/experiment.py), plain-dict-ified by
+    # the caller; a model with no entry there falls back to
+    # DEFAULT_BILLABLE_WEIGHTS (Anthropic's cache economics).
+    billable_tokens = sum(_request_billable_tokens(r, billable_weights_by_model) for r in reqs)
     cost_usd = sum(r.get("response_cost") or 0.0 for r in reqs)
 
     # Context growth and cache reuse describe the shape of one conversation,
@@ -399,10 +453,16 @@ def outcome_metrics(cur, run_id: str) -> dict:
 # Per-run rollup
 # ---------------------------------------------------------------------------
 
-def compute_run_metrics(cur, run_id: str) -> dict:
-    """All per-run metrics for one run_id, merged into a single flat dict."""
+def compute_run_metrics(cur, run_id: str, billable_weights_by_model: Optional[dict] = None) -> dict:
+    """All per-run metrics for one run_id, merged into a single flat dict.
+
+    `billable_weights_by_model` (see `token_metrics`) is optional -- callers
+    that don't have an `Experiment` handy (e.g. `ys end`'s immediate,
+    single-run summary) get `billable_tokens` under the Anthropic-shaped
+    default; `ys compare`/`ys report` (ys/render.py) pass the experiment's
+    declared `billable_weights` explicitly."""
     metrics: dict = {}
-    metrics.update(token_metrics(cur, run_id))
+    metrics.update(token_metrics(cur, run_id, billable_weights_by_model))
     metrics.update(overhead_metrics(cur, run_id))
     metrics.update(turn_metrics(cur, run_id))
     metrics.update(tool_call_metrics(cur, run_id))
@@ -446,7 +506,10 @@ _EFFICIENCY_METRICS = [
 
 
 def aggregate_run_metrics(
-    cur, run_ids: list[str], gate: Optional[Callable[[dict], bool]] = None
+    cur,
+    run_ids: list[str],
+    gate: Optional[Callable[[dict], bool]] = None,
+    billable_weights_by_model: Optional[dict] = None,
 ) -> dict:
     """Aggregate per-run metrics across the repeats of one arm.
 
@@ -459,6 +522,9 @@ def aggregate_run_metrics(
     ALL runs of the arm (successful or not -- failed runs still spent
     money) divided by the count of successful runs, per spec 5.7.
 
+    `billable_weights_by_model` is forwarded to `compute_run_metrics` for
+    every run (see `token_metrics`) -- finding 10.
+
     Spread is population stdev (statistics.pstdev): 0.0 for a single
     observation rather than undefined, which keeps `repeats: 1` arms usable.
     """
@@ -467,7 +533,7 @@ def aggregate_run_metrics(
         def gate(m):
             return bool(m.get("task_success"))
 
-    per_run = {rid: compute_run_metrics(cur, rid) for rid in run_ids}
+    per_run = {rid: compute_run_metrics(cur, rid, billable_weights_by_model) for rid in run_ids}
     n_runs = len(run_ids)
     passing = {rid: m for rid, m in per_run.items() if gate(m)}
     n_success = len(passing)

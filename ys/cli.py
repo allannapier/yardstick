@@ -84,6 +84,18 @@ def harness_point_cmd(
     arm: Optional[str] = typer.Option(
         None, "--arm", help="arm id whose model factor to point the agent at"
     ),
+    pin_background: bool = typer.Option(
+        True,
+        "--pin-background/--no-pin-background",
+        help=(
+            "also pin Claude Code's background small/fast-model env vars to the arm's "
+            "model (default: on). This is what keeps a mock_response experiment a dry "
+            "smoke test, but it also inflates cost_usd/billable_tokens relative to an "
+            "unmeasured session -- pass --no-pin-background for a real cost comparison "
+            "once the arm's model doesn't need mock_response to stay safe. See finding "
+            "27 in IMPROVEMENTS.md."
+        ),
+    ),
 ):
     """Point an agent's real config at the yardstick proxy (backs up the original first)."""
     api_key = os.environ.get("LITELLM_MASTER_KEY")
@@ -120,9 +132,17 @@ def harness_point_cmd(
             "to pin it to the arm's model.[/yellow]"
         )
 
+    if model and not pin_background:
+        console.print(
+            "[yellow]--no-pin-background: background (small/fast model) requests will "
+            "use the agent's own default, not the arm's model -- only safe if that "
+            "model doesn't rely on mock_response to avoid hitting the real API "
+            "(finding 27 in IMPROVEMENTS.md).[/yellow]"
+        )
+
     for name in _agent_names(agent):
         try:
-            path = harness.point(name, port, api_key, model=model)
+            path = harness.point(name, port, api_key, model=model, pin_background=pin_background)
         except harness.HarnessError as e:
             console.print(f"[red]{name}: {e}[/red]")
             raise typer.Exit(1)
@@ -384,6 +404,8 @@ def compare(
             raise typer.Exit(1)
         table = render.build_table(comparison)
     console.print(table)
+    for warning in render.cost_warnings(comparison):
+        console.print(f"[red]{warning}[/red]")
 
 
 @app.command()

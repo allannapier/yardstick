@@ -42,6 +42,11 @@ class ArmResult:
     aggregate: dict
     fingerprint_drifted: bool
     run_ids: list = field(default_factory=list)
+    # {"model": ..., "count": ...} entries with at least one request whose
+    # cost LiteLLM couldn't price and no declared `pricing:` override could
+    # price either -- finding 9. Non-empty means this arm's cost_usd/
+    # cost_per_success are undercounted, not merely imprecise.
+    unpriced_models: list = field(default_factory=list)
 
 
 @dataclass
@@ -81,6 +86,18 @@ def _fingerprint_drifted(cur, run_ids: list) -> bool:
     return len(fingerprints) > 1
 
 
+def _unpriced_models_for_arm(cur, run_ids: list) -> list:
+    """Merge `metrics.unpriced_models` across every run of an arm into one
+    {"model", "count"} list -- finding 9. Counts are summed across repeats
+    so a model unpriced in every run reads as clearly worse than one hit
+    once."""
+    counts: dict = {}
+    for run_id in run_ids:
+        for entry in metrics.unpriced_models(cur, run_id):
+            counts[entry["model"]] = counts.get(entry["model"], 0) + entry["count"]
+    return [{"model": model, "count": n} for model, n in sorted(counts.items())]
+
+
 def compare_experiment(cur, experiment: Experiment) -> Comparison:
     """Aggregate every arm of `experiment` from already-recorded runs.
 
@@ -105,13 +122,21 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
                 f"not the same fixed task."
             )
 
+    # Plain-dict-ified once so `metrics.py` (which knows nothing about
+    # pydantic) can look weights up per request's own model. See finding 10.
+    billable_weights_by_model = {
+        key: weights.model_dump() for key, weights in experiment.billable_weights.items()
+    }
+
     results = []
     for arm in experiment.arms:
         arm_row_id = _arm_row_id(experiment.experiment, arm.id)
         run_ids = _run_ids_for_arm(cur, arm_row_id)
         if not run_ids:
             continue
-        aggregate = metrics.aggregate_run_metrics(cur, run_ids)
+        aggregate = metrics.aggregate_run_metrics(
+            cur, run_ids, billable_weights_by_model=billable_weights_by_model
+        )
         results.append(
             ArmResult(
                 arm_id=arm.id,
@@ -120,6 +145,7 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
                 aggregate=aggregate,
                 fingerprint_drifted=_fingerprint_drifted(cur, run_ids),
                 run_ids=run_ids,
+                unpriced_models=_unpriced_models_for_arm(cur, run_ids),
             )
         )
 
@@ -161,6 +187,31 @@ def _delta_str(value: Optional[float], baseline: Optional[float]) -> str:
     return f"{sign}{pct:.0f}%"
 
 
+# Metrics whose value is directly undercounted (not merely imprecise) when an
+# arm has any unpriced request -- see finding 9. Both are derived straight
+# from response_cost.
+_COST_DERIVED_METRICS = ("cost_usd", "cost_per_success")
+_COST_UNKNOWN_MARKER = " [COST UNKNOWN]"
+
+
+def cost_warnings(comparison: Comparison) -> list:
+    """One line per (arm, model) with at least one request LiteLLM couldn't
+    price and that no declared `pricing:` override could price either
+    (finding 9). Meant to be printed prominently alongside the table/report
+    -- a request like this makes cost_usd/cost_per_success for that arm
+    silently *wrong*, not just imprecise, so this is not a footnote."""
+    lines = []
+    for arm in comparison.arms:
+        for entry in arm.unpriced_models:
+            lines.append(
+                f"cost unavailable for model '{entry['model']}' in arm '{arm.label}' "
+                f"({entry['count']} request(s)) -- LiteLLM has no price for it and the "
+                "experiment declares no `pricing:` override for it. cost_usd and "
+                "cost_per_success for this arm are undercounted, not merely imprecise."
+            )
+    return lines
+
+
 def build_table(comparison: Comparison):
     from rich.table import Table
 
@@ -171,6 +222,8 @@ def build_table(comparison: Comparison):
         header = f"{arm.label}*" if arm.is_baseline else arm.label
         if arm.fingerprint_drifted:
             header += " [UNCONTROLLED]"
+        if arm.unpriced_models:
+            header += _COST_UNKNOWN_MARKER
         table.add_column(header, justify="right")
 
     n_runs = {a.label: a.aggregate["n_runs"] for a in comparison.arms}
@@ -181,7 +234,11 @@ def build_table(comparison: Comparison):
     )
     table.add_row(
         "cost_per_success",
-        *[_fmt(a.aggregate["cost_per_success"], ".4f") for a in comparison.arms],
+        *[
+            _fmt(a.aggregate["cost_per_success"], ".4f")
+            + (_COST_UNKNOWN_MARKER if a.unpriced_models else "")
+            for a in comparison.arms
+        ],
     )
 
     for key in PRIMARY_METRICS + SECONDARY_METRICS:
@@ -191,6 +248,8 @@ def build_table(comparison: Comparison):
             stat = arm.aggregate["metrics"].get(key, {})
             mean = stat.get("mean")
             cell = _fmt(mean)
+            if key in _COST_DERIVED_METRICS and arm.unpriced_models:
+                cell += _COST_UNKNOWN_MARKER
             if not arm.is_baseline:
                 delta = _delta_str(mean, base_mean)
                 if delta:
@@ -253,9 +312,11 @@ def render_html(comparison: Comparison, cur) -> str:
     baseline = next((a for a in comparison.arms if a.is_baseline), None)
 
     uncontrolled = ' <span class="warn">UNCONTROLLED</span>'
+    cost_unknown_header = ' <span class="warn">COST UNKNOWN</span>'
     header_cells = "".join(
         f"<th>{html.escape(a.label)}{' *' if a.is_baseline else ''}"
-        f"{uncontrolled if a.fingerprint_drifted else ''}</th>"
+        f"{uncontrolled if a.fingerprint_drifted else ''}"
+        f"{cost_unknown_header if a.unpriced_models else ''}</th>"
         for a in comparison.arms
     )
 
@@ -270,6 +331,8 @@ def render_html(comparison: Comparison, cur) -> str:
             cell = _fmt(mean, fmt_spec)
             if spread is not None and n and n > 1:
                 cell += f' <span class="spread">± {_fmt(spread, fmt_spec)} (n={n})</span>'
+            if key in _COST_DERIVED_METRICS and a.unpriced_models:
+                cell += ' <span class="warn">?</span>'
             if not a.is_baseline:
                 delta = _delta_str(mean, base_mean)
                 if delta:
@@ -286,13 +349,24 @@ def render_html(comparison: Comparison, cur) -> str:
     )
     rows_html.append(
         "<tr><th>cost_per_success</th>"
-        + "".join(f"<td>{_fmt(a.aggregate['cost_per_success'], '.4f')}</td>" for a in comparison.arms)
+        + "".join(
+            f"<td>{_fmt(a.aggregate['cost_per_success'], '.4f')}"
+            + (' <span class="warn">?</span>' if a.unpriced_models else "")
+            + "</td>"
+            for a in comparison.arms
+        )
         + "</tr>"
     )
     for key in PRIMARY_METRICS:
         rows_html.append(metric_row(key))
     for key in SECONDARY_METRICS:
         rows_html.append(metric_row(key))
+
+    warnings = cost_warnings(comparison)
+    warnings_html = ""
+    if warnings:
+        items = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
+        warnings_html = f'<div class="cost-warning"><strong>Cost unavailable</strong><ul>{items}</ul></div>'
 
     charts_html = []
     for a in comparison.arms:
@@ -320,9 +394,12 @@ def render_html(comparison: Comparison, cur) -> str:
   .chart-grid {{ display: flex; flex-wrap: wrap; gap: 1rem; }}
   .chart-card {{ border: 1px solid #8883; border-radius: 8px; padding: 0.75rem; }}
   .chart-label {{ font-size: 0.75rem; color: #888; margin-top: 0.5rem; }}
+  .cost-warning {{ border: 2px solid #e0555f; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; color: #e0555f; }}
+  .cost-warning ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
 </style>
 <h1>{html.escape(comparison.experiment_name)}</h1>
 <p>task: {html.escape(comparison.task_id)} &middot; repeats: {comparison.repeats} &middot; (*) baseline</p>
+{warnings_html}
 <table><tr><th></th>{header_cells}</tr>{''.join(rows_html)}</table>
 <h2>per-run detail</h2>
 <div class="chart-grid">{''.join(charts_html)}</div>

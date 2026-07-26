@@ -113,9 +113,11 @@ def test_normal_run():
 
     assert m["turns"] == 3
     assert m["cost_usd"] == pytest.approx(0.12)
-    # billable = sum(input) + sum(cache_creation) + sum(output) + sum(cache_read)*0.1
-    #          = 1100 + 200 + 750 + 2200*0.1
-    assert m["billable_tokens"] == pytest.approx(2270.0)
+    # billable = sum(input)*1.0 + sum(cache_creation)*1.25 + sum(output)*1.0 + sum(cache_read)*0.1
+    #          = 1100 + 200*1.25 + 750 + 2200*0.1
+    # cache_creation weight is 1.25 (finding 10's fixed Anthropic default --
+    # a cache write costs ~1.25x a plain input token, not 1.0x).
+    assert m["billable_tokens"] == pytest.approx(2320.0)
     # context_tokens per request: 1200, 1050, 1250
     assert m["context_high_water"] == 1250
     assert m["context_growth_rate"] == pytest.approx(25.0)
