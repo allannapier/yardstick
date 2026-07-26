@@ -92,9 +92,13 @@ pid/port/log files, and generated proxy config.
 
 ## Provenance
 
-`docs/provenance/` holds the ad-hoc probe scripts used to capture a real
+`tools/provenance/` holds the ad-hoc probe scripts used to capture a real
 LiteLLM callback payload against a live proxied request. `ys/collector.py`'s
 field paths are verified against that captured shape rather than guessed
 from LiteLLM's docs; see its module docstring. The scripts were originally
 kept at the repo root as `explore/` and were moved here as documentation,
-not source.
+not source. They live under `tools/` rather than `docs/` specifically
+because `docs/` is published verbatim to GitHub Pages
+(`.github/workflows/pages.yml` uploads the whole directory on every push
+that touches it) — putting probe scripts and captured payloads there would
+publish them to the public site and trigger a docs redeploy on every edit.

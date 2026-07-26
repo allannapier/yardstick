@@ -606,7 +606,8 @@ file; the `--env-only` path sidesteps it entirely.
 - ~~`explore/` — ad-hoc probe scripts committed at the root. Valuable as provenance
   for the collector's field paths (the collector docstring cites them), so keep
   them, but move them under `tools/` or `docs/provenance/` and say so in the
-  README.~~ Moved to `docs/provenance/` with `git mv`; README now says so, and
+  README.~~ Moved to `tools/provenance/` with `git mv` (not `docs/`, since
+  `docs/` is published verbatim to GitHub Pages); README now says so, and
   every reference to the old `explore/` path (the collector docstring,
   `.gitignore`, and the relocated scripts' own hardcoded paths) was updated.
 - ~~`pyproject.toml` has no dev-dependency group; `pytest` isn't declared

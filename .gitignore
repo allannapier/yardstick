@@ -1,8 +1,8 @@
 .venv/
-docs/provenance/dumps/
-docs/provenance/proxy.log
-docs/provenance/.master_key
-docs/provenance/.anthropic_key
+tools/provenance/dumps/
+tools/provenance/proxy.log
+tools/provenance/.master_key
+tools/provenance/.anthropic_key
 __pycache__/
 *.pyc
 .pytest_cache/

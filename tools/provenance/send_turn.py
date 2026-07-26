@@ -2,7 +2,7 @@ import json
 import sys
 import urllib.request
 
-MASTER_KEY = open("/home/allan/code/measure/docs/provenance/.master_key").read().strip()
+MASTER_KEY = open("/home/allan/code/measure/tools/provenance/.master_key").read().strip()
 
 
 def send(run_id, messages):
