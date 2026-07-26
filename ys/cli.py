@@ -44,9 +44,13 @@ def proxy_up_cmd(
 
 
 @proxy_app.command("down")
-def proxy_down_cmd():
+def proxy_down_cmd(
+    force: bool = typer.Option(
+        False, "--force", help="send SIGKILL if the process doesn't stop from SIGTERM"
+    ),
+):
     """Stop the proxy."""
-    console.print(proxy.proxy_down())
+    console.print(proxy.proxy_down(force=force))
 
 
 @proxy_app.command("status")
@@ -167,9 +171,13 @@ def web_up_cmd(
 
 
 @web_app.command("down")
-def web_down_cmd():
+def web_down_cmd(
+    force: bool = typer.Option(
+        False, "--force", help="send SIGKILL if the process doesn't stop from SIGTERM"
+    ),
+):
     """Stop the dashboard."""
-    console.print(webserver.web_down())
+    console.print(webserver.web_down(force=force))
 
 
 @web_app.command("status")

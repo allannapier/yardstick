@@ -131,7 +131,7 @@ compute conversation metrics over the main thread (the one with the most
 requests), and report background traffic as its own line item — "N background
 requests, M tokens" is itself a useful harness-efficiency number.
 
-### 5. `ys proxy down` silently orphans the proxy [verified]
+### 5. `ys proxy down` silently orphans the proxy [verified] — fixed on this branch
 
 ```
 stop() returned after 5.0s: 'stopped process (pid 11395)'
@@ -148,10 +148,21 @@ The user is left with a process still holding port 4000 and no pidfile to find i
 by. The next `ys proxy up` then fails after a 15-second readiness timeout with a
 message that points at a log file rather than at the real cause.
 
-**Fix:** signal the process group (`os.killpg`), escalate to `SIGKILL` after a
-grace period, only remove the pidfile once the process is confirmed gone, and
-report honestly when it isn't. Add `ys proxy down --force` and have `proxy up`
-detect a port that is bound but unowned.
+**Fix:**
+
+- `procutil.stop` now signals the whole process group (`os.killpg`, falling
+  back to `os.kill` if the group lookup fails) so a worker `launch_detached`
+  spawned under `start_new_session=True` is reachable too, not just the
+  leader pid.
+- After the grace period, a still-alive process is reported honestly — the
+  pidfile is left in place (so it can still be found) instead of being
+  removed regardless of outcome — and the message points at the new
+  `ys proxy down --force` / `ys web down --force`, which escalates to
+  `SIGKILL` and only clears the pidfile once the process is confirmed dead.
+- `proxy up` and `web up` now probe the target port before starting; a port
+  that's bound but has no live pidfile behind it (the exact state the old
+  `stop` could leave behind) fails fast with an explanation instead of
+  burning the 15s readiness timeout and blaming a log file.
 
 ---
 
@@ -432,9 +443,9 @@ file; the `--env-only` path sidesteps it entirely.
 
 ## Suggested sequencing
 
-**Milestone 1 — make it run.** Findings 1 (done), 2 (done), 3 (done), 5. Add the test
-matrix CI first so the rest is defended. After this, a first-time user can
-complete the README quick start with a real agent.
+**Milestone 1 — make it run.** Findings 1 (done), 2 (done), 3 (done), 5 (done). Add
+the test matrix CI first so the rest is defended. After this, a first-time user
+can complete the README quick start with a real agent.
 
 **Milestone 2 — make the numbers trustworthy.** Findings 8 (migrations, first),
 then 4, 6, 7, 9, 11, 12, 13, 14. This is the batch that decides whether the tool's

@@ -106,6 +106,12 @@ def proxy_up(experiment_paths: list[str], port: int = DEFAULT_PORT) -> str:
         raise ProxyError(
             f"proxy already running (pid {existing}). Run `ys proxy down` first."
         )
+    if procutil.port_in_use(port):
+        raise ProxyError(
+            f"port {port} is already bound by a process ys has no pidfile for -- a proxy "
+            "started outside ys, a previous run `ys proxy down` couldn't kill, or an "
+            "unrelated service. Free the port, or start with a different --port."
+        )
 
     db.init_db()  # the collector writes to this schema from inside the proxy subprocess
     config_path = generate_config(experiment_paths)
@@ -161,8 +167,8 @@ def read_port(default: int = DEFAULT_PORT) -> int:
     return procutil.read_port(paths.PROXY_PORT_PATH, default)
 
 
-def proxy_down() -> str:
-    return procutil.stop(paths.PROXY_PID_PATH, paths.PROXY_PORT_PATH)
+def proxy_down(force: bool = False) -> str:
+    return procutil.stop(paths.PROXY_PID_PATH, paths.PROXY_PORT_PATH, force=force)
 
 
 def proxy_status() -> tuple[bool, int | None]:
