@@ -1,5 +1,4 @@
 import datetime
-import json
 
 from ys import db
 from ys.collector import (
