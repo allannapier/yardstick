@@ -68,11 +68,13 @@ def test_stop_kills_live_process(tmp_path):
     assert not procutil.alive(proc.pid)
 
 
-# A leader that spawns a child in its own session/process group (Popen
-# without start_new_session leaves the child in the leader's group), then
-# publishes the child's pid atomically -- write-then-rename, so the waiting
-# test can never read a half-written file. Kept in Python rather than a shell
-# one-liner so the test doesn't depend on an external `bash`.
+# `_spawn` puts this leader in a session/process group of its own
+# (start_new_session=True, exactly as launch_detached does); the child it
+# spawns here stays in that same group, because Popen without
+# start_new_session doesn't move it. The child's pid is then published
+# atomically -- write-then-rename, so the waiting test can never read a
+# half-written file. Kept in Python rather than a shell one-liner so the test
+# doesn't depend on an external `bash`.
 _LEADER_SPAWNS_CHILD = (
     "import pathlib, subprocess, sys, time;"
     "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
@@ -165,14 +167,18 @@ def test_stop_with_force_escalates_to_sigkill(tmp_path):
 
 
 def test_port_in_use_false_when_nothing_listening():
-    # Bind an ephemeral port and immediately release it: the kernel handed it
-    # out because it was free, which is a far safer bet on a shared CI runner
-    # than asserting some hardcoded port number is idle.
+    # Bind an ephemeral port but never listen on it, and hold the binding for
+    # the duration of the check: the kernel handed the port out because it was
+    # free, and keeping it bound stops anything else on a shared CI runner
+    # taking it mid-test. connect_ex against a bound-but-not-listening port
+    # still gets ECONNREFUSED, so port_in_use is False -- which is the state
+    # this is asserting, and now without a window for another process to make
+    # it flakily true.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
 
-    assert procutil.port_in_use(port) is False
+        assert procutil.port_in_use(port) is False
 
 
 def test_port_in_use_true_when_something_listening():
