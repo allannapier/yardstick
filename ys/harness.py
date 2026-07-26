@@ -117,7 +117,11 @@ def point(agent_name: str, port: int, api_key: str, model: Optional[str] = None)
     defaults to, which the proxy has never heard of and rejects (finding 3);
     the request would only survive via the proxy's catch-all passthrough,
     which skips any mock_response/params the experiment declared for the
-    real model_name."""
+    real model_name.
+
+    Written into each agent's config as that agent expects it: verbatim for
+    Claude Code's `ANTHROPIC_MODEL` env vars, provider-prefixed
+    (`anthropic/<model>`) for opencode's `model` key."""
     if agent_name not in AGENTS:
         raise HarnessError(f"unknown agent '{agent_name}'. Choose from: {', '.join(AGENTS)}")
 

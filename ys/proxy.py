@@ -136,8 +136,9 @@ def model_available(model_name: str, port: int, api_key: str, timeout_s: float =
     """Whether the running proxy has an *explicit* model_list entry for
     `model_name` (as opposed to falling through the `*` catch-all, which
     still works but skips any mock_response/params the experiment declared
-    for it). Returns None if the proxy couldn't be reached at all, so callers
-    can tell "not running" apart from "running but missing this model"."""
+    for it). Returns None if the query itself failed for any reason --
+    unreachable proxy, a non-2xx response, or an unparseable body -- so
+    callers can tell "couldn't verify" apart from "verified and missing"."""
     req = urllib.request.Request(
         f"http://localhost:{port}/v1/models",
         headers={"Authorization": f"Bearer {api_key}"},
