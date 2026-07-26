@@ -4,7 +4,17 @@ from contextlib import contextmanager
 
 from ys import paths
 
-SCHEMA = """
+# Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
+# Each entry is executed at most once per database file, in order, and never
+# edited after release — a schema change (new table, new column) is a new
+# entry appended to this list, not an edit to an earlier one. Entries must be
+# idempotent-safe to replay (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF
+# NOT EXISTS`) so that a database created before migrations existed, which
+# has all these tables but `user_version = 0`, converges to the same state
+# as a fresh one instead of erroring on migration 1.
+MIGRATIONS: list[str] = [
+    # 1: initial schema
+    """
 CREATE TABLE IF NOT EXISTS experiments (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -82,7 +92,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_request ON tool_calls(request_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id, provider_call_id);
-"""
+""",
+]
 
 
 def connect() -> sqlite3.Connection:
@@ -93,11 +104,20 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
 def init_db():
     conn = connect()
     try:
-        conn.executescript(SCHEMA)
-        conn.commit()
+        current = schema_version(conn)
+        for version, script in enumerate(MIGRATIONS, start=1):
+            if version <= current:
+                continue
+            conn.executescript(script)
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.commit()
     finally:
         conn.close()
 

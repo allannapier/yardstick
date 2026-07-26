@@ -194,15 +194,23 @@ corrupts the transition chain.
 transaction, and retry on conflict. Consider ordering by the autoincrement `id`
 and treating `seq` as a derived presentation value.
 
-### 8. No schema versioning [by inspection]
+### 8. No schema versioning [verified] — fixed on this branch
 
-The schema is applied with `CREATE TABLE IF NOT EXISTS` and nothing else. Every
+The schema was applied with `CREATE TABLE IF NOT EXISTS` and nothing else. Every
 fix in this document that adds a column (`thread_key`, `cost_source`,
-`task_snapshot`) will silently not apply to any existing database, and queries
-will fail against tables that were created by an older version.
+`task_snapshot`) would have silently not applied to any existing database, and
+queries would fail against tables that were created by an older version.
 
-**Fix:** `PRAGMA user_version` plus an ordered migration list applied in
-`init_db()`, before anything else here lands.
+**Fix:** `ys/db.py` now tracks `PRAGMA user_version` against an ordered
+`MIGRATIONS` list (currently one entry: the original schema). `init_db()`
+applies only the migrations above the database's current version, in order,
+committing after each one, so a fresh install and an old database both
+converge to the same state. Future schema changes are appended as new list
+entries rather than edits to migration 1. A database created before this
+change has every table but `user_version = 0`; replaying migration 1's
+`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` against it is a
+no-op that still advances the version, which `tests/test_db.py` covers
+directly.
 
 ### 9. Cost is silently $0 for models LiteLLM cannot price [by inspection]
 
@@ -447,10 +455,11 @@ file; the `--env-only` path sidesteps it entirely.
 the test matrix CI first so the rest is defended. After this, a first-time user
 can complete the README quick start with a real agent.
 
-**Milestone 2 — make the numbers trustworthy.** Findings 8 (migrations, first),
-then 4, 6, 7, 9, 11, 12, 13, 14. This is the batch that decides whether the tool's
-output can be believed; nothing above it matters if `compaction_events` and
-`cost_usd` are wrong.
+**Milestone 2 — make the numbers trustworthy.** Finding 8 (migrations, done —
+this is what the rest of the milestone builds its schema changes on), then 4, 6,
+7, 9, 11, 12, 13, 14. This is the batch that decides whether the tool's output
+can be believed; nothing above it matters if `compaction_events` and `cost_usd`
+are wrong.
 
 **Milestone 3 — make it usable.** The dashboard defect table (19–24), the HTML and
 experiment-discovery fixes, `ys doctor`, `ys runs list`, and the unattributed
