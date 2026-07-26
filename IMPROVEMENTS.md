@@ -385,7 +385,7 @@ they belong to — each fix does what it claims — but each is a place where th
 fix rests on an assumption that isn't enforced, or is narrower than the finding
 it closed.
 
-### 25. Thread separation depends entirely on the system prompt hash [by inspection]
+### 25. Thread separation depends entirely on the system prompt hash [by inspection] — fixed
 
 `_resolve_thread` (finding 4) only considers a candidate thread whose most
 recent request shares this request's `system_prompt_hash`. That check is doing
@@ -405,15 +405,38 @@ genuine harness-side compaction rewrites the early history into a summary, so
 its shared prefix with the pre-compaction history is also 0 — indistinguishable
 from an unrelated shorter conversation on hashes alone.
 
-**Fix:** at minimum, state the assumption in `_resolve_thread`'s docstring and
-add a test that pins the behaviour when the system prompts *do* match, so a
-future change to the transition classifier can't silently widen the hole. A
-stronger version needs a second signal — a large drop in message count with a
-zero shared prefix looks much more like a new thread than like a compaction,
-and compaction candidates could require the request to be within some ratio of
-the parent's size.
+**Fix:**
 
-### 26. The "main" thread is whichever thread is largest [by inspection]
+- `_resolve_thread`'s docstring now states the assumption directly: matching
+  `system_prompt_hash` is treated as strong evidence of "same conversation",
+  and that's only safe because every harness this rig currently drives gives
+  background/subagent traffic a different system prompt from the main
+  conversation — a property of those harnesses today, not a guarantee.
+- The stronger fix: `_resolve_thread` no longer accepts every "compaction"
+  transition as a plausible parent. A new `_plausible_compaction` check
+  requires the candidate's message count to retain at least a third
+  (`_MIN_COMPACTION_RATIO = 1/3`) of the parent's — a low bar for a real
+  compaction (lossy, but not annihilative: the conversation keeps going) but
+  usually well out of reach for an unrelated exchange that only coincidentally
+  shares a system prompt, since a subagent or background call restarts from a
+  small, roughly constant handful of messages regardless of how long the
+  thread it's mistaken for has grown. This isn't a precise boundary — the
+  ambiguity above is real and hashes alone can't fully resolve it — just a
+  conservative floor against the worst case: a tiny unrelated exchange
+  landing right after a long thread and being read as "compaction" on
+  message-count alone. A "compaction" transition that fails the ratio falls
+  through to starting its own thread instead of joining the parent's.
+- Two new tests in `tests/test_collector.py` pin both directions:
+  `test_write_rejects_a_same_system_prompt_short_unrelated_call_as_compaction`
+  (a same-system-prompt exchange collapsing from 12 messages to 2 must start
+  its own thread — this fails with a bare `AssertionError` against the
+  pre-fix code, since the old code merges it as "compaction") and
+  `test_write_still_follows_a_plausible_large_compaction` (a real compaction
+  retaining exactly a third of the pre-compaction message count — the ratio's
+  inclusive boundary — must still resolve to the same thread, which is the
+  case the fix must not regress).
+
+### 26. The "main" thread is whichever thread is largest [by inspection] — fixed
 
 `metrics._main_thread_key` picks the `thread_key` with the most requests, ties
 broken by earliest `MIN(seq)`. A long-running `Task` subagent can plausibly
@@ -422,10 +445,31 @@ becomes "the main thread": `turns`, the compaction metrics, and the run's
 corrected fingerprint (`main_thread_fingerprint`, written at `finish_run`) all
 come from the subagent instead of the driving conversation.
 
-**Fix:** prefer the thread containing the run's first request — the driving
-conversation is the one that starts the run — or keep the largest-thread rule
-but warn when the largest thread doesn't contain `seq = 1`, which is the case
-where the two rules disagree.
+**Fix:** kept the largest-thread rule rather than overriding it to "whichever
+thread contains the run's first request", and added a warning signal instead.
+The override was tempting but isn't a strict improvement: it has its own
+failure mode, already pinned by
+`test_main_thread_fingerprint_prefers_largest_thread_over_first_request`
+(finding 4) — a background call (e.g. title generation) that happens to be
+logged as the run's very first request, ahead of the real conversation's first
+turn, is a singleton that must not win the fingerprint just for being first.
+Neither signal (request count, chronology) dominates the other, so overriding
+to chronology would only trade one mis-attribution for the other rather than
+fixing it.
+
+Instead, `metrics._main_thread_started_run` reports whether the thread
+`_main_thread_key` picked also contains `seq = 1` — false is exactly the case
+where the two rules disagree, i.e. where a secondary thread has out-issued the
+conversation that started the run. It's surfaced as `main_thread_started_run`
+in `compute_run_metrics`'s output (via the new `main_thread_metrics`), a
+boolean finding excluded from `_EFFICIENCY_METRICS` the same way
+`overhead_drift` is — not a magnitude to average across repeats. `cost_usd`/
+`billable_tokens` are unaffected either way (still run-wide); `turns`, the
+compaction metrics, and the corrected fingerprint still come from the
+largest thread, now with a way to tell when that choice is questionable.
+Two new tests in `tests/test_metrics.py` cover both the ordinary case and the
+finding-26 scenario (a 3-request `subagent` thread outnumbering a 2-request
+`main` thread that holds `seq = 1`).
 
 ### 27. Pinning the small/fast model routes background traffic through the arm's model [by inspection]
 
