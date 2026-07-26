@@ -307,3 +307,25 @@ def test_start_warns_when_proxy_unreachable(tmp_path, monkeypatch):
     assert "could not reach the proxy" in unwrapped(result.stdout)
 
     runner.invoke(app, ["end"])
+
+
+def test_start_warns_when_master_key_unset_skips_model_check(tmp_path, monkeypatch):
+    """Regression test for finding 29: without LITELLM_MASTER_KEY in `ys
+    start`'s own environment (e.g. `ys proxy up` ran in a different shell),
+    the model_available check added for finding 3 can't run at all -- it
+    must say so instead of silently doing nothing, which left the user
+    believing a verified proxy was serving their model."""
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+
+    def _boom(model, port, key):
+        raise AssertionError("model_available must not run without a master key")
+
+    monkeypatch.setattr(proxy, "model_available", _boom)
+
+    exp = _write_model_exp(tmp_path)
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "model-arm"])
+    assert result.exit_code == 0, result.stdout
+    assert "couldn't verify model 'claude-sonnet-5'" in unwrapped(result.stdout)
+    assert "LITELLM_MASTER_KEY not set in this shell" in unwrapped(result.stdout)
+
+    runner.invoke(app, ["end"])

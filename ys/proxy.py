@@ -158,6 +158,27 @@ def model_available(model_name: str, port: int, api_key: str, timeout_s: float =
     return model_name in ids
 
 
+def model_check_skipped_message(model: str) -> str:
+    """Message for the case where `model_available`'s check couldn't run at
+    all, because `ys start` has no `LITELLM_MASTER_KEY` in its own
+    environment to query the proxy's `/v1/models` with -- distinct from
+    `model_available` returning `False` (verified, and missing) or `None`
+    (verified reachability, but the proxy didn't answer). `ys proxy up` and
+    `ys start` are commonly run in separate shells, so a shell that never
+    exported the key is a first-run scenario, not an edge case (finding 29
+    in IMPROVEMENTS.md) -- without this, `ys start` silently skips the
+    check finding 3 added and the user proceeds believing a verified proxy
+    is serving their model. Factored out here, rather than inlined at the
+    one caller, so `ys doctor` (finding 12/feature 4) can print the same
+    wording instead of inventing its own."""
+    return (
+        f"couldn't verify model '{model}' is registered on the proxy -- "
+        "LITELLM_MASTER_KEY not set in this shell (the check needs it to "
+        "query the proxy's /v1/models). Export the same key you started "
+        "`ys proxy up` with to verify."
+    )
+
+
 def read_port(default: int = DEFAULT_PORT) -> int:
     """The port the currently-configured proxy is (or was last) listening on.
 

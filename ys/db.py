@@ -1,9 +1,19 @@
 import json
 import sqlite3
+import time
 import warnings
 from contextlib import contextmanager
 
 from ys import paths
+
+# db.connect()'s busy_timeout already makes SQLite itself wait out a
+# conflicting writer, but a write that outlasts the busy timeout -- or loses
+# the UNIQUE(run_id, seq) race from finding 7 -- still needs a caller-level
+# retry. A few attempts with a short backoff covers that residual
+# contention without masking a persistently broken database. See
+# `call_with_retry` below and finding 28 in IMPROVEMENTS.md.
+MAX_WRITE_ATTEMPTS = 3
+RETRY_BACKOFF_S = 0.2
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str):
@@ -248,6 +258,35 @@ def cursor():
         conn.commit()
     finally:
         conn.close()
+
+
+def call_with_retry(fn, *args, **kwargs):
+    """Call `fn(*args, **kwargs)`, retrying up to `MAX_WRITE_ATTEMPTS` times
+    with a short linear backoff on `sqlite3.OperationalError` (a lock that
+    outlasted `connect()`'s busy_timeout) or `sqlite3.IntegrityError` (the
+    `UNIQUE(run_id, seq)` backstop from finding 7 -- a fresh attempt gets a
+    fresh transaction and a fresh seq, so it self-heals). Any other
+    exception propagates immediately; only lock/uniqueness races are worth
+    retrying.
+
+    Originally this loop lived only in `ys/collector.py`'s `YardstickLogger.
+    _handle` (finding 6); every other writer -- `ys start`, `ys end`,
+    `ys runs delete`, the dashboard -- went through a bare `db.cursor()` and
+    surfaced "database is locked" as an unhandled traceback instead (finding
+    28). This is the one retry policy both paths now share.
+
+    `fn` must open (and commit) its own `db.cursor()` per call, so a retried
+    attempt starts from a clean connection/transaction rather than replaying
+    inside one that already failed partway through -- see `ys/collector.py`'s
+    `_write` and `ys/runs.py`'s write helpers for the two shapes of caller.
+    """
+    for attempt in range(1, MAX_WRITE_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except (sqlite3.OperationalError, sqlite3.IntegrityError):
+            if attempt == MAX_WRITE_ATTEMPTS:
+                raise
+            time.sleep(RETRY_BACKOFF_S * attempt)
 
 
 def dumps(obj) -> str:

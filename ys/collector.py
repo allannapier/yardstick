@@ -7,7 +7,6 @@ tools/provenance/ for the probe that produced the ground truth.
 import asyncio
 import hashlib
 import json
-import sqlite3
 import time
 import traceback
 import uuid
@@ -17,15 +16,6 @@ from litellm.integrations.custom_logger import CustomLogger
 from ys import db, dropped, paths
 
 _SECRET_KEYS = {"api_key", "authorization", "x-api-key", "api-key"}
-
-# db.connect()'s busy_timeout already makes SQLite itself wait out a
-# conflicting writer, and _write's BEGIN IMMEDIATE serializes seq allocation
-# against every other writer (finding 7), but a few retries with a short
-# backoff still covers residual contention -- OperationalError from a lock
-# that outlasts busy_timeout, or IntegrityError from the UNIQUE(run_id, seq)
-# backstop -- without masking a persistently broken database.
-_MAX_WRITE_ATTEMPTS = 3
-_RETRY_BACKOFF_S = 0.2
 
 
 def _redact(obj, key=None):
@@ -498,14 +488,15 @@ class YardstickLogger(CustomLogger):
         try:
             run_id = _resolve_run_id(kwargs)
             rec = extract_record(kwargs, response_obj, start_time, end_time)
-            for attempt in range(1, _MAX_WRITE_ATTEMPTS + 1):
-                try:
-                    await asyncio.get_running_loop().run_in_executor(None, _write, run_id, rec)
-                    break
-                except (sqlite3.OperationalError, sqlite3.IntegrityError):
-                    if attempt == _MAX_WRITE_ATTEMPTS:
-                        raise
-                    await asyncio.sleep(_RETRY_BACKOFF_S * attempt)
+            # `_write` already opens its own `db.cursor()` transaction per
+            # call, so `db.call_with_retry` can just call it again on a
+            # retryable failure -- see finding 28 in IMPROVEMENTS.md, and
+            # `db.call_with_retry`'s docstring for why this is now the one
+            # retry policy shared with the CLI/dashboard write paths
+            # (ys/runs.py) instead of collector-only inline retry logic.
+            await asyncio.get_running_loop().run_in_executor(
+                None, db.call_with_retry, _write, run_id, rec
+            )
         except Exception as e:
             # A request whose write never lands has no other record of its
             # existence -- count it so a lossy run is visible instead of

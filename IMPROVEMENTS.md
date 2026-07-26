@@ -497,7 +497,7 @@ test — so this is a trade-off to make explicit rather than a bug to reverse.
 declares a `mock_response`) so a real cost comparison can opt out. Overlaps
 findings 9 and 10, which have to price this traffic correctly either way.
 
-### 28. Only the collector retries a locked write [by inspection]
+### 28. Only the collector retries a locked write [by inspection] — fixed
 
 Finding 6 gave `YardstickLogger._handle` a retry loop, but every other writer —
 `ys start`, `ys end`, `ys runs delete`, the dashboard — goes through a bare
@@ -506,10 +506,35 @@ than impossible, and a write that outlasts the busy timeout still surfaces as
 an unhandled `database is locked` traceback from the CLI, with `ys end` (which
 races the tail of the proxy's in-flight writes) the most exposed.
 
-**Fix:** move the retry into a helper alongside `db.cursor()` and use it for the
-CLI/dashboard write paths too, rather than duplicating the loop per call site.
+**Fix:**
 
-### 29. `ys start` silently skips its own model check without a master key [by inspection]
+- `db.call_with_retry(fn, *args, **kwargs)` is the one retry policy the
+  collector and the CLI/dashboard now share, living next to `db.cursor()`.
+  It retries `fn(*args, **kwargs)` up to `db.MAX_WRITE_ATTEMPTS` (3) times
+  with a short backoff on `sqlite3.OperationalError`/`IntegrityError` — the
+  same two exceptions and the same policy `_handle` had inline — and lets
+  anything else propagate on the first attempt. `fn` is expected to open
+  (and commit) its own `db.cursor()` per call, so a retried attempt starts
+  from a clean transaction instead of replaying inside one that already
+  failed partway through.
+- `ys/collector.py`'s `YardstickLogger._handle` now calls
+  `db.call_with_retry(_write, run_id, rec)` instead of its own inline loop;
+  the existing tests that pin its retry behaviour (3 attempts, backoff,
+  drop-and-record via `ys/dropped.py` once exhausted) pass unchanged, which
+  is the evidence the refactor didn't change the policy.
+- `ys/runs.py`'s `begin_run`, `finish_run` and `delete_run` — the functions
+  `ys start`, `ys end`, `ys runs delete`, and the dashboard's equivalent
+  routes all funnel through — now wrap each write in `db.call_with_retry`
+  via a small `_with_cursor` helper, instead of a bare `with db.cursor()`.
+  `ys end`'s `ended_at`/`task_success` write, the one this finding calls out
+  as most exposed, is included.
+- `ys/cli.py` and `ys/web/app.py` catch
+  `(sqlite3.OperationalError, sqlite3.IntegrityError)` around the `runs.*`
+  calls in `start`/`end`/`delete` (CLI) and the equivalent dashboard routes,
+  and turn an exhausted retry into a readable message instead of an
+  unhandled traceback (CLI) or a 500 (dashboard).
+
+### 29. `ys start` silently skips its own model check without a master key [by inspection] — fixed
 
 The `model_available` warning added for finding 3 is guarded by
 `if model and master_key`, where `master_key` is read from the `ys start`
@@ -519,9 +544,13 @@ doesn't warn that it didn't run, and the user proceeds believing a verified
 proxy is serving their model — a first-run scenario, and the one finding 3 is
 about.
 
-**Fix:** print a "couldn't verify — `LITELLM_MASTER_KEY` not set in this shell"
-line in that branch. Belongs to the same diagnostic surface as findings 12
-and `ys doctor` (feature 4).
+**Fix:** `ys start` now has an `elif model and not master_key` branch that
+prints "couldn't verify model '<model>' is registered on the proxy —
+LITELLM_MASTER_KEY not set in this shell" instead of silently doing nothing.
+The message itself lives in `proxy.model_check_skipped_message()` rather than
+inlined at the one call site, so `ys doctor` (feature 4) and finding 12's
+diagnostic surface can print the same wording later instead of inventing
+their own.
 
 ---
 
