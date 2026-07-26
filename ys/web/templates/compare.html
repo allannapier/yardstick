@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}yardstick -- {{ experiment.experiment }} comparison{% endblock %}
+{% block content %}
+
+<div class="row" style="justify-content: space-between; margin-top: 1.5rem;">
+  <h2 style="margin-top:0">{{ experiment.experiment }} -- comparison</h2>
+  <a href="/experiments/{{ experiment.experiment }}" class="btn secondary">&larr; back to experiment</a>
+</div>
+
+<div class="report-embed">
+{{ report_html | safe }}
+</div>
+
+{% endblock %}

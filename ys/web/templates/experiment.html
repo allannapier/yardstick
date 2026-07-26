@@ -8,12 +8,26 @@
 
 <div class="row">
   <a href="/experiments/{{ experiment.experiment }}/compare" class="btn secondary">view comparison</a>
+  <a href="/experiments/{{ experiment.experiment }}/yaml" class="btn secondary">view yaml</a>
+  {% if managed %}
+  <a href="/experiments/{{ experiment.experiment }}/edit" class="btn secondary">edit</a>
+  <form method="post" action="/experiments/{{ experiment.experiment }}/delete" class="inline"
+        onsubmit="return confirm('delete experiment &quot;{{ experiment.experiment }}&quot;? {{ total_runs }} recorded run(s) will remain in the database but will be unreachable from the dashboard until a same-named experiment exists again.');">
+    <button type="submit" class="danger">delete experiment</button>
+  </form>
+  {% endif %}
   {% if not proxy_alive %}
   <form method="post" action="/experiments/{{ experiment.experiment }}/proxy/up" class="inline">
     <button type="submit">start proxy for this experiment</button>
   </form>
   {% endif %}
 </div>
+
+{% if not managed %}
+<p class="muted">defined at <code>{{ experiment_path }}</code>, outside the dashboard's own
+  experiments directory -- view-only here (edit/delete are unavailable); edit or remove the
+  file directly if you want to change it.</p>
+{% endif %}
 
 {% for entry in arms_data %}
 <div class="card">

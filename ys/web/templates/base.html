@@ -56,13 +56,34 @@
   a.btn:hover { opacity: 0.9; }
   .muted { color: #888; font-size: 0.85rem; }
   .field-error { color: #c0392b; font-size: 0.82rem; margin: 0.2rem 0 0; }
-  .arm-row, .model-row { display: flex; gap: 0.5rem; margin-bottom: 0.4rem; align-items: center; }
-  .arm-row input, .model-row input { flex: 1; }
+  .arm-row, .model-row, .factor-row { display: flex; gap: 0.5rem; margin-bottom: 0.4rem; align-items: center; }
+  .arm-row input, .model-row input, .factor-row input { flex: 1; }
+  .arm-row-group { border: 1px solid #8883; border-radius: 8px; padding: 0.6rem; margin-bottom: 0.6rem; }
+  .factor-rows { margin: 0.3rem 0 0.3rem 1.5rem; }
   fieldset { border: 1px solid #8883; border-radius: 8px; margin: 1rem 0; }
   legend { padding: 0 0.4rem; font-weight: 600; }
   label { font-size: 0.85rem; color: #888; display: block; margin-bottom: 0.15rem; }
   .field { margin-bottom: 0.75rem; }
   .field input, .field textarea, .field select { width: 100%; box-sizing: border-box; }
+  pre.yaml { white-space: pre-wrap; word-break: break-word; background: color-mix(in srgb, currentColor 4%, transparent); border-radius: 8px; padding: 1rem; font-size: 0.85rem; }
+  /* Item 4: the comparison view used to be `render.render_html`'s own
+     standalone document, served raw with no app chrome. It's now embedded
+     inside this shell (see compare.html); these rules scope its markup
+     (which is otherwise identical to the standalone report's own <style>
+     block -- see ys/render.py's `render_html`) so it doesn't bleed into
+     the rest of the page the way reusing bare `table`/`th`/`td` selectors
+     would. */
+  .report-embed table { margin: 1rem 0; }
+  .report-embed th, .report-embed td { text-align: right; }
+  .report-embed th:first-child, .report-embed td:first-child { text-align: left; }
+  .report-embed .warn { color: #e0555f; font-weight: 600; font-size: 0.75em; }
+  .report-embed .delta { color: #888; font-size: 0.85em; }
+  .report-embed .spread { color: #888; font-size: 0.8em; }
+  .report-embed .chart-grid { display: flex; flex-wrap: wrap; gap: 1rem; }
+  .report-embed .chart-card { border: 1px solid #8883; border-radius: 8px; padding: 0.75rem; }
+  .report-embed .chart-label { font-size: 0.75rem; color: #888; margin-top: 0.5rem; }
+  .report-embed .cost-warning { border: 2px solid #e0555f; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; color: #e0555f; }
+  .report-embed .cost-warning ul { margin: 0.4rem 0 0; padding-left: 1.2rem; }
 </style>
 </head>
 <body>
@@ -77,11 +98,39 @@
     <strong>active run</strong>
     <span class="muted">{{ active_run.run_id }} &middot; {{ active_run.experiment }} / {{ active_run.arm }} &middot; started {{ active_run.started_at }}</span>
   </div>
+  <div class="row muted" style="margin-top:0.3rem">
+    <span id="live-request-count">-</span> requests &middot;
+    <span id="live-billable-tokens">-</span> billable tokens &middot;
+    $<span id="live-cost-usd">-</span>
+  </div>
   <form method="post" action="/runs/end" class="row" style="margin-top:0.5rem">
     <input type="number" step="any" name="manual_score" placeholder="manual score (optional, skips success_check)">
     <button type="submit">End run</button>
   </form>
 </div>
+<script>
+// Item 3 ("nothing updates during a live run"): poll the active run's
+// running totals so the one card visible on every page during a run isn't
+// frozen at zero until the next full page load. Dependency-free -- no
+// build step, no client library -- matching the rest of this dashboard;
+// see app.py's /runs/{run_id}/live for the JSON this reads.
+(function () {
+  var runId = {{ active_run.run_id | tojson }};
+  function poll() {
+    fetch("/runs/" + runId + "/live")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        document.getElementById("live-request-count").textContent = data.request_count;
+        document.getElementById("live-billable-tokens").textContent = Math.round(data.billable_tokens);
+        document.getElementById("live-cost-usd").textContent = data.cost_usd.toFixed(4);
+        if (!data.ended) setTimeout(poll, 3000);
+      })
+      .catch(function () { setTimeout(poll, 5000); });
+  }
+  poll();
+})();
+</script>
 {% endif %}
 
 <div class="card row">

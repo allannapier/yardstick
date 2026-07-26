@@ -14,7 +14,10 @@
   <tr><th>experiment</th><th>task</th><th>arms</th><th>runs</th><th></th></tr>
   {% for s in summaries %}
   <tr>
-    <td><a href="/experiments/{{ s.experiment.experiment }}">{{ s.experiment.experiment }}</a></td>
+    <td>
+      <a href="/experiments/{{ s.experiment.experiment }}">{{ s.experiment.experiment }}</a>
+      {% if not s.managed %}<span class="pill down">read-only</span>{% endif %}
+    </td>
     <td class="muted">{{ s.experiment.task.id }}</td>
     <td>{{ s.experiment.arms | length }}</td>
     <td>{{ s.run_count }}</td>
