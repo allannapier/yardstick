@@ -4,7 +4,18 @@ from contextlib import contextmanager
 
 from ys import paths
 
-SCHEMA = """
+# Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
+# Each entry is gated by user_version, so it runs at most once per database
+# file — new entries do not need to be replay-safe. Migration 1 is the one
+# exception: a database created before this file existed already has every
+# one of these tables but `user_version = 0`, so its `CREATE TABLE IF NOT
+# EXISTS` / `CREATE INDEX IF NOT EXISTS` guards are what let it converge to
+# the same state as a fresh database instead of erroring. A schema change
+# (new table, new column) is a new entry appended to this list; earlier
+# entries are never edited after release.
+MIGRATIONS: list[str] = [
+    # 1: initial schema
+    """
 CREATE TABLE IF NOT EXISTS experiments (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -82,7 +93,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_request ON tool_calls(request_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id, provider_call_id);
-"""
+""",
+]
 
 
 def connect() -> sqlite3.Connection:
@@ -93,11 +105,23 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
 def init_db():
     conn = connect()
+    conn.isolation_level = None  # manual transaction control: each migration's schema change and version bump commit as one atomic unit
     try:
-        conn.executescript(SCHEMA)
-        conn.commit()
+        current = schema_version(conn)
+        for version, script in enumerate(MIGRATIONS, start=1):
+            if version <= current:
+                continue
+            try:
+                conn.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {version};\nCOMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
     finally:
         conn.close()
 
