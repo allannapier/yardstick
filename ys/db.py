@@ -86,6 +86,22 @@ def _migration_3(conn: sqlite3.Connection):
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_run_seq_unique ON requests(run_id, seq)"
     )
 
+
+def _migration_4(conn: sqlite3.Connection):
+    """`cost_source` per request -- finding 9. LiteLLM's own cost map
+    returns 0.0, silently, for any model id it has no price for (verified
+    true for `claude-sonnet-5` as configured in
+    experiments/interactive-sonnet.yaml). `ys/collector.py` now records
+    which of `litellm` / `declared` / `unknown` produced a request's
+    `response_cost`: `litellm` when LiteLLM's own number is nonzero,
+    `declared` when it was zero but an experiment's `pricing:` block
+    (ys/experiment.py) could price the tokens instead, `unknown` when
+    neither could -- so `ys compare`/`ys report` can flag a request whose
+    cost is a genuine unknown rather than silently folding a confident $0
+    into the total."""
+    _add_column_if_missing(conn, "requests", "cost_source", "TEXT")
+
+
 # Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
 # Each entry is gated by user_version, so it runs at most once per database
 # file in the normal case -- but every entry must still converge cleanly if
@@ -183,6 +199,8 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id,
     _migration_2,
     # 3: see _migration_3 above.
     _migration_3,
+    # 4: see _migration_4 above.
+    _migration_4,
 ]
 
 

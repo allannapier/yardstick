@@ -18,6 +18,20 @@ models:
     model: claude-sonnet-5
     api_key: os.environ/ANTHROPIC_API_KEY
 
+# claude-sonnet-5 is not a real, published model id -- LiteLLM's cost map has
+# no entry for it, so response_cost comes back 0.0 on every request despite
+# real token usage (finding 9 in IMPROVEMENTS.md, reproduced against this
+# exact file). Declaring prices here (illustrative list-price-shaped numbers;
+# replace with your actual contract pricing) lets ys/collector.py compute
+# cost_usd from tokens instead of silently reporting $0. Keyed exactly like
+# `models` above, by the `factors.model` value.
+pricing:
+  claude-sonnet-5:
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+    cache_write_per_mtok: 3.75
+    cache_read_per_mtok: 0.30
+
 arms:
   - id: arm-sonnet
     factors: {agent: claude-code, model: claude-sonnet-5}

@@ -110,7 +110,13 @@ def _deep_set(d: dict, path: list, value):
     cur[path[-1]] = value
 
 
-def point(agent_name: str, port: int, api_key: str, model: Optional[str] = None) -> str:
+def point(
+    agent_name: str,
+    port: int,
+    api_key: str,
+    model: Optional[str] = None,
+    pin_background: bool = True,
+) -> str:
     """`model` should be the arm's `factors.model` value -- i.e. exactly the
     `model_name` `ys proxy up` registered it under, not the underlying
     provider model id. Without it, the agent requests whatever model id it
@@ -121,7 +127,27 @@ def point(agent_name: str, port: int, api_key: str, model: Optional[str] = None)
 
     Written into each agent's config as that agent expects it: verbatim for
     Claude Code's `ANTHROPIC_MODEL` env vars, provider-prefixed
-    (`anthropic/<model>`) for opencode's `model` key."""
+    (`anthropic/<model>`) for opencode's `model` key.
+
+    `pin_background` (Claude Code only, default True) additionally pins
+    `ANTHROPIC_SMALL_FAST_MODEL`/`ANTHROPIC_DEFAULT_HAIKU_MODEL` -- the
+    model ids Claude Code sends its background requests (title generation,
+    etc.) to -- at the same registered model_name as the main arm. This is
+    a real trade-off, not a free safety net (finding 27 in IMPROVEMENTS.md):
+    background traffic that a real session would send to a small, cheap
+    model instead runs on -- and is billed/weighted as -- the arm's own
+    model, inflating cost_usd/billable_tokens (which are deliberately
+    run-wide, since that spend is real; finding 4) relative to an
+    unmeasured session. It's still the right *default*, because
+    `ys proxy up` only registers a `mock_response`/params for the exact
+    model_name the experiment declared (see ys/proxy.py's
+    generate_config) -- unpinned background traffic would carry its own
+    (harness-default) model id, which the proxy's `model_name: "*"`
+    catch-all still routes, but straight through to the real Anthropic API,
+    silently defeating a mock experiment's entire point as a dry smoke
+    test. Pass `pin_background=False` (`ys harness point
+    --no-pin-background`) once the arm's model doesn't need mock_response
+    to stay safe and you want a real, unpinned cost comparison."""
     if agent_name not in AGENTS:
         raise HarnessError(f"unknown agent '{agent_name}'. Choose from: {', '.join(AGENTS)}")
 
@@ -136,13 +162,15 @@ def point(agent_name: str, port: int, api_key: str, model: Optional[str] = None)
         _deep_set(config, ["env", "ANTHROPIC_BASE_URL"], base_url)
         _deep_set(config, ["env", "ANTHROPIC_API_KEY"], api_key)
         if model:
-            # Claude Code also issues background requests (title generation,
-            # etc.) against a separate "small/fast" model id -- pin those to
-            # the same registered model_name too, or they 400 against the
-            # same model_list.
             _deep_set(config, ["env", "ANTHROPIC_MODEL"], model)
-            _deep_set(config, ["env", "ANTHROPIC_SMALL_FAST_MODEL"], model)
-            _deep_set(config, ["env", "ANTHROPIC_DEFAULT_HAIKU_MODEL"], model)
+            if pin_background:
+                # See the pin_background docstring above -- deliberate
+                # default, not a bug: keeps background traffic inside a
+                # mock experiment's mock_response instead of leaking to the
+                # real API, at the cost of inflating run-wide cost_usd/
+                # billable_tokens relative to an unmeasured session.
+                _deep_set(config, ["env", "ANTHROPIC_SMALL_FAST_MODEL"], model)
+                _deep_set(config, ["env", "ANTHROPIC_DEFAULT_HAIKU_MODEL"], model)
     elif agent_name == "opencode":
         # opencode's anthropic provider POSTs to `{baseURL}/messages` without
         # adding a version prefix itself, but LiteLLM's Anthropic-compatible

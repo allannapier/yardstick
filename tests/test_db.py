@@ -71,6 +71,16 @@ def test_migration_3_drops_the_superseded_plain_index():
     assert "idx_requests_run_seq_unique" in indexes
 
 
+def test_migration_4_adds_cost_source_column():
+    """finding 9: `cost_source` (litellm/declared/unknown, ys/collector.py's
+    `_resolve_cost`) is a new `requests` column, added via
+    `_add_column_if_missing` like `thread_key` (migration 2) before it."""
+    db.init_db()
+    with db.cursor() as cur:
+        cols = {r["name"] for r in cur.execute("PRAGMA table_info(requests)")}
+    assert "cost_source" in cols
+
+
 def test_foreign_key_enforcement():
     db.init_db()
     with db.cursor() as cur:

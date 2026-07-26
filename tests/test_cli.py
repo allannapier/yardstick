@@ -236,6 +236,35 @@ def test_harness_point_without_exp_arm_warns(fake_claude_agent):
     assert "no --exp/--arm given" in plain(result.stdout)
 
 
+def test_harness_point_no_pin_background_leaves_small_fast_model_unset(tmp_path, fake_claude_agent):
+    """Regression test for finding 27's CLI wiring: --no-pin-background
+    must reach ys.harness.point and actually leave the background model
+    env vars unset, and warn that it's doing so."""
+    exp = _write_model_exp(tmp_path)
+    result = runner.invoke(
+        app,
+        ["harness", "point", "claude-code", "--exp", exp, "--arm", "model-arm", "--no-pin-background"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "--no-pin-background" in unwrapped(result.stdout)
+
+    with open(fake_claude_agent) as f:
+        config = json.load(f)
+    assert config["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-5"
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in config["env"]
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in config["env"]
+
+
+def test_harness_point_pins_background_by_default(tmp_path, fake_claude_agent):
+    exp = _write_model_exp(tmp_path)
+    result = runner.invoke(app, ["harness", "point", "claude-code", "--exp", exp, "--arm", "model-arm"])
+    assert result.exit_code == 0, result.stdout
+
+    with open(fake_claude_agent) as f:
+        config = json.load(f)
+    assert config["env"]["ANTHROPIC_SMALL_FAST_MODEL"] == "claude-sonnet-5"
+
+
 def test_end_warns_when_largest_thread_is_not_the_driving_conversation(tmp_path):
     """Regression test for finding 26: a Task subagent that issues more
     requests than the conversation that started the run becomes the
@@ -283,6 +312,31 @@ def test_end_does_not_warn_when_largest_thread_holds_seq1(tmp_path):
     end = runner.invoke(app, ["end"])
     assert end.exit_code == 0, end.stdout
     assert "doesn't contain its first request" not in unwrapped(end.stdout)
+
+
+def test_compare_prints_cost_unknown_warning_for_unpriced_model(tmp_path):
+    """Regression test for finding 9: `ys compare` must surface a request
+    LiteLLM couldn't price (cost_source='unknown') as a visible warning,
+    not fold it silently into cost_usd."""
+    exp = _write_exp(tmp_path)
+    start = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    assert start.exit_code == 0, start.stdout
+    run_id = re.search(r"run (\S+)", plain(start.stdout)).group(1)
+
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, model, input_tokens, output_tokens, "
+            "response_cost, cost_source) VALUES (?,1,?,?,?,?,?,?)",
+            (run_id, "2026-01-01T00:00:00Z", "claude-sonnet-5", 100, 20, 0.0, "unknown"),
+        )
+
+    runner.invoke(app, ["end"])
+
+    result = runner.invoke(app, ["compare", "--exp", exp])
+    assert result.exit_code == 0, result.stdout
+    output = unwrapped(result.stdout)
+    assert "cost unavailable for model 'claude-sonnet-5'" in output
+    assert "COST UNKNOWN" in output
 
 
 def test_start_warns_when_proxy_missing_arm_model(tmp_path, monkeypatch):
