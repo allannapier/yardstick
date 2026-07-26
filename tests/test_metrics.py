@@ -54,6 +54,10 @@ def _mk_request(cur, run_id, seq, **overrides):
         thread_key=None,
         toolset_hash=None,
         system_prompt_hash=None,
+        # None (not e.g. "litellm") so existing tests -- which never set
+        # this -- stay unaffected by the cost_source column added for
+        # finding 9.
+        cost_source=None,
     )
     defaults.update(overrides)
     cur.execute(
@@ -61,8 +65,8 @@ def _mk_request(cur, run_id, seq, **overrides):
            (run_id, seq, ts, provider, model, stream, input_tokens, cache_creation,
             cache_read, output_tokens, response_cost, latency_ms, ttft_ms, status_code,
             error, msg_count, msg_hashes_json, system_tokens, tools_tokens, transition,
-            thread_key, toolset_hash, system_prompt_hash)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            thread_key, toolset_hash, system_prompt_hash, cost_source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             run_id, seq, defaults["ts"], defaults["provider"], defaults["model"], defaults["stream"],
             defaults["input_tokens"], defaults["cache_creation"], defaults["cache_read"],
@@ -70,7 +74,7 @@ def _mk_request(cur, run_id, seq, **overrides):
             defaults["ttft_ms"], defaults["status_code"], defaults["error"], defaults["msg_count"],
             defaults["msg_hashes_json"], defaults["system_tokens"], defaults["tools_tokens"],
             defaults["transition"], defaults["thread_key"], defaults["toolset_hash"],
-            defaults["system_prompt_hash"],
+            defaults["system_prompt_hash"], defaults["cost_source"],
         ),
     )
     return cur.lastrowid
@@ -386,3 +390,93 @@ def test_main_thread_started_run_false_when_subagent_outnumbers_driving_conversa
 
     assert main_key == "subagent"  # largest thread still wins -- unchanged from finding 4
     assert m["main_thread_started_run"] is False
+
+
+# ---------------------------------------------------------------------------
+# finding 10: billable_tokens is a per-model-weighted proxy, not a flat
+# formula -- an experiment's declared `billable_weights` (ys/experiment.py)
+# must override the Anthropic-shaped default per request's own model.
+# ---------------------------------------------------------------------------
+
+def test_billable_tokens_uses_declared_per_model_weights():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_weights")
+        _mk_request(cur, "r_weights", 1, model="model-a", input_tokens=100, output_tokens=0,
+                     cache_creation=0, cache_read=0)
+        _mk_request(cur, "r_weights", 2, model="model-b", input_tokens=100, output_tokens=0,
+                     cache_creation=0, cache_read=0)
+
+    weights = {
+        "model-a": {"input": 2.0, "output": 1.0, "cache_creation": 1.25, "cache_read": 0.1},
+        "model-b": {"input": 5.0, "output": 1.0, "cache_creation": 1.25, "cache_read": 0.1},
+    }
+    with db.cursor() as cur:
+        m = metrics.compute_run_metrics(cur, "r_weights", billable_weights_by_model=weights)
+
+    # model-a: 100 * 2.0 = 200; model-b: 100 * 5.0 = 500
+    assert m["billable_tokens"] == pytest.approx(700.0)
+
+
+def test_billable_tokens_falls_back_to_anthropic_default_for_undeclared_model():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_fallback")
+        _mk_request(cur, "r_fallback", 1, model="unknown-model", input_tokens=100,
+                     output_tokens=0, cache_creation=100, cache_read=0)
+
+    # billable_weights_by_model declares weights for a *different* model --
+    # "unknown-model" must fall back to DEFAULT_BILLABLE_WEIGHTS, not to 0.
+    weights = {"some-other-model": {"input": 9.0, "output": 9.0, "cache_creation": 9.0, "cache_read": 9.0}}
+    with db.cursor() as cur:
+        m = metrics.compute_run_metrics(cur, "r_fallback", billable_weights_by_model=weights)
+
+    # 100 * 1.0 (input) + 100 * 1.25 (cache_creation, Anthropic default)
+    assert m["billable_tokens"] == pytest.approx(225.0)
+
+
+def test_billable_tokens_resolves_provider_prefixed_model_against_bare_weight_key():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_prefix")
+        _mk_request(cur, "r_prefix", 1, model="anthropic/claude-sonnet-5", input_tokens=100,
+                     output_tokens=0, cache_creation=0, cache_read=0)
+
+    weights = {"claude-sonnet-5": {"input": 3.0, "output": 1.0, "cache_creation": 1.25, "cache_read": 0.1}}
+    with db.cursor() as cur:
+        m = metrics.compute_run_metrics(cur, "r_prefix", billable_weights_by_model=weights)
+
+    assert m["billable_tokens"] == pytest.approx(300.0)
+
+
+# ---------------------------------------------------------------------------
+# finding 9: requests LiteLLM couldn't price (and no `pricing:` override
+# could price either) must be surfaced, not silently folded into a total
+# that reads as complete.
+# ---------------------------------------------------------------------------
+
+def test_unpriced_models_reports_model_and_count():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_unpriced")
+        _mk_request(cur, "r_unpriced", 1, model="claude-sonnet-5", response_cost=0.0,
+                     input_tokens=100, output_tokens=20, cost_source="unknown")
+        _mk_request(cur, "r_unpriced", 2, model="claude-sonnet-5", response_cost=0.0,
+                     input_tokens=100, output_tokens=20, cost_source="unknown")
+        _mk_request(cur, "r_unpriced", 3, model="claude-sonnet-5", response_cost=0.01,
+                     input_tokens=100, output_tokens=20, cost_source="litellm")
+
+    with db.cursor() as cur:
+        unpriced = metrics.unpriced_models(cur, "r_unpriced")
+
+    assert unpriced == [{"model": "claude-sonnet-5", "count": 2}]
+
+
+def test_unpriced_models_empty_when_all_requests_priced():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_priced")
+        _mk_request(cur, "r_priced", 1, cost_source="litellm")
+
+    with db.cursor() as cur:
+        assert metrics.unpriced_models(cur, "r_priced") == []
