@@ -19,6 +19,16 @@ from ys.experiment import Experiment
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
+def _with_cursor(fn):
+    """Run `fn(cur)` inside a fresh `db.cursor()` transaction. Exists so a
+    write can be handed to `db.call_with_retry` -- which re-invokes its
+    callable from scratch on a retryable failure -- without each call site
+    re-deriving the "open a fresh cursor per attempt" boilerplate. See
+    finding 28 in IMPROVEMENTS.md."""
+    with db.cursor() as cur:
+        return fn(cur)
+
+
 def now() -> str:
     return time.strftime(TS_FORMAT, time.gmtime())
 
@@ -98,42 +108,49 @@ def begin_run(experiment: Experiment, config_yaml: str, arm_id: str, force: bool
     # not leave an orphan run row inflating the arm's repeat count.
     state.set_active(run_id, exp_id, arm_id, started_at, force=force)  # may raise RunAlreadyActive
 
+    def _insert(cur):
+        cur.execute(
+            "INSERT OR IGNORE INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                exp_id,
+                exp_id,
+                experiment.question,
+                db.dumps(experiment.task.model_dump()),
+                config_yaml,
+                started_at,
+            ),
+        )
+        # The YAML is the source of truth; refresh it so `finish_run` re-reads
+        # the success_check being run today, not a stale first version.
+        cur.execute(
+            "UPDATE experiments SET config_yaml = ?, task_json = ? WHERE id = ?",
+            (config_yaml, db.dumps(experiment.task.model_dump()), exp_id),
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (a_id, exp_id, arm_id, db.dumps(arm_obj.factors), int(arm_obj.baseline)),
+        )
+        repeat_idx = (
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM runs WHERE arm_id = ?", (a_id,)
+            ).fetchone()["c"]
+            + 1
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, exp_id, a_id, repeat_idx, started_at, arm_obj.notes),
+        )
+        return repeat_idx
+
     try:
-        with db.cursor() as cur:
-            cur.execute(
-                "INSERT OR IGNORE INTO experiments (id, name, question, task_json, config_yaml, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    exp_id,
-                    exp_id,
-                    experiment.question,
-                    db.dumps(experiment.task.model_dump()),
-                    config_yaml,
-                    started_at,
-                ),
-            )
-            # The YAML is the source of truth; refresh it so `finish_run` re-reads
-            # the success_check being run today, not a stale first version.
-            cur.execute(
-                "UPDATE experiments SET config_yaml = ?, task_json = ? WHERE id = ?",
-                (config_yaml, db.dumps(experiment.task.model_dump()), exp_id),
-            )
-            cur.execute(
-                "INSERT OR IGNORE INTO arms (id, experiment_id, label, factors_json, is_baseline) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (a_id, exp_id, arm_id, db.dumps(arm_obj.factors), int(arm_obj.baseline)),
-            )
-            repeat_idx = (
-                cur.execute(
-                    "SELECT COUNT(*) AS c FROM runs WHERE arm_id = ?", (a_id,)
-                ).fetchone()["c"]
-                + 1
-            )
-            cur.execute(
-                "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (run_id, exp_id, a_id, repeat_idx, started_at, arm_obj.notes),
-            )
+        # `ys start` writes from the CLI/dashboard process while the proxy
+        # may be writing requests for a still-active previous run at the
+        # same moment -- retry a lock that outlasts busy_timeout instead of
+        # surfacing "database is locked" as a raw traceback (finding 28).
+        repeat_idx = db.call_with_retry(_with_cursor, _insert)
     except Exception:
         state.clear_active()
         raise
@@ -198,12 +215,18 @@ def finish_run(manual_score: Optional[float] = None) -> FinishResult:
             task_success = False
             success_output = f"success_check timed out after {timeout_s}s"
 
-    with db.cursor() as cur:
+    def _write_ended(cur):
         cur.execute(
             "UPDATE runs SET ended_at=?, wall_clock_s=?, task_success=?, "
             "success_output=?, manual_score=? WHERE id=?",
             (ended_at, wall_clock_s, int(task_success), success_output, manual_score, run_id),
         )
+
+    # `ys end` races the tail of the proxy's in-flight writes for this same
+    # run more than any other writer -- retry a lock that outlasts
+    # busy_timeout instead of surfacing "database is locked" as a raw
+    # traceback (finding 28).
+    db.call_with_retry(_with_cursor, _write_ended)
 
     state.clear_active()
 
@@ -211,7 +234,7 @@ def finish_run(manual_score: Optional[float] = None) -> FinishResult:
     try:
         from ys import metrics
 
-        with db.cursor() as cur:
+        def _correct_fingerprint(cur):
             # The per-request fingerprint fill in ys.collector fires eagerly
             # on the first successful request, which can't yet know which
             # thread will end up being the run's main conversation -- if
@@ -230,7 +253,9 @@ def finish_run(manual_score: Optional[float] = None) -> FinishResult:
                         run_id,
                     ),
                 )
-            summary_metrics = metrics.compute_run_metrics(cur, run_id)
+            return metrics.compute_run_metrics(cur, run_id)
+
+        summary_metrics = db.call_with_retry(_with_cursor, _correct_fingerprint)
     except ImportError:
         pass
 
@@ -260,7 +285,7 @@ def delete_run(run_id: str) -> DeleteResult:
     if active is not None and active["run_id"] == run_id:
         raise CannotDeleteActiveRun(run_id)
 
-    with db.cursor() as cur:
+    def _delete(cur):
         row = cur.execute(
             "SELECT experiment_id, arm_id FROM runs WHERE id = ?", (run_id,)
         ).fetchone()
@@ -272,6 +297,12 @@ def delete_run(run_id: str) -> DeleteResult:
         cur.execute("DELETE FROM tool_calls WHERE run_id = ?", (run_id,))
         cur.execute("DELETE FROM requests WHERE run_id = ?", (run_id,))
         cur.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+        return experiment_name, arm_row
+
+    # RunNotFound isn't a lock/uniqueness race, so it propagates on the
+    # first attempt -- only sqlite3.OperationalError/IntegrityError are
+    # retried (finding 28).
+    experiment_name, arm_row = db.call_with_retry(_with_cursor, _delete)
 
     arm_id = arm_row.split("::", 1)[1] if "::" in arm_row else arm_row
     return DeleteResult(run_id=run_id, experiment_name=experiment_name, arm_id=arm_id)

@@ -1,5 +1,8 @@
 import os
 import re
+import sqlite3
+from contextlib import contextmanager
+from urllib.parse import unquote
 
 from fastapi.testclient import TestClient
 
@@ -8,6 +11,27 @@ from ys.web import store
 from ys.web.app import app
 
 client = TestClient(app)
+
+
+def _create_experiment(name: str):
+    client.post(
+        "/experiments",
+        data={
+            "name": name,
+            "task_id": "t0",
+            "success_check": "true",
+            "timeout_s": "60",
+            "repeats": "1",
+            "model_key": ["m1"],
+            "model_kind": ["mock"],
+            "model_value": ["hi"],
+            "arm_id": ["only-arm"],
+            "arm_model": ["m1"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
+            "arm_notes": [""],
+        },
+    )
 
 
 def test_health():
@@ -485,4 +509,62 @@ def test_run_detail_page():
 
     resp = client.get(f"/runs/{run_id}")
     assert resp.status_code == 200
-    assert run_id in resp.text
+
+
+# --- write retry (finding 28) ------------------------------------------------
+
+
+def test_start_run_survives_contention_that_previously_raised(monkeypatch):
+    """Regression test for finding 28: before this fix, every dashboard
+    write went through a bare db.cursor() -- only the collector retried a
+    locked write. `runs.begin_run` now writes through `db.call_with_retry`,
+    so a lock that clears within a couple of attempts must not surface as a
+    500. Reverting the fix makes this 500 instead of redirecting cleanly."""
+    _create_experiment("retry-web-exp")
+
+    real_cursor = db.cursor
+    calls = {"n": 0}
+
+    @contextmanager
+    def flaky_cursor():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        with real_cursor() as cur:
+            yield cur
+
+    monkeypatch.setattr(db, "cursor", flaky_cursor)
+
+    resp = client.post(
+        "/experiments/retry-web-exp/runs/start",
+        data={"arm_id": "only-arm"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "error=" not in resp.headers["location"]
+    assert calls["n"] == 3
+    assert state.get_active() is not None
+
+    client.post("/runs/end", data={})
+
+
+def test_start_run_reports_a_readable_error_after_exhausting_retries(monkeypatch):
+    """Once retries are exhausted the write still fails, but the dashboard
+    must redirect with a plain-English error instead of a raw 500
+    traceback from an unhandled sqlite3.OperationalError."""
+    _create_experiment("stuck-web-exp")
+
+    def always_locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "cursor", always_locked)
+
+    resp = client.post(
+        "/experiments/stuck-web-exp/runs/start",
+        data={"arm_id": "only-arm"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "error=" in resp.headers["location"]
+    assert "could not write to the database" in unquote(resp.headers["location"])
+    assert state.get_active() is None

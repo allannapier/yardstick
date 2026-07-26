@@ -249,3 +249,78 @@ def test_failed_migration_rolls_back_schema_change_and_version(monkeypatch):
         assert "broken_col" not in cols
     finally:
         conn.close()
+
+
+# --- call_with_retry (finding 28) --------------------------------------------
+#
+# Finding 6 gave ys/collector.py's YardstickLogger._handle a retry loop, but
+# every other writer (ys start, ys end, ys runs delete, the dashboard) went
+# through a bare db.cursor(). call_with_retry is the one retry policy both
+# now share -- these pin its behavior directly, independent of any one
+# caller.
+
+
+def test_call_with_retry_recovers_from_transient_operational_error(monkeypatch):
+    monkeypatch.setattr(db.time, "sleep", lambda s: None)  # skip real backoff
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    assert db.call_with_retry(flaky) == "ok"
+    assert calls["n"] == 3
+
+
+def test_call_with_retry_recovers_from_integrity_error(monkeypatch):
+    """finding 7's self-heal: a write that lost the UNIQUE(run_id, seq)
+    race gets a fresh attempt (fresh transaction, fresh seq) instead of
+    being dropped outright."""
+    monkeypatch.setattr(db.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise sqlite3.IntegrityError("UNIQUE constraint failed")
+        return "ok"
+
+    assert db.call_with_retry(flaky) == "ok"
+    assert calls["n"] == 2
+
+
+def test_call_with_retry_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setattr(db.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def always_locked():
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        db.call_with_retry(always_locked)
+    assert calls["n"] == db.MAX_WRITE_ATTEMPTS
+
+
+def test_call_with_retry_does_not_retry_unrelated_exceptions():
+    """Only lock/uniqueness races are worth retrying -- anything else (a
+    programming error, a business-rule exception like runs.RunNotFound)
+    must propagate on the first attempt, not be masked by three retries."""
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError):
+        db.call_with_retry(boom)
+    assert calls["n"] == 1
+
+
+def test_call_with_retry_passes_through_args_and_kwargs():
+    def add(a, b, c=0):
+        return a + b + c
+
+    assert db.call_with_retry(add, 1, 2, c=3) == 6

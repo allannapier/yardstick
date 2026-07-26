@@ -5,6 +5,7 @@ parsing and HTML rendering, so it can never drift from what `ys` the CLI
 does (see ys/runs.py's docstring for why that split exists).
 """
 import os
+import sqlite3
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request
@@ -18,6 +19,18 @@ from ys.web import store
 
 app = FastAPI(title="yardstick")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+
+def _write_failed_message(e: Exception) -> str:
+    """`runs.begin_run`/`finish_run`/`delete_run` write through
+    `db.call_with_retry` (finding 28), which already retries a locked
+    database `db.MAX_WRITE_ATTEMPTS` times -- if it still raises, surface a
+    plain message on the redirect instead of a 500 traceback."""
+    return (
+        f"could not write to the database after {db.MAX_WRITE_ATTEMPTS} attempts "
+        f"({e}) -- is another yardstick process holding a long write against the "
+        "same database file?"
+    )
 
 
 @app.get("/health", response_class=PlainTextResponse)
@@ -447,6 +460,8 @@ async def start_run(request: Request, name: str):
         return _redirect(f"/experiments/{name}", error=str(e))
     except state.RunAlreadyActive as e:
         return _redirect(f"/experiments/{name}", error=str(e))
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        return _redirect(f"/experiments/{name}", error=_write_failed_message(e))
 
     return _redirect(
         f"/experiments/{name}", ok=f"started run {result.run_id} (repeat {result.repeat_idx})"
@@ -467,6 +482,8 @@ async def end_run(request: Request):
         return _redirect("/", error=str(e))
     except runs.NoSuccessCheck as e:
         return _redirect("/", error=f"{e} (set a manual score instead)")
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        return _redirect("/", error=_write_failed_message(e))
 
     dest = f"/experiments/{result.experiment_name}"
     verdict = "SUCCESS" if result.task_success else "FAIL"
@@ -481,6 +498,8 @@ def delete_run(run_id: str):
         return _redirect("/", error=str(e))
     except runs.CannotDeleteActiveRun as e:
         return _redirect(f"/runs/{run_id}", error=str(e))
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        return _redirect(f"/runs/{run_id}", error=_write_failed_message(e))
 
     return _redirect(
         f"/experiments/{result.experiment_name}", ok=f"deleted run {result.run_id}"

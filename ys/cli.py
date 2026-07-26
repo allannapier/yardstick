@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from typing import Optional
 
 import typer
@@ -17,6 +18,21 @@ harness_app = typer.Typer(help="point/reset a coding agent's config at the proxy
 app.add_typer(harness_app, name="harness")
 
 console = Console()
+
+
+def _report_write_failed(e: Exception):
+    """`runs.begin_run`/`finish_run`/`delete_run` write through
+    `db.call_with_retry` (finding 28), which already retries a locked
+    database `db.MAX_WRITE_ATTEMPTS` times -- if it still raises, the lock
+    genuinely outlasted that, so surface a plain message instead of an
+    unhandled sqlite3 traceback."""
+    console.print(
+        f"[red]could not write to the database after {db.MAX_WRITE_ATTEMPTS} "
+        f"attempts ({e}) -- is another yardstick process (the proxy, another "
+        "`ys` command) holding a long write against the same database "
+        f"file?[/red]"
+    )
+    raise typer.Exit(1)
 
 
 @app.command()
@@ -227,6 +243,8 @@ def start(
     except state.RunAlreadyActive as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        _report_write_failed(e)
 
     master_key = os.environ.get("LITELLM_MASTER_KEY")
     key_line = (
@@ -256,6 +274,12 @@ def start(
                 f"[yellow]warning: could not reach the proxy on port {port} to verify "
                 f"it serves model '{model}' -- is `ys proxy up` running?[/yellow]\n"
             )
+    elif model and not master_key:
+        # Same check as above, just gated on this process's own environment
+        # rather than the arm's model -- `ys proxy up` and `ys start` are
+        # commonly run in separate shells, and without this the check
+        # silently never runs at all (finding 29).
+        console.print(f"[yellow]warning: {proxy.model_check_skipped_message(model)}[/yellow]\n")
 
     proxy_url = f"http://localhost:{proxy.read_port()}"
     console.print("point your harness at the proxy:\n")
@@ -291,6 +315,8 @@ def end(
     except runs.NoSuccessCheck as e:
         console.print(f"[red]{e} (re-run with --manual-score).[/red]")
         raise typer.Exit(1)
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        _report_write_failed(e)
 
     verdict = "[green]SUCCESS[/green]" if result.task_success else "[red]FAIL[/red]"
     console.print(
@@ -343,6 +369,8 @@ def delete(
     except runs.CannotDeleteActiveRun as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        _report_write_failed(e)
 
     console.print(
         f"deleted run [bold]{result.run_id}[/bold]  "
