@@ -89,3 +89,12 @@ pytest
 
 `YARDSTICK_HOME` (default `~/.yardstick`) holds the database, proxy/web
 pid/port/log files, and generated proxy config.
+
+## Provenance
+
+`docs/provenance/` holds the ad-hoc probe scripts used to capture a real
+LiteLLM callback payload against a live proxied request. `ys/collector.py`'s
+field paths are verified against that captured shape rather than guessed
+from LiteLLM's docs; see its module docstring. The scripts were originally
+kept at the repo root as `explore/` and were moved here as documentation,
+not source.

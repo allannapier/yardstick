@@ -1,8 +1,8 @@
 """Production LiteLLM CustomLogger for yardstick.
 
 Field paths here are verified against a real proxied Claude Code-shaped
-request (see explore/dumps/), not guessed from LiteLLM's docs. See
-explore/ for the probe that produced the ground truth.
+request (see docs/provenance/dumps/), not guessed from LiteLLM's docs. See
+docs/provenance/ for the probe that produced the ground truth.
 """
 import asyncio
 import hashlib
@@ -65,7 +65,7 @@ def _classify_transition(prev: list, cur: list) -> str:
     prompt, so a mid-conversation summarization -- which shortens the
     history but leaves the system prompt at position 0 untouched -- would
     never trip that check and would be misclassified as a branch. Verified
-    against a live probe (see explore/): a shrink-and-diverge-after-index-0
+    against a live probe (see docs/provenance/): a shrink-and-diverge-after-index-0
     case landed as 'branch' under the literal spec logic. Keying off
     "did it get shorter" instead of "did position 0 change" is what the
     metric is actually trying to detect.

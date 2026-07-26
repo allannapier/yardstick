@@ -599,13 +599,16 @@ file; the `--env-only` path sidesteps it entirely.
 
 ## Housekeeping
 
-- `output/joes-shears-*/` — 12 files of generated website artifacts from some past
+- ~~`output/joes-shears-*/` — 12 files of generated website artifacts from some past
   experiment run are committed to the repo. These are run outputs, not source;
-  gitignore them.
-- `explore/` — ad-hoc probe scripts committed at the root. Valuable as provenance
+  gitignore them.~~ Untracked and gitignored (whole `output/` directory); the
+  files themselves were left on disk since they're the user's data, not the repo's.
+- ~~`explore/` — ad-hoc probe scripts committed at the root. Valuable as provenance
   for the collector's field paths (the collector docstring cites them), so keep
   them, but move them under `tools/` or `docs/provenance/` and say so in the
-  README.
+  README.~~ Moved to `docs/provenance/` with `git mv`; README now says so, and
+  every reference to the old `explore/` path (the collector docstring,
+  `.gitignore`, and the relocated scripts' own hardcoded paths) was updated.
 - ~~`pyproject.toml` has no dev-dependency group; `pytest` isn't declared
   anywhere despite the README's `pytest` instruction.~~ Fixed alongside
   finding 2: a `dev` extra now declares `pytest` and `ruff`.
