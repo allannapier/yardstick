@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from ys import db, dropped
+from ys import db, dropped, state
 from ys.collector import (
     YardstickLogger,
     _classify_transition,
@@ -16,6 +16,7 @@ from ys.collector import (
     _pricing_table_for_run,
     _redact,
     _resolve_cost,
+    _resolve_run_id,
     _write,
     extract_record,
 )
@@ -829,3 +830,99 @@ def test_handle_counts_non_operational_errors_as_dropped_too(monkeypatch):
     asyncio.run(logger._handle(kwargs, FakeResponse([]), None, None))
 
     assert dropped.count() == 1
+
+
+# --- run-id resolution / drain window (finding 11) --------------------------
+
+
+def test_resolve_run_id_prefers_header_over_everything_else():
+    state.set_active("active-run", "exp", "arm", "2026-01-01T00:00:00Z")
+    kwargs = {
+        "litellm_params": {"proxy_server_request": {"headers": {"x-ys-run": "header-run"}}}
+    }
+    assert _resolve_run_id(kwargs) == "header-run"
+
+
+def test_resolve_run_id_falls_back_to_active_file_when_no_header():
+    state.set_active("active-run", "exp", "arm", "2026-01-01T00:00:00Z")
+    assert _resolve_run_id({}) == "active-run"
+
+
+def test_resolve_run_id_is_unattributed_with_no_signal_at_all():
+    assert _resolve_run_id({}) == "unattributed"
+
+
+def test_resolve_run_id_falls_back_to_the_draining_run_after_ys_end():
+    """Regression test for finding 11: `ys end` (`runs.finish_run`) clears
+    active.json right away, so a response that lands after it -- the tail
+    of the run, often the final and largest turn -- previously had no
+    attribution signal left and fell into 'unattributed'. Reverting the
+    `state.get_draining_run()` fallback in `_resolve_run_id` (or reverting
+    `runs.finish_run` to skip `state.mark_ended`) makes this fail."""
+    state.set_active("run1", "exp", "arm", "2026-01-01T00:00:00Z")
+    state.mark_ended("run1", "exp", "arm", "2026-01-01T00:05:00Z")
+    state.clear_active()  # what `ys end` does right after marking ended
+
+    assert state.get_active() is None  # the slot is free, as `ys status` expects
+    assert _resolve_run_id({}) == "run1"
+
+
+def test_resolve_run_id_does_not_use_a_draining_run_past_its_window():
+    """The other half of the same regression: the fallback must not persist
+    forever, or a request arriving long after an unrelated run ended would
+    be misattributed to it instead of correctly landing in 'unattributed'."""
+    import json
+
+    from ys import paths
+
+    state.set_active("run1", "exp", "arm", "2026-01-01T00:00:00Z")
+    state.mark_ended("run1", "exp", "arm", "2026-01-01T00:05:00Z")
+    state.clear_active()
+
+    with open(paths.LAST_ENDED_RUN_PATH) as f:
+        record = json.load(f)
+    import time
+
+    record["drain_until"] = time.time() - 1
+    with open(paths.LAST_ENDED_RUN_PATH, "w") as f:
+        json.dump(record, f)
+
+    assert _resolve_run_id({}) == "unattributed"
+
+
+def test_write_attributes_a_post_end_request_to_the_run_it_belongs_to():
+    """End-to-end regression test for finding 11, at the `_write` level
+    rather than just `_resolve_run_id`: a request resolved via the drain
+    window must still land in the *correct* run's rows in the database, not
+    the synthetic 'unattributed' run -- proving the fix all the way through
+    the write path, not only the id-resolution helper."""
+    db.init_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}','','2026-01-01')"
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+
+    state.set_active("r", "e", "a", "2026-01-01T00:00:00Z")
+    state.mark_ended("r", "e", "a", "2026-01-01T00:05:00Z")
+    state.clear_active()  # ys end just finished -- the harness has no x-ys-run header
+
+    rec = extract_record(_fake_kwargs(), FakeResponse([]), None, None)
+    run_id = _resolve_run_id({})
+    _write(run_id, rec)
+
+    with db.cursor() as cur:
+        row = cur.execute("SELECT run_id FROM requests WHERE run_id = 'r'").fetchone()
+        unattributed = cur.execute(
+            "SELECT 1 FROM requests WHERE run_id = 'unattributed'"
+        ).fetchone()
+    assert row is not None
+    assert unattributed is None

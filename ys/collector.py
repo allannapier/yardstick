@@ -14,7 +14,7 @@ import uuid
 import yaml
 from litellm.integrations.custom_logger import CustomLogger
 
-from ys import db, dropped, paths
+from ys import db, dropped, paths, state
 from ys.experiment import resolve_model_key
 
 _SECRET_KEYS = {"api_key", "authorization", "x-api-key", "api-key"}
@@ -201,6 +201,13 @@ def _safe_token_count(model: str, text: str) -> int:
 
 
 def _resolve_run_id(kwargs: dict) -> str:
+    """Finding 11: a response that lands after `ys end` has no `x-ys-run`
+    header (harnesses like Claude Code can't set arbitrary headers) and no
+    active.json to fall back to either, since `finish_run` clears it right
+    away -- without the drain-window fallback below, that would land in
+    `unattributed` even though it's plainly the tail of the run that just
+    finished (often the final and largest turn). See `state.mark_ended`/
+    `state.get_draining_run`."""
     try:
         headers = (
             kwargs.get("litellm_params", {})
@@ -221,6 +228,13 @@ def _resolve_run_id(kwargs: dict) -> str:
             with open(paths.ACTIVE_RUN_PATH) as f:
                 active = json.load(f)
             return active["run_id"]
+    except Exception:
+        pass
+
+    try:
+        draining = state.get_draining_run()
+        if draining:
+            return draining["run_id"]
     except Exception:
         pass
 

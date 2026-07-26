@@ -355,26 +355,91 @@ economics — which the rig otherwise wants to compare.
   *pricing-weighted proxy* for spend, not a token count, and are meaningless
   as a cross-provider constant.
 
-### 11. `ys end` drops in-flight requests [by inspection]
+### 11. `ys end` drops in-flight requests [by inspection] — fixed
 
 `finish_run` clears the active-run state file, and `_resolve_run_id` falls back to
 that file for any harness that can't set `x-ys-run`. A response that lands after
 `ys end` is attributed to `unattributed` — so the tail of every run, including the
 final and often largest turn, can go missing.
 
-**Fix:** keep the state file until a short drain window has passed, or record
-`ended_at` and attribute by timestamp window rather than by file presence.
+**Fix:** chose the timestamp-window approach (record `ended_at`, attribute by
+elapsed time) over literally keeping `active.json` alive longer, for two reasons
+named directly in the finding: `ys end` is a synchronous CLI command the user is
+waiting on, so a fix that makes it sleep before returning has a real UX cost and
+was ruled out; and `active.json`'s *presence* is also what `state.set_active`/
+`ys status`/the next `ys start` treat as "a run is in progress" — stretching its
+lifetime would make a fast `ys start` right after `ys end` see a phantom active
+run.
 
-### 12. Unattributed traffic is invisible [by inspection]
+- `ys/runs.py`'s `finish_run` now calls a new `state.mark_ended(run_id,
+  experiment, arm, ended_at)` immediately before its existing
+  `state.clear_active()` (unchanged, still unconditional and immediate — `ys
+  status`/the next `ys start` see the slot free right away, exactly as before).
+  `mark_ended` writes a *separate* file, `ys/paths.py`'s new
+  `LAST_ENDED_RUN_PATH`, recording the run id plus an absolute
+  `time.time() + state.DRAIN_WINDOW_S` (60s) deadline.
+- `ys/collector.py`'s `_resolve_run_id` — running in the separate proxy process,
+  hence still file-based cross-process state rather than an in-memory handoff —
+  gained a third fallback after the `x-ys-run` header and `active.json`:
+  `state.get_draining_run()`, which returns the most recently ended run's id only
+  if `time.time()` hasn't yet passed its recorded deadline, else `None` (falling
+  through to `unattributed` as before). This directly attributes by elapsed time
+  rather than by a file's mere existence, per the finding's second suggested fix.
+- What this does *not* solve, deliberately: `finish_run` still computes
+  `summary_metrics` (and the corrected fingerprint) from the rows in the database
+  at the moment `ys end` runs. A request that lands during the drain window is
+  now attributed to the correct run in the database — `ys compare`/`ys report`/a
+  later re-query will see it — but it will not retroactively appear in the
+  `ys end` command's own printed summary for that invocation. The finding
+  explicitly separates "attributed to the wrong run" (fixed here) from "landed
+  after metrics were computed" (a different problem, out of scope for this fix).
+- No schema/migration change: both `LAST_ENDED_RUN_PATH` and the drain-window
+  fallback are file-based, like the existing `active.json` mechanism they sit
+  next to, and never touch the `runs` table.
+- Regression tests in `tests/test_state.py`, `tests/test_collector.py` and
+  `tests/test_runs.py` pin: `finish_run` leaves a draining record behind
+  (`test_finish_run_leaves_a_draining_record_behind_for_stragglers`);
+  `_resolve_run_id` falls back to it after `ys end` has already cleared
+  `active.json` (`test_resolve_run_id_falls_back_to_the_draining_run_after_ys_end`);
+  a request resolved that way lands in the *correct* run's rows in the database,
+  not `unattributed`
+  (`test_write_attributes_a_post_end_request_to_the_run_it_belongs_to` — the
+  literal "still attributed to the run it belongs to" case); and the fallback
+  expires once the window elapses, so a request arriving long after an unrelated
+  run ended is not misattributed to it forever
+  (`test_resolve_run_id_does_not_use_a_draining_run_past_its_window`). All four
+  fail with the fix reverted (missing attributes / wrong run_id in the database)
+  and pass with it restored.
+
+### 12. Unattributed traffic is invisible [by inspection] — fixed
 
 Requests that can't be attributed land in a synthetic `unattributed` run. Nothing
 in the CLI or the dashboard ever surfaces it. A user who misconfigures the harness
 sees a run with zero requests and no explanation anywhere — which is precisely the
 situation finding 3 puts everyone in on their first real run.
 
-**Fix:** surface the unattributed count in `ys status`, `ys end` and the dashboard
-banner: "42 requests since 14:02 could not be attributed to a run". This is the
-single highest-value diagnostic in the app.
+**Fix:**
+
+- `ys/runs.py` gained `unattributed_summary()`, querying
+  `COUNT(*)`/`MIN(ts)` over `requests WHERE run_id = 'unattributed'` and
+  returning a count plus the earliest request's `HH:MM` (the same `ts` format
+  `_now()` already writes, sliced rather than reparsed).
+- `ys/cli.py`'s `ys status` and `ys end` both print it via a shared
+  `_print_unattributed_notice()`, right alongside the existing dropped-request
+  count (finding 6) — its sibling diagnostic: dropped requests never made it
+  into the database at all, unattributed ones did, just not under the run they
+  belonged to. Phrasing follows the finding's own example: "N request(s) since
+  HH:MM UTC could not be attributed to a run", plus a pointer at the likely
+  cause (harness not pointed at the proxy / not sending `x-ys-run` / running
+  outside an active run).
+- The dashboard banner is deliberately **not** included in this fix — left as a
+  scoped-out follow-up (`ys/web/**` was off limits for this change to avoid
+  colliding with concurrent work already in flight there). `ys status`/`ys end`
+  now cover the CLI half of the finding; the dashboard half is still open.
+- Regression tests in `tests/test_runs.py` (`unattributed_summary` counts and
+  reports the earliest timestamp) and `tests/test_cli.py` (`ys status`/`ys end`
+  print the notice when unattributed requests exist, and stay silent when there
+  are none) fail with the fix reverted and pass with it restored.
 
 ### 13. `--force` leaves the previous run orphaned forever [by inspection]
 
