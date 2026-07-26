@@ -33,6 +33,69 @@ def _run_row(cur, run_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _main_thread_key(cur, run_id: str):
+    """The thread_key with the most requests in this run -- the run's
+    actual driving conversation, as opposed to interleaved background or
+    Task-subagent traffic. Ties (e.g. a run with no thread_key data at all,
+    grouped under NULL) broken toward whichever thread started first. See
+    finding 4 in IMPROVEMENTS.md."""
+    row = cur.execute(
+        "SELECT thread_key FROM requests WHERE run_id = ? "
+        "GROUP BY thread_key ORDER BY COUNT(*) DESC, MIN(seq) ASC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    return row["thread_key"] if row else None
+
+
+def _main_requests(cur, run_id: str) -> list[dict]:
+    main_key = _main_thread_key(cur, run_id)
+    rows = cur.execute(
+        "SELECT * FROM requests WHERE run_id = ? AND thread_key IS ? ORDER BY seq",
+        (run_id, main_key),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _main_tool_calls(cur, run_id: str) -> list[dict]:
+    main_key = _main_thread_key(cur, run_id)
+    rows = cur.execute(
+        "SELECT tc.* FROM tool_calls tc JOIN requests r ON r.id = tc.request_id "
+        "WHERE tc.run_id = ? AND r.thread_key IS ?",
+        (run_id, main_key),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def background_metrics(cur, run_id: str) -> dict:
+    """Traffic outside the run's main conversation thread: background
+    (harness title-generation) requests and Task-subagent conversations.
+    Reported as its own line item instead of being folded into -- and
+    corrupting -- the main thread's conversation metrics. See finding 4."""
+    reqs = _requests(cur, run_id)
+    main_key = _main_thread_key(cur, run_id)
+    background = [r for r in reqs if r.get("thread_key") != main_key]
+    return {
+        "background_requests": len(background),
+        "background_tokens": sum(context_tokens(r) for r in background),
+    }
+
+
+def main_thread_fingerprint(cur, run_id: str) -> Optional[dict]:
+    """model/toolset_hash/system_prompt_hash of the first successful request
+    in the run's main thread. Used to correct `runs`' fingerprint columns
+    once a run finishes, in case the eager per-request fill in
+    ys.collector (which can't yet know which thread will end up largest)
+    stamped them from a background or subagent request instead."""
+    main_key = _main_thread_key(cur, run_id)
+    row = cur.execute(
+        "SELECT model, toolset_hash, system_prompt_hash FROM requests "
+        "WHERE run_id = ? AND thread_key IS ? AND status_code = 200 "
+        "ORDER BY seq LIMIT 1",
+        (run_id, main_key),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def context_tokens(req: dict) -> int:
     """Full prompt size for one request: new + cache-write + cache-read tokens."""
     return (req.get("input_tokens") or 0) + (req.get("cache_creation") or 0) + (req.get("cache_read") or 0)
@@ -67,12 +130,21 @@ def token_metrics(cur, run_id: str) -> dict:
     billable_tokens = input_sum + cache_creation_sum + output_sum + cache_read_sum * 0.1
     cost_usd = sum(r.get("response_cost") or 0.0 for r in reqs)
 
-    ctx = [context_tokens(r) for r in reqs]
+    # Context growth and cache reuse describe the shape of one conversation,
+    # not the run's total traffic -- computed over the main thread only so
+    # interleaved background/subagent requests (their own short, low-cache
+    # histories) don't distort them. Token/cost totals above stay run-wide:
+    # that traffic is still real spend. See finding 4 in IMPROVEMENTS.md.
+    main_reqs = _main_requests(cur, run_id)
+    ctx = [context_tokens(r) for r in main_reqs]
     context_high_water = max(ctx) if ctx else 0
-    context_growth_rate = _linear_slope([float(r["seq"]) for r in reqs], [float(c) for c in ctx])
+    context_growth_rate = _linear_slope([float(r["seq"]) for r in main_reqs], [float(c) for c in ctx])
 
-    cache_denom = cache_read_sum + input_sum + cache_creation_sum
-    cache_read_ratio = (cache_read_sum / cache_denom) if cache_denom else 0.0
+    main_input_sum = sum(r.get("input_tokens") or 0 for r in main_reqs)
+    main_cache_creation_sum = sum(r.get("cache_creation") or 0 for r in main_reqs)
+    main_cache_read_sum = sum(r.get("cache_read") or 0 for r in main_reqs)
+    cache_denom = main_cache_read_sum + main_input_sum + main_cache_creation_sum
+    cache_read_ratio = (main_cache_read_sum / cache_denom) if cache_denom else 0.0
 
     return {
         "billable_tokens": billable_tokens,
@@ -88,7 +160,7 @@ def token_metrics(cur, run_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def overhead_metrics(cur, run_id: str) -> dict:
-    reqs = _requests(cur, run_id)
+    reqs = _main_requests(cur, run_id)
     turns = len(reqs)
     if not reqs:
         return {
@@ -127,13 +199,13 @@ def overhead_metrics(cur, run_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def turn_metrics(cur, run_id: str) -> dict:
-    n = cur.execute("SELECT COUNT(*) AS n FROM requests WHERE run_id = ?", (run_id,)).fetchone()["n"]
-    return {"turns": n}
+    # Main thread only -- a background title-generation request is not a turn.
+    return {"turns": len(_main_requests(cur, run_id))}
 
 
 def tool_call_metrics(cur, run_id: str) -> dict:
     turns = turn_metrics(cur, run_id)["turns"]
-    calls = _tool_calls(cur, run_id)
+    calls = _main_tool_calls(cur, run_id)
     n_calls = len(calls)
     n_errors = sum(1 for c in calls if c.get("is_error"))
 
@@ -156,7 +228,7 @@ _READ_LIKE_SUBSTRINGS = ("read", "grep", "glob")
 
 
 def redundancy_metrics(cur, run_id: str) -> dict:
-    calls = _tool_calls(cur, run_id)
+    calls = _main_tool_calls(cur, run_id)
     n_calls = len(calls)
 
     hashes = {c["input_hash"] for c in calls}
@@ -196,7 +268,7 @@ def redundancy_metrics(cur, run_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def compaction_metrics(cur, run_id: str, regrowth_window: int = 5) -> dict:
-    reqs = _requests(cur, run_id)
+    reqs = _main_requests(cur, run_id)
     compaction_idxs = [i for i, r in enumerate(reqs) if r.get("transition") == "compaction"]
     compaction_events = len(compaction_idxs)
 
@@ -275,6 +347,7 @@ def compute_run_metrics(cur, run_id: str) -> dict:
     metrics.update(tool_call_metrics(cur, run_id))
     metrics.update(redundancy_metrics(cur, run_id))
     metrics.update(compaction_metrics(cur, run_id))
+    metrics.update(background_metrics(cur, run_id))
     metrics.update(outcome_metrics(cur, run_id))
     return metrics
 
@@ -303,6 +376,8 @@ _EFFICIENCY_METRICS = [
     "tokens_dropped",
     "turns_to_recompaction",
     "post_compaction_regrowth",
+    "background_requests",
+    "background_tokens",
     "wall_clock_s",
     "active_s",
 ]

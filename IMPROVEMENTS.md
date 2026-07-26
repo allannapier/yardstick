@@ -97,7 +97,7 @@ same `model_list`.
 - The README quick start now points the harness with `--exp`/`--arm` so the model
   is pinned before the run starts, instead of pointing blind.
 
-### 4. Background and subagent traffic corrupts conversation metrics [verified]
+### 4. Background and subagent traffic corrupts conversation metrics [verified] — fixed on this branch
 
 `_classify_transition` compares each request's message-hash list against the
 single previous request in the same run. Claude Code interleaves background calls
@@ -125,11 +125,39 @@ then flags arms `UNCONTROLLED` essentially at random.
 It also inflates `turns` (a background title generation is not a turn) and
 distorts `overhead_tokens_per_turn`, which extrapolates from request 0 alone.
 
-**Fix:** add a `thread_key` column to `requests`, derived from the system prompt
-hash plus the hash of the first message. Classify transitions within a thread,
-compute conversation metrics over the main thread (the one with the most
-requests), and report background traffic as its own line item — "N background
-requests, M tokens" is itself a useful harness-efficiency number.
+**Fix:** added a `thread_key` column to `requests`, assigned in
+`collector._resolve_thread` by chain-following: a request joins the thread
+whose most recent request shares its system prompt *and* is a plausible
+parent per `_classify_transition` (continuation, compaction, or branch —
+anything but "reset"); no match starts a new thread. This was originally a
+static hash of the system prompt plus the first non-system message, which
+broke on the exact case the fix exists for — a harness-side compaction that
+summarizes/rewrites that first message would have looked like the start of a
+brand new thread instead of a continuation of the real one. Chain-following
+doesn't have that failure mode: a compaction is explicitly not a "reset", so
+it still resolves to the same thread. Background/subagent calls, which get a
+different system prompt, task instruction, or both, still correctly land in
+their own thread even when interleaved mid-run — an interleaved background
+call can no longer fabricate a compaction/reset event or break the main
+thread's continuation chain.
+
+`ys/metrics.py` computes turns, overhead, tool-call, redundancy, compaction,
+and context-growth/cache-reuse metrics over the run's largest thread only
+(`_main_requests`/`_main_tool_calls`, picked by request count via
+`_main_thread_key`); `cost_usd`/`billable_tokens` still total across all
+traffic, since that's real spend regardless of thread. Background/subagent
+traffic is reported separately as `background_requests`/`background_tokens`
+(surfaced in `ys end`'s headline metrics and in `compare`/`report`).
+
+The run fingerprint (`model`/`toolset_hash`/`system_prompt_hash`) is corrected
+at `finish_run` from `metrics.main_thread_fingerprint` — the first successful
+request of the largest thread — since the eager per-request fill in the
+collector can't yet know, mid-run, which thread will end up being the main
+one. `ys/db.py`'s migration list gained a second entry (`thread_key` plus
+per-request `toolset_hash`/`system_prompt_hash`, needed to recompute the
+fingerprint); since a plain `ALTER TABLE ADD COLUMN` isn't safe to replay,
+non-`CREATE ... IF NOT EXISTS` migrations are now Python callables that guard
+their own column additions (`db._add_column_if_missing`).
 
 ### 5. `ys proxy down` silently orphans the proxy [verified] — fixed on this branch
 
@@ -456,10 +484,10 @@ the test matrix CI first so the rest is defended. After this, a first-time user
 can complete the README quick start with a real agent.
 
 **Milestone 2 — make the numbers trustworthy.** Finding 8 (migrations, done —
-this is what the rest of the milestone builds its schema changes on), then 4, 6,
-7, 9, 11, 12, 13, 14. This is the batch that decides whether the tool's output
-can be believed; nothing above it matters if `compaction_events` and `cost_usd`
-are wrong.
+this is what the rest of the milestone builds its schema changes on), then 4
+(done), 6, 7, 9, 11, 12, 13, 14. This is the batch that decides whether the
+tool's output can be believed; nothing above it matters if `compaction_events`
+and `cost_usd` are wrong.
 
 **Milestone 3 — make it usable.** The dashboard defect table (19–24), the HTML and
 experiment-discovery fixes, `ys doctor`, `ys runs list`, and the unattributed

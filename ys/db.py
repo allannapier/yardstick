@@ -4,16 +4,51 @@ from contextlib import contextmanager
 
 from ys import paths
 
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str):
+    """SQLite has no `ADD COLUMN IF NOT EXISTS`, and a plain `ALTER TABLE`
+    isn't safe to replay -- needed because a migration must converge cleanly
+    even when run against a database that already has the column (see
+    test_pre_migration_database_converges_without_error, which replays every
+    migration from user_version 0 against an already-current schema)."""
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _migration_2(conn: sqlite3.Connection):
+    """thread_key + per-request toolset_hash/system_prompt_hash. Claude Code
+    interleaves the main conversation with background (harness
+    title-generation) requests and Task-subagent conversations in the same
+    run, each its own much shorter, unrelated message history. Without a way
+    to tell them apart, transition classification, turn counts, and the
+    run's fingerprint were all computed against whichever request happened
+    to land next in seq order. thread_key (assigned in ys/collector.py by
+    chain-following each request to the most recent same-system-prompt
+    request it plausibly continues) lets metrics scope themselves to the
+    run's actual driving conversation. See finding 4 in IMPROVEMENTS.md."""
+    _add_column_if_missing(conn, "requests", "thread_key", "TEXT")
+    _add_column_if_missing(conn, "requests", "toolset_hash", "TEXT")
+    _add_column_if_missing(conn, "requests", "system_prompt_hash", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_run_thread_seq "
+        "ON requests(run_id, thread_key, seq)"
+    )
+
+
 # Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
 # Each entry is gated by user_version, so it runs at most once per database
-# file — new entries do not need to be replay-safe. Migration 1 is the one
-# exception: a database created before this file existed already has every
-# one of these tables but `user_version = 0`, so its `CREATE TABLE IF NOT
-# EXISTS` / `CREATE INDEX IF NOT EXISTS` guards are what let it converge to
-# the same state as a fresh database instead of erroring. A schema change
-# (new table, new column) is a new entry appended to this list; earlier
-# entries are never edited after release.
-MIGRATIONS: list[str] = [
+# file in the normal case -- but every entry must still converge cleanly if
+# replayed from user_version 0 against a database that already has its
+# changes applied (a database created before this file existed has every
+# table but `user_version = 0`; see test_pre_migration_database_converges_
+# without_error). A `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT
+# EXISTS` string is naturally replay-safe; anything else (e.g. `ALTER TABLE
+# ADD COLUMN`, which SQLite has no `IF NOT EXISTS` form for) must be a
+# callable that guards itself, like `_migration_2` above. A schema change is
+# a new entry appended to this list; earlier entries are never edited after
+# release.
+MIGRATIONS: list = [
     # 1: initial schema
     """
 CREATE TABLE IF NOT EXISTS experiments (
@@ -94,6 +129,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 CREATE INDEX IF NOT EXISTS idx_tool_calls_request ON tool_calls(request_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id, provider_call_id);
 """,
+    # 2: see _migration_2 above.
+    _migration_2,
 ]
 
 
@@ -114,11 +151,19 @@ def init_db():
     conn.isolation_level = None  # manual transaction control: each migration's schema change and version bump commit as one atomic unit
     try:
         current = schema_version(conn)
-        for version, script in enumerate(MIGRATIONS, start=1):
+        for version, migration in enumerate(MIGRATIONS, start=1):
             if version <= current:
                 continue
             try:
-                conn.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {version};\nCOMMIT;")
+                if callable(migration):
+                    conn.execute("BEGIN")
+                    migration(conn)
+                    conn.execute(f"PRAGMA user_version = {version}")
+                    conn.execute("COMMIT")
+                else:
+                    conn.executescript(
+                        f"BEGIN;\n{migration}\nPRAGMA user_version = {version};\nCOMMIT;"
+                    )
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
