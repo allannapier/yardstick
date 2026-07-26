@@ -74,6 +74,12 @@ def _agent_names(agent: str) -> list:
 def harness_point_cmd(
     agent: str = typer.Argument(..., help="claude-code | opencode | all"),
     port: int = typer.Option(proxy.DEFAULT_PORT, "--port"),
+    exp: Optional[str] = typer.Option(
+        None, "--exp", help="experiment YAML -- combine with --arm to pin the agent's model"
+    ),
+    arm: Optional[str] = typer.Option(
+        None, "--arm", help="arm id whose model factor to point the agent at"
+    ),
 ):
     """Point an agent's real config at the yardstick proxy (backs up the original first)."""
     api_key = os.environ.get("LITELLM_MASTER_KEY")
@@ -84,13 +90,40 @@ def harness_point_cmd(
         )
         raise typer.Exit(1)
 
+    if bool(exp) != bool(arm):
+        console.print("[red]--exp and --arm must be given together.[/red]")
+        raise typer.Exit(1)
+
+    model = None
+    if exp and arm:
+        experiment = load_experiment(exp)
+        try:
+            arm_obj = experiment.get_arm(arm)
+        except KeyError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
+        model = arm_obj.factors.get("model")
+        if not model:
+            console.print(
+                f"[yellow]warning: arm '{arm}' has no 'model' factor -- the agent's "
+                "own default model id will be used, which the proxy likely hasn't "
+                "registered.[/yellow]"
+            )
+    else:
+        console.print(
+            "[yellow]no --exp/--arm given -- the agent will request its own default "
+            "model id, which the proxy may not have registered. Pass --exp and --arm "
+            "to pin it to the arm's model.[/yellow]"
+        )
+
     for name in _agent_names(agent):
         try:
-            path = harness.point(name, port, api_key)
+            path = harness.point(name, port, api_key, model=model)
         except harness.HarnessError as e:
             console.print(f"[red]{name}: {e}[/red]")
             raise typer.Exit(1)
-        console.print(f"{name}: pointed at http://localhost:{port} ({path})")
+        model_str = f", model={model}" if model else ""
+        console.print(f"{name}: pointed at http://localhost:{port}{model_str} ({path})")
 
 
 @harness_app.command("reset")
@@ -196,6 +229,24 @@ def start(
         f"\nrun [bold]{result.run_id}[/bold]  exp={result.experiment_name}  "
         f"arm={result.arm_id}  repeat={result.repeat_idx}\n"
     )
+
+    model = experiment.get_arm(arm).factors.get("model")
+    if model and master_key:
+        port = proxy.read_port()
+        available = proxy.model_available(model, port, master_key)
+        if available is False:
+            console.print(
+                f"[red]warning: the proxy on port {port} has no explicit entry for "
+                f"model '{model}' -- it will only work via the catch-all passthrough "
+                "(mock_response/params declared for it won't apply). Run "
+                f"`ys proxy up --exp {exp}` to register it.[/red]\n"
+            )
+        elif available is None:
+            console.print(
+                f"[yellow]warning: could not reach the proxy on port {port} to verify "
+                f"it serves model '{model}' -- is `ys proxy up` running?[/yellow]\n"
+            )
+
     proxy_url = f"http://localhost:{proxy.read_port()}"
     console.print("point your harness at the proxy:\n")
     console.print(f"  export ANTHROPIC_BASE_URL={proxy_url}", highlight=False)

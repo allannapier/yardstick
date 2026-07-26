@@ -63,34 +63,39 @@ lint pass in a separate job. `pyproject.toml` now declares a `dev` extra
 locally; the handful of real lint findings (unused imports, an unused local, a
 lambda-assignment, an f-string without placeholders) are fixed alongside it.
 
-### 3. `ys harness point` never sets the model, so real runs fail [by inspection]
+### 3. `ys harness point` never sets the model, so real runs fail [verified] — fixed on this branch
 
-`harness.point()` writes only `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. But
+`harness.point()` wrote only `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. But
 `proxy.generate_config()` registers models under the experiment's *factor value*
 (`probe-claude-mock`, `claude-sonnet-5`), and a Claude Code session left to itself
 requests its own default model id. That name is not in `model_list`, so LiteLLM
 rejects it and every request in the run fails.
 
-The mock smoke test in `experiments/example.yaml` cannot work as documented
-either: nothing will ever ask for `probe-claude-mock`.
+The mock smoke test in `experiments/example.yaml` couldn't work as documented
+either: nothing would ever ask for `probe-claude-mock`.
 
 There is a second half to this. Claude Code issues background requests against a
 small/fast model for things like title generation. Even with the main model
-mapped, those requests carry a *different* model id and will 400 against the same
-`model_list`.
+mapped, those requests carry a *different* model id and would 400 against the
+same `model_list`.
 
-**Fix, in order of value:**
+**Fix:**
 
-- Make `point` arm-aware: `ys harness point claude-code --exp E --arm A`, writing
-  `ANTHROPIC_MODEL` (and `ANTHROPIC_SMALL_FAST_MODEL` /
-  `ANTHROPIC_DEFAULT_HAIKU_MODEL`) to the arm's model key.
-- Emit a catch-all entry in the generated proxy config so unmapped model ids are
-  passed through and *recorded* rather than rejected — an unmeasured request is
-  better than a broken run.
-- Have `ys start` verify the running proxy actually serves the arm's model, and
-  fail loudly if not.
-- Fix the README quick start ordering, which currently points the harness before
-  the arm is known.
+- `point()` is now arm-aware: `ys harness point claude-code --exp E --arm A`
+  resolves the arm's `factors.model` and writes `ANTHROPIC_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` (opencode gets
+  a best-effort top-level `model: anthropic/<value>`) so background requests
+  land on the same registered `model_name` as the main turn.
+- `proxy.generate_config()` now always emits a `model_name: "*"` catch-all entry
+  (LiteLLM's provider-wildcard routing) so any model id the experiment didn't
+  declare is passed through to Anthropic and still recorded, rather than
+  rejected — an unmeasured request is better than a broken run.
+- `ys start` now queries the running proxy's `/v1/models` and warns loudly if the
+  arm's model has no explicit `model_list` entry (it would only work via the
+  catch-all, silently skipping any `mock_response`/params declared for it) or if
+  the proxy can't be reached at all.
+- The README quick start now points the harness with `--exp`/`--arm` so the model
+  is pinned before the run starts, instead of pointing blind.
 
 ### 4. Background and subagent traffic corrupts conversation metrics [verified]
 
@@ -427,7 +432,7 @@ file; the `--env-only` path sidesteps it entirely.
 
 ## Suggested sequencing
 
-**Milestone 1 — make it run.** Findings 1 (done), 2 (done), 3, 5. Add the test
+**Milestone 1 — make it run.** Findings 1 (done), 2 (done), 3 (done), 5. Add the test
 matrix CI first so the rest is defended. After this, a first-time user can
 complete the README quick start with a real agent.
 

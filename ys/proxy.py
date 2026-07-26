@@ -1,4 +1,7 @@
+import json
 import os
+import urllib.error
+import urllib.request
 
 import yaml
 
@@ -6,6 +9,16 @@ from ys import db, paths, procutil
 from ys.experiment import load_experiment
 
 DEFAULT_PORT = 4000
+
+# Any model id not covered by an experiment's `models:` block or arm
+# `factors.model` convention still needs somewhere to go -- Claude Code's
+# background/title-generation traffic in particular carries model ids the
+# experiment never declared. Without a catch-all, LiteLLM 400s those
+# requests and the whole run fails. This passes them straight through to
+# Anthropic (LiteLLM's provider-wildcard routing: `model_name: "*"` +
+# `litellm_params.model: "anthropic/*"`) and the collector still records
+# them -- unmeasured against a declared arm, but not a broken run.
+CATCH_ALL_MODEL_NAME = "*"
 
 # LiteLLM resolves `litellm_settings.callbacks` as a file path relative to the
 # config's own directory, not as a Python import. So the callback must be named
@@ -53,6 +66,15 @@ def generate_config(experiment_paths: list[str]) -> str:
         "model_list": [
             {"model_name": name, "litellm_params": params}
             for name, params in sorted(model_params.items())
+        ]
+        + [
+            {
+                "model_name": CATCH_ALL_MODEL_NAME,
+                "litellm_params": {
+                    "model": "anthropic/*",
+                    "api_key": "os.environ/ANTHROPIC_API_KEY",
+                },
+            }
         ],
         "litellm_settings": {
             "callbacks": f"{SHIM_MODULE}.yardstick_logger",
@@ -108,6 +130,25 @@ def proxy_up(experiment_paths: list[str], port: int = DEFAULT_PORT) -> str:
         )
 
     return f"http://localhost:{port}"
+
+
+def model_available(model_name: str, port: int, api_key: str, timeout_s: float = 3.0) -> bool | None:
+    """Whether the running proxy has an *explicit* model_list entry for
+    `model_name` (as opposed to falling through the `*` catch-all, which
+    still works but skips any mock_response/params the experiment declared
+    for it). Returns None if the proxy couldn't be reached at all, so callers
+    can tell "not running" apart from "running but missing this model"."""
+    req = urllib.request.Request(
+        f"http://localhost:{port}/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    ids = {entry.get("id") for entry in data.get("data", [])}
+    return model_name in ids
 
 
 def read_port(default: int = DEFAULT_PORT) -> int:

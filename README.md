@@ -9,8 +9,9 @@ tool-call efficiency, and task success.
 ## How it works
 
 1. `ys proxy up` starts a LiteLLM proxy configured from your experiment YAML(s).
-2. `ys harness point` repoints an agent's config (e.g. Claude Code's
-   `~/.claude/settings.json`) at that proxy, backing up the original first.
+2. `ys harness point <agent> --exp ... --arm ...` repoints an agent's config
+   (e.g. Claude Code's `~/.claude/settings.json`) at that proxy and pins it to
+   the arm's model, backing up the original config first.
 3. `ys start --exp ... --arm ...` marks a run active; you then drive the
    agent through its task as normal.
 4. `ys end` finishes the run, runs the arm's `success_check`, and prints
@@ -40,7 +41,8 @@ ys init                                    # create ~/.yardstick and the db
 export LITELLM_MASTER_KEY=sk-...           # proxy auth key you choose
 ys proxy up --exp experiments/example.yaml # start the measurement proxy
 
-ys harness point claude-code               # point Claude Code at the proxy
+# point Claude Code at the proxy, pinned to arm-a's model
+ys harness point claude-code --exp experiments/example.yaml --arm arm-a
 ys start --exp experiments/example.yaml --arm arm-a
 
 # ... drive the agent through the task ...

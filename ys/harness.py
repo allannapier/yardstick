@@ -110,7 +110,14 @@ def _deep_set(d: dict, path: list, value):
     cur[path[-1]] = value
 
 
-def point(agent_name: str, port: int, api_key: str) -> str:
+def point(agent_name: str, port: int, api_key: str, model: Optional[str] = None) -> str:
+    """`model` should be the arm's `factors.model` value -- i.e. exactly the
+    `model_name` `ys proxy up` registered it under, not the underlying
+    provider model id. Without it, the agent requests whatever model id it
+    defaults to, which the proxy has never heard of and rejects (finding 3);
+    the request would only survive via the proxy's catch-all passthrough,
+    which skips any mock_response/params the experiment declared for the
+    real model_name."""
     if agent_name not in AGENTS:
         raise HarnessError(f"unknown agent '{agent_name}'. Choose from: {', '.join(AGENTS)}")
 
@@ -124,6 +131,14 @@ def point(agent_name: str, port: int, api_key: str) -> str:
     if agent_name == "claude-code":
         _deep_set(config, ["env", "ANTHROPIC_BASE_URL"], base_url)
         _deep_set(config, ["env", "ANTHROPIC_API_KEY"], api_key)
+        if model:
+            # Claude Code also issues background requests (title generation,
+            # etc.) against a separate "small/fast" model id -- pin those to
+            # the same registered model_name too, or they 400 against the
+            # same model_list.
+            _deep_set(config, ["env", "ANTHROPIC_MODEL"], model)
+            _deep_set(config, ["env", "ANTHROPIC_SMALL_FAST_MODEL"], model)
+            _deep_set(config, ["env", "ANTHROPIC_DEFAULT_HAIKU_MODEL"], model)
     elif agent_name == "opencode":
         # opencode's anthropic provider POSTs to `{baseURL}/messages` without
         # adding a version prefix itself, but LiteLLM's Anthropic-compatible
@@ -131,6 +146,8 @@ def point(agent_name: str, port: int, api_key: str) -> str:
         # (unlike claude-code, which already sends `/v1/messages` itself).
         _deep_set(config, ["provider", "anthropic", "options", "baseURL"], f"{base_url}/v1")
         _deep_set(config, ["provider", "anthropic", "options", "apiKey"], api_key)
+        if model:
+            _deep_set(config, ["model"], f"anthropic/{model}")
 
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, "w") as f:
