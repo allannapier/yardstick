@@ -1,13 +1,17 @@
 name: Tests
 
-# Run the test suite and lint on every push/PR. The version matrix is the
-# point: a 3.12-only run would not have caught the f-string SyntaxError that
-# previously broke ys/render.py (and everything importing it) on 3.10/3.11,
-# even though pyproject.toml declares requires-python = ">=3.10".
+# Run the test suite and lint on pushes to main and on pull requests. The
+# version matrix is the point: a 3.12-only run would not have caught the
+# f-string SyntaxError that previously broke ys/render.py (and everything
+# importing it) on 3.10/3.11, even though pyproject.toml declares
+# requires-python = ">=3.10".
 on:
   push:
     branches: ["main"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -19,6 +23,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -36,6 +42,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5

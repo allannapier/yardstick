@@ -30,3 +30,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["ys*"]
+
+[tool.ruff.lint]
+# Pyflakes plus the syntax-error/fatal subset of pycodestyle -- this is the
+# baseline that would have caught the ys/render.py f-string SyntaxError
+# (finding 1). Ruff's larger opt-in rule families (S, ASYNC, PL, RUF, UP, ...)
+# raise real style/security findings but are a separate remediation project,
+# not part of standing up CI.
+select = ["E4", "E7", "E9", "F"]
