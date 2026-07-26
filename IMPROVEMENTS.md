@@ -49,15 +49,19 @@ hard `SyntaxError`, so `import ys.render` fails — taking out `ys compare`,
 suite reported "62 passed" while 18 tests were silently never running. With the
 fix applied it is 80 passed.
 
-### 2. There is no CI running the tests [verified]
+### 2. There is no CI running the tests [verified] — fixed on this branch
 
-`.github/workflows/` contains only `pages.yml`, which deploys the docs site.
-Nothing runs `pytest`, which is exactly why a syntax error in a core module
+`.github/workflows/` contained only `pages.yml`, which deploys the docs site.
+Nothing ran `pytest`, which is exactly why a syntax error in a core module
 shipped to `main`.
 
-**Fix:** add a test workflow on push/PR running the suite on 3.10, 3.11, 3.12 and
-3.13. The version matrix is the point — a 3.12-only CI would not have caught
-finding 1. Add a lint pass (`ruff`) in the same workflow.
+**Fix:** added `.github/workflows/tests.yml`, a test workflow on push/PR running
+the suite on 3.10, 3.11, 3.12 and 3.13. The version matrix is the point — a
+3.12-only CI would not have caught finding 1. It also runs `ruff check .` as a
+lint pass in a separate job. `pyproject.toml` now declares a `dev` extra
+(`pytest`, `ruff`) so `pip install -e ".[dev]"` is enough to reproduce CI
+locally; the handful of real lint findings (unused imports, an unused local, a
+lambda-assignment, an f-string without placeholders) are fixed alongside it.
 
 ### 3. `ys harness point` never sets the model, so real runs fail [by inspection]
 
@@ -415,16 +419,17 @@ file; the `--env-only` path sidesteps it entirely.
   for the collector's field paths (the collector docstring cites them), so keep
   them, but move them under `tools/` or `docs/provenance/` and say so in the
   README.
-- `pyproject.toml` has no dev-dependency group; `pytest` isn't declared anywhere
-  despite the README's `pytest` instruction.
+- ~~`pyproject.toml` has no dev-dependency group; `pytest` isn't declared
+  anywhere despite the README's `pytest` instruction.~~ Fixed alongside
+  finding 2: a `dev` extra now declares `pytest` and `ruff`.
 
 ---
 
 ## Suggested sequencing
 
-**Milestone 1 — make it run.** Findings 1 (done), 2, 3, 5. Add the test matrix CI
-first so the rest is defended. After this, a first-time user can complete the
-README quick start with a real agent.
+**Milestone 1 — make it run.** Findings 1 (done), 2 (done), 3, 5. Add the test
+matrix CI first so the rest is defended. After this, a first-time user can
+complete the README quick start with a real agent.
 
 **Milestone 2 — make the numbers trustworthy.** Findings 8 (migrations, first),
 then 4, 6, 7, 9, 11, 12, 13, 14. This is the batch that decides whether the tool's

@@ -59,7 +59,7 @@ def test_begin_run_sets_active_and_returns_repeat_idx():
 
 
 def test_begin_run_second_repeat_increments():
-    r1 = runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
+    runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
     runs.finish_run()
     r2 = runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
     assert r2.repeat_idx == 2

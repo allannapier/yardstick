@@ -17,7 +17,6 @@ raise rather than guess at a lossy comment-stripping parse.
 """
 import json
 import os
-import shutil
 from dataclasses import dataclass, field
 from typing import Optional
 

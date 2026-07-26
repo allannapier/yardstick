@@ -326,7 +326,9 @@ def aggregate_run_metrics(
     observation rather than undefined, which keeps `repeats: 1` arms usable.
     """
     if gate is None:
-        gate = lambda m: bool(m.get("task_success"))
+
+        def gate(m):
+            return bool(m.get("task_success"))
 
     per_run = {rid: compute_run_metrics(cur, rid) for rid in run_ids}
     n_runs = len(run_ids)

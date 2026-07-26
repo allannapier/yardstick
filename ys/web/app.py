@@ -245,8 +245,6 @@ async def end_run(request: Request):
     manual_score_raw = form.get("manual_score", "").strip()
     manual_score = float(manual_score_raw) if manual_score_raw else None
 
-    active_before = state.get_active()
-
     try:
         result = runs.finish_run(manual_score=manual_score)
     except runs.NoActiveRun:

@@ -10,7 +10,6 @@ against what each historical run actually saw. A full fix needs a schema
 change (snapshot task_json onto the run row) that's out of scope here.
 """
 import html
-import statistics
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -282,7 +281,7 @@ def render_html(comparison: Comparison, cur) -> str:
         return f"<tr><th>{html.escape(key)}</th>{''.join(cells)}</tr>"
 
     rows_html.append(
-        f"<tr><th>success rate</th>"
+        "<tr><th>success rate</th>"
         + "".join(
             f"<td>{a.aggregate['n_success']}/{a.aggregate['n_runs']}</td>" for a in comparison.arms
         )
