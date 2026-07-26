@@ -285,6 +285,59 @@ def test_aggregate_run_metrics_excludes_failed_runs_from_efficiency_but_not_n():
     assert cost["mean"] == pytest.approx((1.0 + 2.0) / 2)
 
 
+# ---------------------------------------------------------------------------
+# finding 13: a run that never got an `ys end` (task_success still NULL --
+# e.g. one displaced by `--force`, which ys/state.py flags `abandoned`
+# without ever assigning it a verdict) must not count toward n_runs/
+# success_rate at all, since it was never scored -- not the same thing as
+# having failed the task.
+# ---------------------------------------------------------------------------
+
+def test_aggregate_run_metrics_excludes_unfinished_runs_from_n_runs():
+    """Regression test for finding 13. Before the fix, n_runs was simply
+    len(run_ids) regardless of whether a run ever finished, so a run
+    displaced by `--force` (task_success left NULL forever) permanently
+    dragged the arm's success rate down: with the old code this would
+    compute n_runs == 3 and success_rate == 2/3 instead of n_runs == 2 and
+    success_rate == 1.0."""
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_ok1", task_success=1)
+        _mk_request(cur, "r_ok1", 1, response_cost=1.0)
+
+        _mk_run(cur, "r_ok2", task_success=1)
+        _mk_request(cur, "r_ok2", 1, response_cost=2.0)
+
+        _mk_run(cur, "r_unfinished", task_success=None)
+        _mk_request(cur, "r_unfinished", 1, response_cost=3.0)
+
+    with db.cursor() as cur:
+        agg = metrics.aggregate_run_metrics(cur, ["r_ok1", "r_ok2", "r_unfinished"])
+
+    assert agg["n_runs"] == 2
+    assert agg["n_unfinished"] == 1
+    assert agg["n_success"] == 2
+    assert agg["success_rate"] == pytest.approx(1.0)
+    # cost_per_success still totals cost_usd over every run, finished or
+    # not -- an unfinished run may still have spent real money before it
+    # was cut off, and spec 5.7's cost_per_success is unconditional on that.
+    assert agg["cost_per_success"] == pytest.approx((1.0 + 2.0 + 3.0) / 2)
+
+
+def test_aggregate_run_metrics_all_unfinished_yields_no_success_rate():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r1", task_success=None)
+        _mk_request(cur, "r1", 1)
+
+    with db.cursor() as cur:
+        agg = metrics.aggregate_run_metrics(cur, ["r1"])
+
+    assert agg["n_runs"] == 0
+    assert agg["n_unfinished"] == 1
+    assert agg["success_rate"] is None
+
+
 def test_aggregate_run_metrics_custom_gate():
     db.init_db()
     with db.cursor() as cur:

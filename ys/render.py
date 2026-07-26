@@ -1,13 +1,17 @@
 """ys compare / ys report --html: aggregate an experiment's runs by arm and
 render a comparison, per spec section 8.
 
-Known limitation: `experiments.config_yaml`/`task_json` are overwritten on
-every `ys start` (see ys/cli.py), so there is no per-run historical snapshot
-of which task.id/ref a given run actually executed. The "refuse to compare
-runs with different task.id/ref" guardrail in the spec is therefore only
-checked against the *current* experiment YAML passed to `ys compare`, not
-against what each historical run actually saw. A full fix needs a schema
-change (snapshot task_json onto the run row) that's out of scope here.
+Finding 14 (fixed): `experiments.config_yaml`/`task_json` are overwritten on
+every `ys start`, so the *experiment* row can never be a per-run record of
+what a given run actually executed -- only the run row itself can be. Every
+run now carries its own `config_hash` (`ys.runs.config_hash_for_arm`,
+snapshotted at `begin_run`), and `compare_experiment` groups an arm's run
+history by that hash instead of aggregating every run ever attributed to the
+arm id. Only the group matching today's YAML is used by default; runs under
+any other hash -- a different task/success_check/model, or (for a run
+recorded before this fix shipped) no hash at all -- are excluded and
+reported via `Comparison.config_warnings`/`config_warnings()` instead of
+being silently folded in or silently dropped.
 """
 import html
 from dataclasses import dataclass, field
@@ -15,6 +19,7 @@ from typing import Optional
 
 from ys import metrics
 from ys.experiment import Experiment
+from ys.runs import config_hash_for_arm
 
 PRIMARY_METRICS = ["cost_usd", "billable_tokens", "turns", "wall_clock_s"]
 SECONDARY_METRICS = [
@@ -55,17 +60,70 @@ class Comparison:
     task_id: str
     repeats: int
     arms: list  # list[ArmResult], baseline (if any) first
+    # One line per arm with run history excluded from the table below
+    # because it doesn't share today's config_hash -- finding 14. Printed
+    # by `ys compare`/rendered in the HTML report the same way
+    # `cost_warnings` is: prominently, not as a footnote.
+    config_warnings: list = field(default_factory=list)
 
 
 def _arm_row_id(experiment_name: str, arm_id: str) -> str:
     return f"{experiment_name}::{arm_id}"
 
 
-def _run_ids_for_arm(cur, arm_row_id: str) -> list:
+def _run_groups_for_arm(cur, arm_row_id: str) -> dict:
+    """Every run ever recorded against this arm row id, grouped by
+    `config_hash` (finding 14) and ordered by `repeat_idx` within each
+    group. `None` is its own group: runs written before this fix shipped
+    have no snapshot at all, so they can never be *verified* to match
+    today's config -- see `compare_experiment` for how that group is
+    treated (never trusted as "current", even if it's the only data an arm
+    has)."""
     rows = cur.execute(
-        "SELECT id FROM runs WHERE arm_id = ? ORDER BY repeat_idx", (arm_row_id,)
+        "SELECT id, config_hash FROM runs WHERE arm_id = ? ORDER BY repeat_idx",
+        (arm_row_id,),
     ).fetchall()
-    return [r["id"] for r in rows]
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault(r["config_hash"], []).append(r["id"])
+    return groups
+
+
+def _config_warning_for_arm(arm_id: str, groups: dict, current_hash: str, run_ids: list) -> Optional[str]:
+    """finding 14: describe (if any) the runs excluded from `run_ids` --
+    this arm's group matching `current_hash` -- because they were recorded
+    under a different config_hash. Two reasons get named separately, since
+    they call for different user action: the config actually changed
+    (task/success_check/model), vs. the run simply predates this fix and
+    was never given a hash to compare at all. Returns None when every run
+    this arm has matches today's config."""
+    excluded = sum(len(ids) for h, ids in groups.items() if h != current_hash)
+    if excluded == 0:
+        return None
+    predates_snapshot = len(groups.get(None, []))
+    changed_config = excluded - predates_snapshot
+    reasons = []
+    if changed_config:
+        reasons.append(f"{changed_config} run(s) recorded under a different config (task/success_check/model changed since)")
+    if predates_snapshot:
+        reasons.append(f"{predates_snapshot} run(s) recorded before this config-tracking fix existed and can't be verified against today's config")
+    reason_str = "; ".join(reasons)
+    if run_ids:
+        return (
+            f"arm '{arm_id}': {reason_str} -- excluded below. Only the "
+            f"{len(run_ids)} run(s) matching today's config are aggregated."
+        )
+    return (
+        f"arm '{arm_id}': {reason_str} -- excluded below, and none of this "
+        "arm's runs match today's config, so it has no comparable data. Run "
+        "`ys start`/`ys end` for this arm again."
+    )
+
+
+def config_warnings(comparison: Comparison) -> list:
+    """Same shape/precedent as `cost_warnings` -- a flat list of strings
+    meant to be printed prominently alongside the table/report."""
+    return comparison.config_warnings
 
 
 def _fingerprint_drifted(cur, run_ids: list) -> bool:
@@ -101,27 +159,18 @@ def _unpriced_models_for_arm(cur, run_ids: list) -> list:
 def compare_experiment(cur, experiment: Experiment) -> Comparison:
     """Aggregate every arm of `experiment` from already-recorded runs.
 
-    Raises CompareError if no runs exist for any arm, or if the experiment
-    row in the db (if present) was created for a different task.id -- the
-    spec's "refuse mismatched task.id/ref" guardrail, checked against
-    whatever's live in the YAML you're comparing (see module docstring for
-    the historical-drift limitation this doesn't cover).
+    Finding 14: each arm's run history is grouped by `config_hash`
+    (`ys.runs.config_hash_for_arm`, snapshotted per run at `begin_run`) and
+    only the group matching today's YAML is aggregated -- a run recorded
+    before the task/success_check/model changed (or before this fix
+    existed to snapshot anything at all) is excluded rather than silently
+    pooled in with runs of a different config. `Comparison.config_warnings`
+    names exactly what got excluded and why, per arm.
+
+    Raises CompareError if no arm ends up with any runs matching its
+    current config (this also covers "no runs recorded at all", the
+    previous condition for this error).
     """
-    stored_task = cur.execute(
-        "SELECT task_json FROM experiments WHERE id = ?", (experiment.experiment,)
-    ).fetchone()
-    if stored_task:
-        import json
-
-        stored = json.loads(stored_task["task_json"])
-        if stored.get("id") and stored["id"] != experiment.task.id:
-            raise CompareError(
-                f"stored experiment '{experiment.experiment}' was last run with "
-                f"task.id='{stored['id']}', but the YAML you're comparing now has "
-                f"task.id='{experiment.task.id}'. Refusing to compare -- these are "
-                f"not the same fixed task."
-            )
-
     # Plain-dict-ified once so `metrics.py` (which knows nothing about
     # pydantic) can look weights up per request's own model. See finding 10.
     billable_weights_by_model = {
@@ -129,11 +178,22 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
     }
 
     results = []
+    warnings = []
     for arm in experiment.arms:
         arm_row_id = _arm_row_id(experiment.experiment, arm.id)
-        run_ids = _run_ids_for_arm(cur, arm_row_id)
+        groups = _run_groups_for_arm(cur, arm_row_id)
+        if not groups:
+            continue  # arm has never been run at all -- nothing to warn about
+
+        current_hash = config_hash_for_arm(experiment, arm)
+        run_ids = groups.get(current_hash, [])
+
+        warning = _config_warning_for_arm(arm.id, groups, current_hash, run_ids)
+        if warning:
+            warnings.append(warning)
         if not run_ids:
             continue
+
         aggregate = metrics.aggregate_run_metrics(
             cur, run_ids, billable_weights_by_model=billable_weights_by_model
         )
@@ -151,8 +211,9 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
 
     if not results:
         raise CompareError(
-            f"no runs found for any arm of experiment '{experiment.experiment}'. "
-            "Run `ys start` / `ys end` at least once per arm first."
+            f"no runs found for any arm of experiment '{experiment.experiment}' "
+            "matching today's config. Run `ys start` / `ys end` at least once "
+            "per arm first."
         )
 
     results.sort(key=lambda r: (not r.is_baseline, r.label))
@@ -161,6 +222,7 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
         task_id=experiment.task.id,
         repeats=experiment.repeats,
         arms=results,
+        config_warnings=warnings,
     )
 
 
@@ -228,10 +290,20 @@ def build_table(comparison: Comparison):
 
     n_runs = {a.label: a.aggregate["n_runs"] for a in comparison.arms}
     n_success = {a.label: a.aggregate["n_success"] for a in comparison.arms}
+    n_unfinished = {a.label: a.aggregate.get("n_unfinished", 0) for a in comparison.arms}
     table.add_row(
         "success rate",
         *[f"{n_success[a.label]}/{n_runs[a.label]}" for a in comparison.arms],
     )
+    if any(n_unfinished.values()):
+        # finding 13: runs displaced by `--force` (or otherwise never
+        # `ys end`ed) are excluded from n_runs/success rate above rather
+        # than silently counting against the arm -- but still reported, so
+        # "excluded" doesn't mean "invisible".
+        table.add_row(
+            "unfinished (excluded)",
+            *[str(n_unfinished[a.label]) for a in comparison.arms],
+        )
     table.add_row(
         "cost_per_success",
         *[
@@ -355,6 +427,16 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
         )
         + "</tr>"
     )
+    if any(a.aggregate.get("n_unfinished", 0) for a in comparison.arms):
+        # finding 13: shown separately from success rate above -- these
+        # runs (displaced by `--force`, or never `ys end`ed) were never
+        # scored, so they're excluded from n_runs rather than silently
+        # dragging the success rate down.
+        rows_html.append(
+            "<tr><th>unfinished (excluded)</th>"
+            + "".join(f"<td>{a.aggregate.get('n_unfinished', 0)}</td>" for a in comparison.arms)
+            + "</tr>"
+        )
     rows_html.append(
         "<tr><th>cost_per_success</th>"
         + "".join(
@@ -376,6 +458,15 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
         items = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
         warnings_html = f'<div class="cost-warning"><strong>Cost unavailable</strong><ul>{items}</ul></div>'
 
+    cfg_warnings = config_warnings(comparison)
+    config_warnings_html = ""
+    if cfg_warnings:
+        items = "".join(f"<li>{html.escape(w)}</li>" for w in cfg_warnings)
+        config_warnings_html = (
+            f'<div class="cost-warning"><strong>Some runs excluded (config changed)</strong>'
+            f"<ul>{items}</ul></div>"
+        )
+
     charts_html = []
     for a in comparison.arms:
         for run_id in a.run_ids:
@@ -391,6 +482,7 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
     body = f"""<h1>{html.escape(comparison.experiment_name)}</h1>
 <p>task: {html.escape(comparison.task_id)} &middot; repeats: {comparison.repeats} &middot; (*) baseline</p>
 {warnings_html}
+{config_warnings_html}
 <table><tr><th></th>{header_cells}</tr>{''.join(rows_html)}</table>
 <h2>per-run detail</h2>
 <div class="chart-grid">{''.join(charts_html)}</div>

@@ -5,6 +5,8 @@ avoidance that ys/cli.py originally had inline. Both callers catch the
 exceptions here and format them for their own presentation layer (Rich
 console vs JSON/HTML).
 """
+import hashlib
+import json
 import subprocess
 import time
 import uuid
@@ -14,7 +16,7 @@ from typing import Optional
 import yaml
 
 from ys import db, state
-from ys.experiment import Experiment
+from ys.experiment import Arm, Experiment
 
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -39,6 +41,38 @@ def _parse_ts(ts: str) -> float:
 
 def arm_row_id(experiment: str, arm_id: str) -> str:
     return f"{experiment}::{arm_id}"
+
+
+def config_hash_for_arm(experiment: Experiment, arm: Arm) -> str:
+    """Finding 14: a per-run fingerprint of exactly the parts of an
+    experiment's config that determine what a run of `arm` actually
+    executes -- `task` (id/repo/ref/prompt_file/success_check/timeout_s)
+    and this arm's own `factors` (which is where `model` lives). Snapshotted
+    onto each run row at `begin_run` so `ys/render.py`'s `compare_experiment`
+    can group an arm's run history by "which version of the config produced
+    this run" instead of silently aggregating every run ever attributed to
+    the arm id, including ones from before the task, success_check, or
+    model changed.
+
+    Deliberately NOT the raw YAML text and NOT the whole parsed Experiment:
+    hashing the entire file would split an arm's history over an edited
+    comment or a `question:` tweak that changed nothing about what ran, and
+    hashing only e.g. `task.id` would let a changed `success_check` or a
+    changed `factors.model` (a different model under the same arm id)
+    silently keep aggregating with runs that were scored, or ran, under
+    different terms -- exactly the failure mode finding 14 is about.
+    Also deliberately excludes `experiment.metrics`/`.pricing`/
+    `.billable_weights`/other arms' `factors`: those change how a run's
+    numbers are displayed or priced after the fact, not what the agent was
+    asked to do or how its result was judged, so a change to them alone
+    should not fragment comparability.
+    """
+    payload = {
+        "task": experiment.task.model_dump(),
+        "factors": arm.factors,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 class ArmNotFound(Exception):
@@ -103,6 +137,11 @@ def begin_run(experiment: Experiment, config_yaml: str, arm_id: str, force: bool
     started_at = now()
     exp_id = experiment.experiment
     a_id = arm_row_id(exp_id, arm_id)
+    # Snapshotted onto the run row itself, independent of `experiments`
+    # (which keeps being overwritten below) -- see finding 14 and
+    # `config_hash_for_arm`'s docstring for what the hash covers.
+    task_json_snapshot = db.dumps(experiment.task.model_dump())
+    config_hash = config_hash_for_arm(experiment, arm_obj)
 
     # Claim the active slot before writing any rows, so a refused start does
     # not leave an orphan run row inflating the arm's repeat count.
@@ -139,9 +178,18 @@ def begin_run(experiment: Experiment, config_yaml: str, arm_id: str, force: bool
             + 1
         )
         cur.execute(
-            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (run_id, exp_id, a_id, repeat_idx, started_at, arm_obj.notes),
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at, notes, "
+            "task_json_snapshot, config_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                exp_id,
+                a_id,
+                repeat_idx,
+                started_at,
+                arm_obj.notes,
+                task_json_snapshot,
+                config_hash,
+            ),
         )
         return repeat_idx
 

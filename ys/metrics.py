@@ -515,12 +515,23 @@ def aggregate_run_metrics(
 
     `gate` is a predicate over a single run's metrics dict deciding whether
     that run counts as a "success"; it defaults to the run's task_success
-    flag. Every run_id contributes to n_runs and the success count/rate
-    regardless of gate outcome. Only gate-passing runs contribute to the
-    efficiency metric means/spreads -- an arm that's cheap but fails half
-    the time should not look cheap. cost_per_success sums cost_usd over
-    ALL runs of the arm (successful or not -- failed runs still spent
-    money) divided by the count of successful runs, per spec 5.7.
+    flag. Every *finished* run_id contributes to n_runs and the success
+    count/rate regardless of gate outcome. Only gate-passing runs
+    contribute to the efficiency metric means/spreads -- an arm that's
+    cheap but fails half the time should not look cheap. cost_per_success
+    sums cost_usd over ALL runs of the arm, finished or not (a run that
+    never finished, e.g. one displaced by `--force`, may still have spent
+    real money before it was cut off) divided by the count of successful
+    runs, per spec 5.7.
+
+    Finding 13: a run whose `task_success` is still NULL never got an
+    `ys end` -- either it's still genuinely active, or it was displaced by
+    `--force` and `state.py` flagged it `abandoned` without ever assigning
+    it a verdict. Either way it was never scored, which isn't the same as
+    failing the task, so it's excluded from n_runs/n_success/success_rate
+    entirely instead of silently counting against the arm forever -- and
+    reported separately via `n_unfinished` so it stays visible rather than
+    just vanishing from the totals.
 
     `billable_weights_by_model` is forwarded to `compute_run_metrics` for
     every run (see `token_metrics`) -- finding 10.
@@ -534,8 +545,10 @@ def aggregate_run_metrics(
             return bool(m.get("task_success"))
 
     per_run = {rid: compute_run_metrics(cur, rid, billable_weights_by_model) for rid in run_ids}
-    n_runs = len(run_ids)
-    passing = {rid: m for rid, m in per_run.items() if gate(m)}
+    finished = {rid: m for rid, m in per_run.items() if m.get("task_success") is not None}
+    n_runs = len(finished)
+    n_unfinished = len(run_ids) - n_runs
+    passing = {rid: m for rid, m in finished.items() if gate(m)}
     n_success = len(passing)
 
     metrics_out = {}
@@ -554,6 +567,7 @@ def aggregate_run_metrics(
 
     return {
         "n_runs": n_runs,
+        "n_unfinished": n_unfinished,
         "n_success": n_success,
         "success_rate": (n_success / n_runs) if n_runs else None,
         "cost_per_success": cost_per_success,

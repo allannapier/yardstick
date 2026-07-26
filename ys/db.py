@@ -102,6 +102,40 @@ def _migration_4(conn: sqlite3.Connection):
     _add_column_if_missing(conn, "requests", "cost_source", "TEXT")
 
 
+def _migration_5(conn: sqlite3.Connection):
+    """`config_hash` + `task_json_snapshot` per run (finding 14), and
+    `abandoned` per run (finding 13). Both land in one migration since they
+    shipped in the same PR.
+
+    Finding 14: `experiments.config_yaml`/`task_json` are overwritten on
+    every `ys start`, so a run row had no record of what it actually
+    executed -- `ys/render.py`'s `_run_ids_for_arm` aggregated every run
+    ever attributed to an arm id, including ones from before the task,
+    success_check, or model changed. `ys/runs.py`'s `begin_run` now
+    snapshots `task_json` onto the run row itself (independent of the
+    `experiments` row, which keeps being overwritten) plus a `config_hash`
+    -- see `runs.config_hash_for_arm` for exactly what's hashed and why --
+    so `ys/render.py`'s `compare_experiment` can group an arm's runs by
+    hash and default to aggregating only the group matching today's YAML,
+    warning when the arm's history spans more than one.
+
+    Finding 13: `state.set_active(force=True)` overwrote the active-run
+    slot without closing the run it displaced, leaving `ended_at`/
+    `task_success`/`wall_clock_s` NULL on that row forever -- and
+    `aggregate_run_metrics` counted it toward `n_runs` regardless, so every
+    forced start permanently depressed the arm's success rate.
+    `state.set_active` now closes the displaced run's row out (`ended_at`/
+    `wall_clock_s` recorded, `abandoned` set to 1, `task_success` left
+    NULL -- the task was never scored, which isn't the same as failing it)
+    and `aggregate_run_metrics` excludes any run with no verdict
+    (`task_success IS NULL`, which covers both `abandoned` runs and a run
+    that simply never got an `ys end`) from `n_runs`/`n_success`,
+    reporting the excluded count separately as `n_unfinished`."""
+    _add_column_if_missing(conn, "runs", "config_hash", "TEXT")
+    _add_column_if_missing(conn, "runs", "task_json_snapshot", "TEXT")
+    _add_column_if_missing(conn, "runs", "abandoned", "INTEGER NOT NULL DEFAULT 0")
+
+
 # Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
 # Each entry is gated by user_version, so it runs at most once per database
 # file in the normal case -- but every entry must still converge cleanly if
@@ -201,6 +235,8 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id,
     _migration_3,
     # 4: see _migration_4 above.
     _migration_4,
+    # 5: see _migration_5 above.
+    _migration_5,
 ]
 
 
