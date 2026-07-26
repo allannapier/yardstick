@@ -308,8 +308,9 @@ def end(
     dropped_count = dropped.count()
     if dropped_count:
         console.print(
-            f"\n[red]{dropped_count} request(s) since yardstick started could not be "
-            f"written to the database and were dropped -- see {paths.DROPPED_LOG_PATH}[/red]"
+            f"\n[red]{dropped_count} request(s) could not be written to the database "
+            f"and were dropped (cumulative across all runs recorded in "
+            f"{paths.DROPPED_LOG_PATH}, not just this one)[/red]"
         )
 
 
@@ -349,8 +350,9 @@ def status():
     dropped_count = dropped.count()
     if dropped_count:
         console.print(
-            f"\n[red]{dropped_count} request(s) could not be written to the "
-            f"database and were dropped -- see {paths.DROPPED_LOG_PATH}[/red]"
+            f"\n[red]{dropped_count} request(s) could not be written to the database "
+            f"and were dropped (cumulative across all runs recorded in "
+            f"{paths.DROPPED_LOG_PATH}, not just this one)[/red]"
         )
 
 

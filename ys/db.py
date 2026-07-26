@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import warnings
 from contextlib import contextmanager
 
 from ys import paths
@@ -146,7 +147,17 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(paths.DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    journal_mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+    if journal_mode.lower() != "wal":
+        # SQLite silently falls back to another journal mode when WAL isn't
+        # supported (e.g. a network filesystem) -- surface that instead of
+        # letting this whole fix quietly be a no-op.
+        warnings.warn(
+            f"could not enable SQLite WAL mode (got journal_mode={journal_mode!r}); "
+            "concurrent readers/writer will contend more than expected",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn

@@ -15,6 +15,36 @@ def test_connect_enables_wal_and_busy_timeout():
         conn.close()
 
 
+def test_connect_warns_when_wal_mode_unavailable(monkeypatch):
+    """SQLite silently falls back to another journal mode when WAL isn't
+    supported (e.g. a network filesystem) -- connect() must surface that
+    instead of letting the fix quietly be a no-op. sqlite3.Connection is a
+    C type and can't be monkeypatched on the instance, so we route through
+    a subclass via the `factory` argument instead."""
+
+    class _FakeWALConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql.strip().upper().startswith("PRAGMA JOURNAL_MODE"):
+                class _FakeCursor:
+                    def fetchone(self_inner):
+                        return ("truncate",)
+
+                return _FakeCursor()
+            return super().execute(sql, *args, **kwargs)
+
+    real_connect = sqlite3.connect
+
+    def fake_connect(*args, **kwargs):
+        kwargs["factory"] = _FakeWALConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(db.sqlite3, "connect", fake_connect)
+
+    with pytest.warns(RuntimeWarning, match="WAL"):
+        conn = db.connect()
+    conn.close()
+
+
 def test_init_db_creates_tables():
     db.init_db()
     with db.cursor() as cur:

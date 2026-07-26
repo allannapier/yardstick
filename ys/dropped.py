@@ -17,12 +17,12 @@ def record(run_id: str, error: str):
         "ts": datetime.now(timezone.utc).isoformat(),
         "error": error,
     }
-    with open(paths.DROPPED_LOG_PATH, "a") as f:
+    with open(paths.DROPPED_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
 def count() -> int:
     if not os.path.exists(paths.DROPPED_LOG_PATH):
         return 0
-    with open(paths.DROPPED_LOG_PATH) as f:
+    with open(paths.DROPPED_LOG_PATH, encoding="utf-8") as f:
         return sum(1 for _ in f)
