@@ -7,15 +7,23 @@ explore/ for the probe that produced the ground truth.
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 import traceback
 import uuid
 
 from litellm.integrations.custom_logger import CustomLogger
 
-from ys import db, paths
+from ys import db, dropped, paths
 
 _SECRET_KEYS = {"api_key", "authorization", "x-api-key", "api-key"}
+
+# db.connect()'s busy_timeout already makes SQLite itself wait out a
+# conflicting writer, but a burst of concurrent requests (parallel tool use,
+# a subagent) can still collide on the Python side. A few retries with a
+# short backoff covers that without masking a persistently broken database.
+_MAX_WRITE_ATTEMPTS = 3
+_RETRY_BACKOFF_S = 0.2
 
 
 def _redact(obj, key=None):
@@ -423,11 +431,23 @@ class YardstickLogger(CustomLogger):
         await self._handle(kwargs, response_obj, start_time, end_time)
 
     async def _handle(self, kwargs, response_obj, start_time, end_time):
+        run_id = "unknown"
         try:
             run_id = _resolve_run_id(kwargs)
             rec = extract_record(kwargs, response_obj, start_time, end_time)
-            await asyncio.get_event_loop().run_in_executor(None, _write, run_id, rec)
-        except Exception:
+            for attempt in range(1, _MAX_WRITE_ATTEMPTS + 1):
+                try:
+                    await asyncio.get_event_loop().run_in_executor(None, _write, run_id, rec)
+                    break
+                except sqlite3.OperationalError:
+                    if attempt == _MAX_WRITE_ATTEMPTS:
+                        raise
+                    await asyncio.sleep(_RETRY_BACKOFF_S * attempt)
+        except Exception as e:
+            # A request whose write never lands has no other record of its
+            # existence -- count it so a lossy run is visible instead of
+            # quietly short (see `ys status`).
+            dropped.record(run_id, repr(e))
             traceback.print_exc()
 
 

@@ -5,6 +5,16 @@ import pytest
 from ys import db
 
 
+def test_connect_enables_wal_and_busy_timeout():
+    conn = db.connect()
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+    finally:
+        conn.close()
+
+
 def test_init_db_creates_tables():
     db.init_db()
     with db.cursor() as cur:
