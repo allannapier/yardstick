@@ -7,7 +7,7 @@ import typer
 from rich.console import Console
 
 from ys import db, dropped, harness, paths, proxy, runs, state, webserver
-from ys.experiment import load_experiment
+from ys.experiment import load_experiment, validate_task_paths
 
 app = typer.Typer(help="yardstick -- measure agent/harness/model efficiency")
 proxy_app = typer.Typer(help="manage the LiteLLM measurement proxy")
@@ -274,6 +274,17 @@ def start(
     with open(exp) as f:
         config_yaml = f.read()
 
+    # Finding 15-18: task.prompt_file/repo are declared-but-unconsumed hooks
+    # for features 1/2 (unattended runs, workspace isolation) -- but a
+    # typo'd path should fail loudly right here, not silently once a future
+    # feature finally reads it. Checked before begin_run claims the active
+    # slot, so a rejected start doesn't leave anything to clean up.
+    path_problems = validate_task_paths(experiment.task)
+    if path_problems:
+        for problem in path_problems:
+            console.print(f"[red]{problem}[/red]")
+        raise typer.Exit(1)
+
     try:
         result = runs.begin_run(experiment, config_yaml, arm, force=force)
     except runs.ArmNotFound as e:
@@ -457,6 +468,12 @@ def compare(
         console.print(f"[red]{warning}[/red]")
     for warning in render.config_warnings(comparison):
         console.print(f"[yellow]{warning}[/yellow]")
+    # finding 15-18: `repeats:` is advisory -- unequal sample sizes across
+    # arms invalidate the comparison in a way the table doesn't show on its
+    # own. Yellow, not red: unlike a cost-unknown request, this doesn't mean
+    # a number above is wrong, just that comparing it isn't apples-to-apples.
+    for warning in render.repeat_count_warnings(comparison):
+        console.print(f"[yellow]warning: {warning}[/yellow]")
 
 
 @app.command()

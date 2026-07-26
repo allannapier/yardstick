@@ -153,6 +153,10 @@ def test_normal_run():
     assert m["wall_clock_s"] == pytest.approx(10.0)
     assert m["active_s"] == pytest.approx((1000 + 1200 + 1300) / 1000.0)
 
+    # finding 15-18: tokens_per_turn was named in both example experiments'
+    # metrics.derived block but never computed anywhere -- now a real metric.
+    assert m["tokens_per_turn"] == pytest.approx(2320.0 / 3)
+
 
 # ---------------------------------------------------------------------------
 # Zero tool calls
@@ -176,6 +180,18 @@ def test_run_with_zero_tool_calls():
     assert m["redundant_tool_calls"] == 0
     assert m["redundancy_rate"] == 0.0
     assert m["read_amplification"] is None
+
+
+def test_tokens_per_turn_none_for_a_run_with_no_requests():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_empty")
+
+    with db.cursor() as cur:
+        m = metrics.compute_run_metrics(cur, "r_empty")
+
+    assert m["turns"] == 0
+    assert m["tokens_per_turn"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +370,32 @@ def test_aggregate_run_metrics_custom_gate():
     assert agg["cost_per_success"] is None
     assert agg["metrics"]["cost_usd"]["mean"] is None
     assert agg["metrics"]["cost_usd"]["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# finding 15-18: metrics.gate is a validated, named lookup now, not a
+# hardcoded predicate -- resolve_gate is the bridge from the YAML's
+# `metrics.gate` string to the callable aggregate_run_metrics gates on.
+# ---------------------------------------------------------------------------
+
+def test_resolve_gate_task_success_matches_the_old_hardcoded_default():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r1", task_success=1)
+        _mk_request(cur, "r1", 1, response_cost=1.0)
+        _mk_run(cur, "r2", task_success=0)
+        _mk_request(cur, "r2", 1, response_cost=2.0)
+
+    with db.cursor() as cur:
+        agg = metrics.aggregate_run_metrics(cur, ["r1", "r2"], gate=metrics.resolve_gate("task_success"))
+
+    assert agg["n_success"] == 1
+    assert agg["metrics"]["cost_usd"]["n"] == 1
+
+
+def test_resolve_gate_unknown_name_names_valid_options():
+    with pytest.raises(ValueError, match="unknown metrics.gate 'nope'.*task_success"):
+        metrics.resolve_gate("nope")
 
 
 # ---------------------------------------------------------------------------

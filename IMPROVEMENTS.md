@@ -530,7 +530,7 @@ recent start.
   `begin_run` actually snapshots both columns
   (`test_begin_run_snapshots_config_hash_and_task_json`).
 
-### 15–18. Declared configuration that does nothing [by inspection]
+### 15–18. Declared configuration that does nothing [by inspection] — fixed
 
 The YAML schema advertises more than the code implements. Each of these is either
 a feature to build or a field to delete, but shipping them as inert config is
@@ -552,6 +552,76 @@ worse than either:
 
 Also: `repeats` is advisory. Nothing warns when one arm has 7 runs and another has
 1, which makes the comparison invalid in a way the table does not show.
+
+**Fix:** built, not deleted, in every case — each field turned out to have a
+real consumer worth writing rather than being genuinely dead:
+
+- `metrics.gate`/`primary`/`secondary`/`derived`: **built.** `ys/experiment.py`'s
+  `Metrics` now validates `gate` against `VALID_GATE_NAMES` and
+  `primary`/`secondary`/`derived` against `VALID_METRIC_NAMES` at YAML-load
+  time — an unknown or misspelled metric name (untrusted user input) now fails
+  loudly, naming the valid options, instead of silently displaying nothing.
+  `ys/metrics.py`'s new `resolve_gate` turns the validated `gate` string into
+  the predicate `aggregate_run_metrics` gates on (previously hardcoded inline);
+  `ys/render.py`'s `compare_experiment` passes it through and resolves
+  `Comparison.primary_metrics`/`.secondary_metrics`/`.derived_metrics` from the
+  experiment's declared lists (via `_resolve_metric_list`, which uses
+  pydantic's `model_fields_set` so an explicit `secondary: []` — "show
+  nothing here" — is distinguished from "not declared at all", which still
+  falls back to the old hardcoded defaults for backward compatibility).
+  `build_table`/`render_html` now iterate `Comparison.display_metrics()`
+  instead of the old module-level `PRIMARY_METRICS`/`SECONDARY_METRICS`
+  constants. `derived: [tokens_per_turn]` is no longer a metric name that
+  goes nowhere: `ys/metrics.py` now actually computes it
+  (`billable_tokens / turns` per run, added to `_EFFICIENCY_METRICS` so it's
+  aggregated like every other metric).
+- `factors`: **built.** `Experiment` gained a `_arms_within_declared_factor_space`
+  validator (`ys/experiment.py`) that rejects an arm referencing a factor key
+  not declared under `factors:`, or a value not in that key's declared list —
+  both previously silent failures that only surfaced far downstream (a
+  never-matching `models:`/`pricing:`/`billable_weights:` entry, or the
+  proxy's catch-all quietly serving an unregistered model). Skipped entirely
+  when `factors:` itself isn't declared, so an experiment not using the
+  factor-space feature is unaffected. The missing "generate the cartesian
+  product" helper the finding calls out now exists too:
+  `expand_factors()`/`Experiment.factor_combinations()`.
+- `task.repo`/`task.ref`/`task.prompt_file`: **kept, not deleted, and now
+  validated.** These are the designated hooks for features 1 (unattended
+  runs, `prompt_file`) and 2 (workspace isolation, `repo`/`ref`), both queued
+  follow-up work — deleting them would just mean re-adding the same fields
+  later. `Task` gained a schema-only `_ref_requires_repo` validator (a `ref`
+  with no `repo` can never mean anything), and `ys/cli.py`'s `start()` now
+  calls the new `validate_task_paths()` (`ys/experiment.py`) before claiming
+  the active-run slot: a `prompt_file` that doesn't exist on disk fails
+  loudly right there, per the finding's own suggested fix, instead of
+  silently once feature 1 finally reads it. A `repo` that looks like a local
+  filesystem path (no `://`, no `user@host:` syntax) is checked the same way;
+  one that looks like a remote git URL is left unvalidated, since confirming
+  it's reachable needs a network call that belongs to feature 2's own
+  implementation. Both fields' docstrings in `ys/experiment.py` now say
+  outright that they're declared-but-unconsumed pending those features.
+- `ttft_ms`: **built.** `ys/collector.py`'s `extract_record` now computes it
+  via a new `_ttft_ms` helper instead of hardcoding `None`. Checked against
+  the installed `litellm` package rather than assumed: LiteLLM's own
+  `standard_logging_object` already carries `startTime`/`completionStartTime`
+  (both epoch-second floats), and for a **streaming** response LiteLLM's
+  streaming handler stamps `completion_start_time` the moment the first
+  chunk arrives, so `completionStartTime - startTime` is a real
+  time-to-first-token. For a **non-streaming** response, LiteLLM never sets
+  `completion_start_time` at all — `get_standard_logging_object_payload`
+  defaults it to `end_time` — so `ttft_ms` collapses to the full round-trip
+  latency for those requests. That's documented as correct, not a bug: a
+  non-streaming response arrives as a single event, so "time to first token"
+  and "time to last token" are genuinely the same moment. Returns `None`
+  when either timestamp is missing (e.g. a failed request with no
+  `standard_logging_object`) rather than fabricating a number.
+- `repeats` advisory: **built.** `ys/render.py`'s new `repeat_count_warnings`
+  flags exactly the case the finding describes — arms in the same comparison
+  with unequal recorded run counts — printed by `ys compare` (yellow, since
+  unlike an unpriced-cost warning this doesn't mean a number is wrong, just
+  that comparing it isn't apples-to-apples) and as an amber banner in the
+  HTML report. Not raised when every arm is short by the same amount (e.g.
+  nobody's past repeat 1 yet), only when the arms disagree with each other.
 
 ---
 

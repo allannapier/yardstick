@@ -65,6 +65,27 @@ def _write_model_exp(tmp_path):
     return str(path)
 
 
+PROMPT_FILE_EXPERIMENT_YAML = """
+experiment: cli-prompt-file-exp
+task:
+  id: t0
+  success_check: "true"
+  timeout_s: 5
+  prompt_file: {prompt_file}
+arms:
+  - id: only-arm
+    factors: {{}}
+    baseline: true
+repeats: 1
+"""
+
+
+def _write_exp_with_prompt_file(tmp_path, prompt_file):
+    path = tmp_path / "prompt_file_exp.yaml"
+    path.write_text(PROMPT_FILE_EXPERIMENT_YAML.format(prompt_file=prompt_file))
+    return str(path)
+
+
 @pytest.fixture
 def fake_claude_agent(monkeypatch, tmp_path):
     claude_path = str(tmp_path / "claude_settings.json")
@@ -157,6 +178,31 @@ def test_start_unknown_arm_lists_valid_arms(tmp_path):
     result = runner.invoke(app, ["start", "--exp", exp, "--arm", "nope"])
     assert result.exit_code != 0
     assert "only-arm" in result.stdout
+
+
+def test_start_fails_loudly_when_prompt_file_missing(tmp_path):
+    """Finding 15-18: task.prompt_file is a declared-but-unconsumed hook for
+    feature 1 (unattended runs) -- but a typo'd path must fail loudly at
+    `ys start`, not silently once the feature that eventually reads it
+    ships. Must not leave an active run behind either."""
+    missing = str(tmp_path / "does-not-exist.txt")
+    exp = _write_exp_with_prompt_file(tmp_path, missing)
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    assert result.exit_code != 0
+    assert "does not exist" in plain(result.stdout)
+
+    # the rejected start must not have claimed the active-run slot
+    status = runner.invoke(app, ["status"])
+    assert "no active run" in plain(status.stdout)
+
+
+def test_start_succeeds_when_prompt_file_exists(tmp_path):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("do the task")
+    exp = _write_exp_with_prompt_file(tmp_path, str(prompt_file))
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    assert result.exit_code == 0, result.stdout
+    runner.invoke(app, ["end"])
 
 
 def test_double_start_without_force_fails(tmp_path):
