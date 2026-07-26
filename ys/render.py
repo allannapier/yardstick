@@ -25,6 +25,7 @@ SECONDARY_METRICS = [
     "fixed_overhead_tokens",
     "context_high_water",
     "compaction_events",
+    "background_requests",
 ]
 
 
@@ -221,19 +222,14 @@ def _sparkline_svg(series: list, width: int = 240, height: int = 40, color: str 
 
 
 def _context_series(cur, run_id: str) -> list:
-    rows = cur.execute(
-        "SELECT input_tokens, cache_creation, cache_read FROM requests WHERE run_id = ? ORDER BY seq",
-        (run_id,),
-    ).fetchall()
-    return [
-        (r["input_tokens"] or 0) + (r["cache_creation"] or 0) + (r["cache_read"] or 0) for r in rows
-    ]
+    # Main thread only, matching token_metrics -- interleaved background/
+    # subagent requests have their own short, unrelated context and would
+    # otherwise show up as spurious drops in the conversation's chart.
+    return [metrics.context_tokens(r) for r in metrics._main_requests(cur, run_id)]
 
 
 def _compaction_timeline_svg(cur, run_id: str, width: int = 240, height: int = 24) -> str:
-    rows = cur.execute(
-        "SELECT seq, transition FROM requests WHERE run_id = ? ORDER BY seq", (run_id,)
-    ).fetchall()
+    rows = metrics._main_requests(cur, run_id)
     if not rows:
         return "<em>no requests</em>"
     n = len(rows)

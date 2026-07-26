@@ -48,21 +48,29 @@ def _mk_request(cur, run_id, seq, **overrides):
         system_tokens=200,
         tools_tokens=100,
         transition=None,
+        # None (not e.g. "main") so existing tests -- which never set this --
+        # keep landing in one group and stay unaffected by the main-thread
+        # scoping added for finding 4.
+        thread_key=None,
+        toolset_hash=None,
+        system_prompt_hash=None,
     )
     defaults.update(overrides)
     cur.execute(
         """INSERT INTO requests
            (run_id, seq, ts, provider, model, stream, input_tokens, cache_creation,
             cache_read, output_tokens, response_cost, latency_ms, ttft_ms, status_code,
-            error, msg_count, msg_hashes_json, system_tokens, tools_tokens, transition)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            error, msg_count, msg_hashes_json, system_tokens, tools_tokens, transition,
+            thread_key, toolset_hash, system_prompt_hash)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             run_id, seq, defaults["ts"], defaults["provider"], defaults["model"], defaults["stream"],
             defaults["input_tokens"], defaults["cache_creation"], defaults["cache_read"],
             defaults["output_tokens"], defaults["response_cost"], defaults["latency_ms"],
             defaults["ttft_ms"], defaults["status_code"], defaults["error"], defaults["msg_count"],
             defaults["msg_hashes_json"], defaults["system_tokens"], defaults["tools_tokens"],
-            defaults["transition"],
+            defaults["transition"], defaults["thread_key"], defaults["toolset_hash"],
+            defaults["system_prompt_hash"],
         ),
     )
     return cur.lastrowid
@@ -287,3 +295,47 @@ def test_aggregate_run_metrics_custom_gate():
     assert agg["cost_per_success"] is None
     assert agg["metrics"]["cost_usd"]["mean"] is None
     assert agg["metrics"]["cost_usd"]["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# finding 4: interleaved background/subagent traffic must not corrupt the
+# main conversation's metrics, and should be reported as its own line item.
+# ---------------------------------------------------------------------------
+
+def test_background_traffic_excluded_from_conversation_metrics_but_counted_separately():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_bg")
+        _mk_request(cur, "r_bg", 1, thread_key="main", input_tokens=100, output_tokens=50,
+                     response_cost=0.01)
+        _mk_request(cur, "r_bg", 2, thread_key="main", input_tokens=100, output_tokens=50,
+                     response_cost=0.01)
+        # a harness title-generation call landing between two main turns
+        _mk_request(cur, "r_bg", 3, thread_key="bg-title-gen", input_tokens=20, output_tokens=5,
+                     response_cost=0.001, system_tokens=10, tools_tokens=0)
+
+    with db.cursor() as cur:
+        m = metrics.compute_run_metrics(cur, "r_bg")
+
+    assert m["turns"] == 2  # the background request is not a conversational turn
+    assert m["background_requests"] == 1
+    assert m["background_tokens"] == 20
+    # totals still include the background request's real spend/tokens
+    assert m["cost_usd"] == pytest.approx(0.021)
+    assert m["billable_tokens"] == pytest.approx(325.0)
+
+
+def test_main_thread_fingerprint_prefers_largest_thread_over_first_request():
+    """A background/subagent call landing before the main conversation's
+    first request must not win the run's fingerprint -- see finding 4."""
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_fp")
+        _mk_request(cur, "r_fp", 1, thread_key="bg", model="bg-model")
+        _mk_request(cur, "r_fp", 2, thread_key="main", model="main-model")
+        _mk_request(cur, "r_fp", 3, thread_key="main", model="main-model")
+
+    with db.cursor() as cur:
+        fp = metrics.main_thread_fingerprint(cur, "r_fp")
+
+    assert fp["model"] == "main-model"

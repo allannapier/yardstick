@@ -212,6 +212,24 @@ def finish_run(manual_score: Optional[float] = None) -> FinishResult:
         from ys import metrics
 
         with db.cursor() as cur:
+            # The per-request fingerprint fill in ys.collector fires eagerly
+            # on the first successful request, which can't yet know which
+            # thread will end up being the run's main conversation -- if
+            # that request happened to be a background or subagent call,
+            # the run got fingerprinted against the wrong conversation (see
+            # finding 4). Now that the run is finished, correct it from the
+            # actual main thread.
+            fingerprint = metrics.main_thread_fingerprint(cur, run_id)
+            if fingerprint:
+                cur.execute(
+                    "UPDATE runs SET model=?, toolset_hash=?, system_prompt_hash=? WHERE id=?",
+                    (
+                        fingerprint["model"],
+                        fingerprint["toolset_hash"],
+                        fingerprint["system_prompt_hash"],
+                        run_id,
+                    ),
+                )
             summary_metrics = metrics.compute_run_metrics(cur, run_id)
     except ImportError:
         pass

@@ -202,6 +202,7 @@ HEADLINE_METRICS = [
     "tool_error_rate",
     "redundant_tool_calls",
     "compaction_events",
+    "background_requests",
     "active_s",
 ]
 

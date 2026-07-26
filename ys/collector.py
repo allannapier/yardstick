@@ -78,6 +78,29 @@ def _classify_transition(prev: list, cur: list) -> str:
     return "reset"
 
 
+def _thread_anchor_hash(messages) -> str:
+    """Hash of the first non-system message in a request's history: the
+    stable anchor that identifies which conversation a request belongs to.
+    Claude Code interleaves the main conversation with background
+    (title-generation) requests and Task-subagent conversations in the same
+    run; each has its own distinct anchor even on the turns where the
+    surrounding system prompt happens to match."""
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("role") != "system":
+            return _sha256(_canonical(m))
+    return ""
+
+
+def _thread_key(system_prompt_hash, messages) -> str:
+    """Groups requests into the conversation they actually belong to, so
+    transition classification and conversation metrics aren't computed
+    across unrelated interleaved threads (finding 4). Not guaranteed stable
+    across a harness-side compaction that rewrites the first message -- see
+    _classify_transition, which is the piece that actually detects that
+    case within a thread."""
+    return _sha256(f"{system_prompt_hash or ''}|{_thread_anchor_hash(messages)}")
+
+
 def _safe_token_count(model: str, text: str) -> int:
     if not text:
         return 0
@@ -123,10 +146,14 @@ def _next_seq(cur, run_id: str) -> int:
     return (row["m"] or 0) + 1
 
 
-def _last_msg_hashes(cur, run_id: str):
+def _last_msg_hashes(cur, run_id: str, thread_key: str):
+    """Scoped to (run_id, thread_key) so an interleaved background or
+    subagent request never becomes the "previous" request a main-thread
+    turn is classified against, and vice versa (finding 4)."""
     row = cur.execute(
-        "SELECT msg_hashes_json FROM requests WHERE run_id = ? ORDER BY seq DESC LIMIT 1",
-        (run_id,),
+        "SELECT msg_hashes_json FROM requests WHERE run_id = ? AND thread_key IS ? "
+        "ORDER BY seq DESC LIMIT 1",
+        (run_id, thread_key),
     ).fetchone()
     if not row or not row["msg_hashes_json"]:
         return []
@@ -183,6 +210,7 @@ def extract_record(kwargs: dict, response_obj, start_time, end_time) -> dict:
 
     messages = slo.get("messages") or kwargs.get("messages") or []
     msg_hashes = _msg_hashes(messages)
+    system_prompt_hash = _sha256(system_text) if system_text else None
 
     headers = (
         (kwargs.get("litellm_params") or {}).get("proxy_server_request", {}).get("headers", {})
@@ -218,7 +246,8 @@ def extract_record(kwargs: dict, response_obj, start_time, end_time) -> dict:
         "user_agent": headers.get("user-agent"),
         "toolset_hash": _sha256(_canonical(tools)) if tools else None,
         "tool_count": len(tools) if isinstance(tools, list) else 0,
-        "system_prompt_hash": _sha256(system_text) if system_text else None,
+        "system_prompt_hash": system_prompt_hash,
+        "thread_key": _thread_key(system_prompt_hash, messages),
     }
 
 
@@ -296,15 +325,16 @@ def _write(run_id: str, rec: dict):
             run_id = "unattributed"
         _ensure_run_exists(cur, run_id)
         seq = _next_seq(cur, run_id)
-        prev_hashes = _last_msg_hashes(cur, run_id)
+        prev_hashes = _last_msg_hashes(cur, run_id, rec["thread_key"])
         transition = _classify_transition(prev_hashes, rec["msg_hashes"])
 
         cur.execute(
             """INSERT INTO requests
                (run_id, seq, ts, provider, model, stream, input_tokens, cache_creation,
                 cache_read, output_tokens, response_cost, latency_ms, ttft_ms, status_code,
-                error, msg_count, msg_hashes_json, system_tokens, tools_tokens, transition)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                error, msg_count, msg_hashes_json, system_tokens, tools_tokens, transition,
+                thread_key, toolset_hash, system_prompt_hash)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id,
                 seq,
@@ -326,6 +356,9 @@ def _write(run_id: str, rec: dict):
                 rec["system_tokens"],
                 rec["tools_tokens"],
                 transition,
+                rec["thread_key"],
+                rec["toolset_hash"],
+                rec["system_prompt_hash"],
             ),
         )
         request_id = cur.lastrowid

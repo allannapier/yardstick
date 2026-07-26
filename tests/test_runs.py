@@ -105,6 +105,44 @@ def test_finish_run_includes_summary_metrics():
     assert "turns" in result.summary_metrics
 
 
+def test_finish_run_corrects_fingerprint_from_main_thread():
+    """Regression test for finding 4: if a background/subagent request lands
+    before the main conversation's first request, the eager per-request
+    fingerprint fill in ys.collector can stamp `runs` from the wrong
+    conversation. finish_run must correct it from the thread with the most
+    requests once the run is complete."""
+    from ys import db
+
+    begun = runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, model, status_code, thread_key, toolset_hash, system_prompt_hash) "
+            "VALUES (?,1,'2026-01-01','bg-model',200,'bg',NULL,NULL)",
+            (begun.run_id,),
+        )
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, model, status_code, thread_key, toolset_hash, system_prompt_hash) "
+            "VALUES (?,2,'2026-01-01','main-model',200,'main','tools-hash','sys-hash')",
+            (begun.run_id,),
+        )
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, model, status_code, thread_key, toolset_hash, system_prompt_hash) "
+            "VALUES (?,3,'2026-01-01','main-model',200,'main','tools-hash','sys-hash')",
+            (begun.run_id,),
+        )
+
+    runs.finish_run()
+
+    with db.cursor() as cur:
+        run_row = cur.execute(
+            "SELECT model, toolset_hash, system_prompt_hash FROM runs WHERE id = ?", (begun.run_id,)
+        ).fetchone()
+
+    assert run_row["model"] == "main-model"
+    assert run_row["toolset_hash"] == "tools-hash"
+    assert run_row["system_prompt_hash"] == "sys-hash"
+
+
 def test_delete_run_unknown_id_raises():
     with pytest.raises(runs.RunNotFound):
         runs.delete_run("no-such-run")
