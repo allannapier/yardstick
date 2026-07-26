@@ -20,6 +20,25 @@ app.add_typer(harness_app, name="harness")
 console = Console()
 
 
+def _print_unattributed_notice():
+    """Finding 12: requests the collector couldn't attribute to a real run
+    land in the synthetic 'unattributed' run and, before this, were never
+    surfaced anywhere -- a misconfigured harness produced a run with zero
+    requests and no explanation in sight. Printed by both `ys status` and
+    `ys end`, right alongside the `ys dropped` count (finding 6), which this
+    is the sibling diagnostic of: dropped requests never made it into the
+    database at all, unattributed ones did, just not under the run they
+    belonged to."""
+    summary = runs.unattributed_summary()
+    if summary.count:
+        console.print(
+            f"\n[yellow]{summary.count} request(s) since {summary.since} UTC could not be "
+            "attributed to a run (cumulative across every run ever recorded, not just "
+            "this one) -- check the harness is pointed at the proxy and either sending "
+            "x-ys-run or running while `ys start` has the active-run slot claimed.[/yellow]"
+        )
+
+
 def _report_write_failed(e: Exception):
     """`runs.begin_run`/`finish_run`/`delete_run` write through
     `db.call_with_retry` (finding 28), which already retries a locked
@@ -370,6 +389,7 @@ def end(
             f"and were dropped (cumulative across all runs recorded in "
             f"{paths.DROPPED_LOG_PATH}, not just this one)[/red]"
         )
+    _print_unattributed_notice()
 
 
 @app.command()
@@ -414,6 +434,7 @@ def status():
             f"and were dropped (cumulative across all runs recorded in "
             f"{paths.DROPPED_LOG_PATH}, not just this one)[/red]"
         )
+    _print_unattributed_notice()
 
 
 @app.command()

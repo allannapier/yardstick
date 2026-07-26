@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from urllib.parse import unquote
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ys import db, state
@@ -34,11 +35,45 @@ def _create_experiment(name: str):
     )
 
 
+def _factor_exp_payload(name="factor-exp", **overrides):
+    """A one-arm mock experiment whose arm carries an extra, non-`model`
+    factor (`harness=claude-code`) -- the shape item 6's arbitrary-factor
+    fields (factor_arm_seq/factor_key/factor_value) need to round-trip
+    through create/edit/re-render-on-error."""
+    payload = {
+        "name": name,
+        "task_id": "t0",
+        "success_check": "true",
+        "timeout_s": "60",
+        "repeats": "1",
+        "model_key": ["m1"],
+        "model_kind": ["mock"],
+        "model_value": ["hi"],
+        "arm_id": ["a"],
+        "arm_model": ["m1"],
+        "arm_seq": ["0"],
+        "arm_baseline": ["0"],
+        "arm_notes": ["a note"],
+        "factor_arm_seq": ["0"],
+        "factor_key": ["harness"],
+        "factor_value": ["claude-code"],
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_health():
     assert client.get("/health").text == "ok"
 
 
-def test_index_empty():
+def test_index_empty(monkeypatch, tmp_path):
+    # Isolate cwd from wherever pytest happens to be invoked from -- since
+    # store.discovery_dirs() now also looks at ./experiments relative to
+    # the process cwd (see the discovery tests below), running this suite
+    # from this repo's own root would otherwise make the "no experiments
+    # yet" empty state unreachable (this repo's experiments/ directory
+    # would always be discovered).
+    monkeypatch.chdir(tmp_path)
     resp = client.get("/")
     assert resp.status_code == 200
     assert "no experiments yet" in resp.text
@@ -509,6 +544,7 @@ def test_run_detail_page():
 
     resp = client.get(f"/runs/{run_id}")
     assert resp.status_code == 200
+    assert run_id in resp.text
 
 
 # --- write retry (finding 28) ------------------------------------------------
@@ -568,3 +604,328 @@ def test_start_run_reports_a_readable_error_after_exhausting_retries(monkeypatch
     assert "error=" in resp.headers["location"]
     assert "could not write to the database" in unquote(resp.headers["location"])
     assert state.get_active() is None
+
+
+# ---------------------------------------------------------------------------
+# Experiment discovery beyond EXPERIMENTS_DIR (dashboard bullet: "it can't
+# see the repo's own experiments")
+# ---------------------------------------------------------------------------
+
+
+def test_index_discovers_experiments_outside_experiments_dir(monkeypatch, tmp_path):
+    # store.list_experiments() used to only read EXPERIMENTS_DIR, so
+    # experiments/example.yaml -- the file the README's quick start points
+    # at -- never appeared. Reproduce that shape without depending on this
+    # repo's actual experiments/ directory: a fake cwd with its own
+    # experiments/ folder, and a filename that deliberately doesn't match
+    # the experiment id inside (mirroring example.yaml's filename
+    # "example.yaml" vs its `experiment:` field "mock-smoke-01").
+    exp_dir = tmp_path / "experiments"
+    exp_dir.mkdir()
+    (exp_dir / "some-file.yaml").write_text(
+        "experiment: discovered-exp\n"
+        'task:\n  id: t0\n  success_check: "true"\n'
+        "models:\n  m1: {mock_response: hi}\n"
+        "arms:\n  - id: a\n    factors: {model: m1}\n    baseline: true\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "discovered-exp" in resp.text
+    assert "read-only" in resp.text  # not dashboard-managed
+
+    detail = client.get("/experiments/discovered-exp")
+    assert detail.status_code == 200
+    assert "outside the dashboard's own" in detail.text
+
+    # discovery is read-only: the dashboard's own writable location is untouched
+    assert not os.path.exists(store.experiment_path("discovered-exp"))
+
+
+def test_dashboard_managed_experiment_wins_name_collision_over_discovered(monkeypatch, tmp_path):
+    exp_dir = tmp_path / "experiments"
+    exp_dir.mkdir()
+    (exp_dir / "collide.yaml").write_text(
+        "experiment: collide-exp\n"
+        'task:\n  id: from-disk\n  success_check: "true"\n'
+        "models:\n  m1: {mock_response: hi}\n"
+        "arms:\n  - id: a\n    factors: {model: m1}\n    baseline: true\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    client.post("/experiments", data=_factor_exp_payload(name="collide-exp", task_id="from-dashboard"))
+
+    detail = client.get("/experiments/collide-exp")
+    assert "from-dashboard" in detail.text
+    assert "from-disk" not in detail.text
+
+
+def test_find_experiment_still_rejects_invalid_names_across_discovery_dirs():
+    # Widening discovery to more than one directory must not widen what a
+    # URL-supplied name can resolve to -- validate_name still runs first
+    # regardless of how many directories find_experiment searches.
+    with pytest.raises(store.InvalidExperimentName):
+        store.find_experiment("../escape")
+
+
+# ---------------------------------------------------------------------------
+# View YAML / edit / delete an experiment definition (dashboard bullet:
+# "no edit, no YAML view, no delete")
+# ---------------------------------------------------------------------------
+
+
+def test_view_yaml_route_shows_raw_definition():
+    client.post("/experiments", data=_factor_exp_payload())
+    resp = client.get("/experiments/factor-exp/yaml")
+    assert resp.status_code == 200
+    assert "success_check" in resp.text
+    assert "harness" in resp.text
+    assert "claude-code" in resp.text
+
+
+def test_view_yaml_works_for_a_discovered_read_only_experiment(monkeypatch, tmp_path):
+    exp_dir = tmp_path / "experiments"
+    exp_dir.mkdir()
+    (exp_dir / "ro.yaml").write_text(
+        "experiment: readonly-yaml-exp\n"
+        'task:\n  id: t0\n  success_check: "true"\n'
+        "models:\n  m1: {mock_response: hi}\n"
+        "arms:\n  - id: a\n    factors: {model: m1}\n    baseline: true\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    resp = client.get("/experiments/readonly-yaml-exp/yaml")
+    assert resp.status_code == 200
+    assert "readonly-yaml-exp" in resp.text
+
+
+def test_edit_form_is_prefilled_with_current_definition():
+    client.post("/experiments", data=_factor_exp_payload())
+    resp = client.get("/experiments/factor-exp/edit")
+    assert resp.status_code == 200
+    assert 'value="t0"' in resp.text
+    assert 'value="harness"' in resp.text
+    assert 'value="claude-code"' in resp.text
+    assert "readonly" in resp.text  # the name field can't be changed via edit
+
+
+def test_edit_saves_changes_without_needing_confirm_overwrite():
+    client.post("/experiments", data=_factor_exp_payload())
+    changed = _factor_exp_payload(success_check="echo changed")
+    resp = client.post("/experiments/factor-exp/edit", data=changed, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith("/experiments/factor-exp")
+    assert "changed" in store.read_raw("factor-exp")
+
+
+def test_edit_reports_field_errors_without_discarding_input():
+    client.post("/experiments", data=_factor_exp_payload())
+    bad = _factor_exp_payload(timeout_s="soon")
+    resp = client.post("/experiments/factor-exp/edit", data=bad, follow_redirects=False)
+    assert resp.status_code == 400
+    assert "must be a whole number" in resp.text
+    assert 'value="t0"' in resp.text  # other fields preserved, not discarded
+
+
+def test_experiment_detail_names_run_count_in_delete_confirmation():
+    # Mirrors defect 21's house style (IMPROVEMENTS.md): name the run count
+    # in the confirmation so the consequence is visible before the user
+    # commits to deleting the definition.
+    client.post("/experiments", data=_factor_exp_payload())
+    client.post("/experiments/factor-exp/runs/start", data={"arm_id": "a"})
+    client.post("/runs/end", data={})
+
+    detail = client.get("/experiments/factor-exp")
+    assert "1 recorded run(s)" in detail.text
+
+
+def test_delete_experiment_removes_definition_but_keeps_runs():
+    client.post("/experiments", data=_factor_exp_payload())
+    client.post("/experiments/factor-exp/runs/start", data={"arm_id": "a"})
+    with db.cursor() as cur:
+        run_id = cur.execute(
+            "SELECT id FROM runs WHERE arm_id = 'factor-exp::a'"
+        ).fetchone()["id"]
+    client.post("/runs/end", data={})
+
+    resp = client.post("/experiments/factor-exp/delete", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith("/?")
+    assert not os.path.exists(store.experiment_path("factor-exp"))
+    assert client.get("/experiments/factor-exp").status_code == 404
+
+    with db.cursor() as cur:
+        row = cur.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+    assert row is not None  # runs are not deleted, just orphaned
+
+
+def test_edit_and_delete_are_refused_for_discovered_non_managed_experiments(monkeypatch, tmp_path):
+    exp_dir = tmp_path / "experiments"
+    exp_dir.mkdir()
+    (exp_dir / "ro.yaml").write_text(
+        "experiment: readonly-exp\n"
+        'task:\n  id: t0\n  success_check: "true"\n'
+        "models:\n  m1: {mock_response: hi}\n"
+        "arms:\n  - id: a\n    factors: {model: m1}\n    baseline: true\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    edit_resp = client.get("/experiments/readonly-exp/edit")
+    assert edit_resp.status_code == 400
+    # `_error_page`'s message renders through Jinja's auto-escaping (unlike
+    # experiment.html's own static copy), so the apostrophe comes back as
+    # `&#39;` -- assert on a stretch of the message that doesn't include one.
+    assert "outside the dashboard" in edit_resp.text
+
+    delete_resp = client.post("/experiments/readonly-exp/delete", follow_redirects=False)
+    assert delete_resp.status_code == 303
+    assert "error=" in delete_resp.headers["location"]
+    assert (exp_dir / "ro.yaml").exists()
+
+
+# ---------------------------------------------------------------------------
+# Live updates during an active run (dashboard bullet: "nothing updates
+# during a live run")
+# ---------------------------------------------------------------------------
+
+
+def test_run_live_endpoint_reports_running_totals():
+    client.post("/experiments", data=_factor_exp_payload(name="live-exp"))
+    client.post("/experiments/live-exp/runs/start", data={"arm_id": "a"})
+    run_id = state.get_active()["run_id"]
+
+    live = client.get(f"/runs/{run_id}/live")
+    assert live.status_code == 200
+    body = live.json()
+    assert body["ended"] is False
+    assert body["request_count"] == 0
+
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, model, input_tokens, response_cost, status_code) "
+            "VALUES (?, 1, '2026-01-01T00:00:00Z', 'm1', 100, 0.01, 200)",
+            (run_id,),
+        )
+
+    live2 = client.get(f"/runs/{run_id}/live").json()
+    assert live2["request_count"] == 1
+    assert live2["cost_usd"] == pytest.approx(0.01)
+
+    client.post("/runs/end", data={})
+    live3 = client.get(f"/runs/{run_id}/live").json()
+    assert live3["ended"] is True
+
+
+def test_run_live_unknown_run_returns_404():
+    resp = client.get("/runs/no-such-run/live")
+    assert resp.status_code == 404
+
+
+def test_active_run_banner_includes_live_polling_markup():
+    client.post("/experiments", data=_factor_exp_payload(name="live-banner-exp"))
+    client.post("/experiments/live-banner-exp/runs/start", data={"arm_id": "a"})
+
+    resp = client.get("/")
+    assert "live-request-count" in resp.text
+    assert "/live" in resp.text
+
+    client.post("/runs/end", data={})  # clean up active-run state
+
+
+# ---------------------------------------------------------------------------
+# The comparison view stays inside the app shell (dashboard bullet: "the
+# comparison view escapes the app")
+# ---------------------------------------------------------------------------
+
+
+def test_compare_view_is_embedded_in_app_shell_with_navigation():
+    client.post("/experiments", data=_factor_exp_payload(name="shell-compare-exp"))
+    client.post("/experiments/shell-compare-exp/runs/start", data={"arm_id": "a"})
+    client.post("/runs/end", data={})
+
+    resp = client.get("/experiments/shell-compare-exp/compare")
+    assert resp.status_code == 200
+    # the standalone report used to be served raw with no way back to the
+    # app -- it should now carry the same header/nav every other page has.
+    assert '<a href="/">yardstick</a>' in resp.text
+    assert '/experiments/shell-compare-exp"' in resp.text
+    assert "back to experiment" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Run detail: notes, factors, success_output, per-turn chart (dashboard
+# bullet: "run detail omits the useful parts")
+# ---------------------------------------------------------------------------
+
+
+def test_run_detail_shows_notes_factors_success_output_and_chart():
+    client.post(
+        "/experiments",
+        data=_factor_exp_payload(
+            name="rich-detail-exp",
+            success_check="echo detail-output-marker",
+            arm_notes=["a distinctive note"],
+        ),
+    )
+    client.post("/experiments/rich-detail-exp/runs/start", data={"arm_id": "a"})
+    with db.cursor() as cur:
+        run_id = cur.execute(
+            "SELECT id FROM runs WHERE arm_id = 'rich-detail-exp::a'"
+        ).fetchone()["id"]
+    client.post("/runs/end", data={})
+
+    resp = client.get(f"/runs/{run_id}")
+    assert resp.status_code == 200
+    assert "a distinctive note" in resp.text
+    assert "harness=claude-code" in resp.text
+    assert "detail-output-marker" in resp.text
+    assert "<svg" not in resp.text  # fewer than 2 requests recorded -- no chart yet
+
+    with db.cursor() as cur:
+        for seq, tokens in [(1, 100), (2, 500)]:
+            cur.execute(
+                "INSERT INTO requests (run_id, seq, ts, model, input_tokens, status_code) "
+                "VALUES (?, ?, '2026-01-01T00:00:00Z', 'm1', ?, 200)",
+                (run_id, seq, tokens),
+            )
+
+    resp2 = client.get(f"/runs/{run_id}")
+    assert "<svg" in resp2.text
+
+
+# ---------------------------------------------------------------------------
+# Arbitrary per-arm factors, not just `model` (dashboard bullet: "only the
+# model factor is expressible")
+# ---------------------------------------------------------------------------
+
+
+def test_arbitrary_arm_factors_are_saved_to_the_yaml():
+    resp = client.post("/experiments", data=_factor_exp_payload(), follow_redirects=False)
+    assert resp.status_code == 303
+    raw = store.read_raw("factor-exp")
+    assert "harness: claude-code" in raw
+
+
+def test_arbitrary_arm_factors_round_trip_through_a_validation_failure():
+    bad = _factor_exp_payload(name="factor-roundtrip-exp", timeout_s="not-a-number")
+    resp = client.post("/experiments", data=bad, follow_redirects=False)
+    assert resp.status_code == 400
+    # the extra factor row must survive the re-render, not just the base fields
+    assert 'value="harness"' in resp.text
+    assert 'value="claude-code"' in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Stale mock model id (dashboard bullet: "the mock model id hardcoded in
+# the form is stale")
+# ---------------------------------------------------------------------------
+
+
+def test_mock_model_id_in_form_is_not_the_stale_2024_sonnet():
+    resp = client.post(
+        "/experiments", data=_factor_exp_payload(name="mock-id-exp"), follow_redirects=False
+    )
+    assert resp.status_code == 303
+    raw = store.read_raw("mock-id-exp")
+    assert "claude-3-5-sonnet-20241022" not in raw

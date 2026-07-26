@@ -85,6 +85,61 @@ def test_status_reports_no_active_run_initially():
     assert "no active run" in result.stdout
 
 
+# --- unattributed traffic surfaced in status/end (finding 12) --------------
+
+
+def _insert_unattributed_request(ts="2026-01-01T14:02:33Z"):
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT OR IGNORE INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('unattributed', 'unattributed', NULL, '{}', '', ?)",
+            (ts,),
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('unattributed', 'unattributed', 'unattributed', '{}', 0)"
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('unattributed', 'unattributed', 'unattributed', 0, ?)",
+            (ts,),
+        )
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, status_code) VALUES ('unattributed', 1, ?, 200)",
+            (ts,),
+        )
+
+
+def test_status_reports_unattributed_requests():
+    """Regression test for finding 12: before this, a request that landed in
+    the synthetic 'unattributed' run was invisible in every CLI command --
+    a misconfigured harness produced a run with zero requests and no
+    explanation anywhere. Reverting the `_print_unattributed_notice` call in
+    `ys status` makes this fail."""
+    _insert_unattributed_request()
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "1 request(s) since 14:02" in unwrapped(result.stdout)
+    assert "could not be attributed to a run" in unwrapped(result.stdout)
+
+
+def test_status_silent_about_unattributed_when_there_are_none():
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "could not be attributed" not in result.stdout
+
+
+def test_end_reports_unattributed_requests(tmp_path):
+    exp = _write_exp(tmp_path)
+    runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    _insert_unattributed_request()
+
+    result = runner.invoke(app, ["end"])
+    assert result.exit_code == 0, result.stdout
+    assert "1 request(s) since 14:02" in unwrapped(result.stdout)
+    assert "could not be attributed to a run" in unwrapped(result.stdout)
+
+
 def test_start_then_status_shows_active_run(tmp_path):
     exp = _write_exp(tmp_path)
     result = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])

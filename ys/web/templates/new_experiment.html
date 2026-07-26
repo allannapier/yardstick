@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}yardstick -- new experiment{% endblock %}
+{% block title %}yardstick -- {{ 'edit ' + edit_name if edit_name else 'new experiment' }}{% endblock %}
 {% block content %}
 
-<h2>new experiment</h2>
+<h2>{{ 'edit ' + edit_name if edit_name else 'new experiment' }}</h2>
 
 {% if general_errors %}
 <div class="flash error">
@@ -12,18 +12,20 @@
 </div>
 {% endif %}
 
-<form method="post" action="/experiments">
+<form method="post" action="{{ '/experiments/' + edit_name + '/edit' if edit_name else '/experiments' }}">
 
   <div class="field">
     <label for="name">experiment name (used as the filename -- letters, digits, - and _ only)</label>
     <input id="name" name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="harness-vs-model-01"
-           value="{{ form_data.name if form_data else '' }}">
+           value="{{ form_data.name if form_data else '' }}" {% if edit_name %}readonly{% endif %}>
     {% if field_errors and field_errors.name %}<p class="field-error">{{ field_errors.name }}</p>{% endif %}
+    {% if not edit_name %}
     <label style="display:flex; align-items:center; gap:0.4rem; margin-top:0.4rem; font-size:0.85rem;">
       <input type="checkbox" name="confirm_overwrite" style="width:auto"
              {% if form_data and form_data.confirm_overwrite %}checked{% endif %}>
       overwrite if an experiment with this name already exists
     </label>
+    {% endif %}
   </div>
 
   <div class="field">
@@ -76,19 +78,36 @@
   <fieldset>
     <legend>arms -- what you're comparing</legend>
     {% if field_errors and field_errors.arms %}<p class="field-error">{{ field_errors.arms }}</p>{% endif %}
+    <p class="muted">Each arm always sets the <code>model</code> factor below; add further factor
+      key/value pairs (e.g. <code>harness=claude-code</code> vs <code>harness=opencode</code>) to
+      compare things other than the model -- <code>Arm.factors</code> is an arbitrary dict, not
+      just a model slot.</p>
     <div id="arm-rows">
       {% if form_data %}
         {% for a in form_data.arms %}
-        <div class="arm-row">
-          <input type="hidden" name="arm_seq" value="{{ a.seq }}">
-          <input name="arm_id" placeholder="arm id (e.g. sonnet-lean)" required value="{{ a.id }}">
-          <input name="arm_model" placeholder="model key (must match one above)" required value="{{ a.model }}">
-          <label style="display:flex; align-items:center; gap:0.3rem; white-space:nowrap;">
-            <input type="radio" name="arm_baseline" value="{{ a.seq }}" style="width:auto" {% if a.baseline %}checked{% endif %}>
-            baseline
-          </label>
-          <input name="arm_notes" placeholder="notes (optional)" value="{{ a.notes }}">
-          <button type="button" class="secondary" onclick="this.parentElement.remove()">remove</button>
+        <div class="arm-row-group" data-seq="{{ a.seq }}">
+          <div class="arm-row">
+            <input type="hidden" name="arm_seq" value="{{ a.seq }}">
+            <input name="arm_id" placeholder="arm id (e.g. sonnet-lean)" required value="{{ a.id }}">
+            <input name="arm_model" placeholder="model key (must match one above)" required value="{{ a.model }}">
+            <label style="display:flex; align-items:center; gap:0.3rem; white-space:nowrap;">
+              <input type="radio" name="arm_baseline" value="{{ a.seq }}" style="width:auto" {% if a.baseline %}checked{% endif %}>
+              baseline
+            </label>
+            <input name="arm_notes" placeholder="notes (optional)" value="{{ a.notes }}">
+            <button type="button" class="secondary" onclick="this.closest('.arm-row-group').remove()">remove</button>
+          </div>
+          <div class="factor-rows">
+            {% for f in a.extra_factors %}
+            <div class="factor-row">
+              <input type="hidden" name="factor_arm_seq" value="{{ a.seq }}">
+              <input name="factor_key" placeholder="factor key (e.g. harness)" value="{{ f.key }}">
+              <input name="factor_value" placeholder="factor value (e.g. claude-code)" value="{{ f.value }}">
+              <button type="button" class="secondary" onclick="this.parentElement.remove()">remove</button>
+            </div>
+            {% endfor %}
+          </div>
+          <button type="button" class="secondary" onclick="addFactorRow(this)">+ add factor</button>
         </div>
         {% endfor %}
       {% endif %}
@@ -102,7 +121,7 @@
     {% if field_errors and field_errors.repeats %}<p class="field-error">{{ field_errors.repeats }}</p>{% endif %}
   </div>
 
-  <button type="submit">create experiment</button>
+  <button type="submit">{{ 'save changes' if edit_name else 'create experiment' }}</button>
 </form>
 
 <template id="model-row-template">
@@ -118,15 +137,28 @@
 </template>
 
 <template id="arm-row-template">
-  <div class="arm-row">
-    <input type="hidden" name="arm_seq" value="">
-    <input name="arm_id" placeholder="arm id (e.g. sonnet-lean)" required>
-    <input name="arm_model" placeholder="model key (must match one above)" required>
-    <label style="display:flex; align-items:center; gap:0.3rem; white-space:nowrap;">
-      <input type="radio" name="arm_baseline" value="" style="width:auto">
-      baseline
-    </label>
-    <input name="arm_notes" placeholder="notes (optional)">
+  <div class="arm-row-group" data-seq="">
+    <div class="arm-row">
+      <input type="hidden" name="arm_seq" value="">
+      <input name="arm_id" placeholder="arm id (e.g. sonnet-lean)" required>
+      <input name="arm_model" placeholder="model key (must match one above)" required>
+      <label style="display:flex; align-items:center; gap:0.3rem; white-space:nowrap;">
+        <input type="radio" name="arm_baseline" value="" style="width:auto">
+        baseline
+      </label>
+      <input name="arm_notes" placeholder="notes (optional)">
+      <button type="button" class="secondary" onclick="this.closest('.arm-row-group').remove()">remove</button>
+    </div>
+    <div class="factor-rows"></div>
+    <button type="button" class="secondary" onclick="addFactorRow(this)">+ add factor</button>
+  </div>
+</template>
+
+<template id="factor-row-template">
+  <div class="factor-row">
+    <input type="hidden" name="factor_arm_seq" value="">
+    <input name="factor_key" placeholder="factor key (e.g. harness)">
+    <input name="factor_value" placeholder="factor value (e.g. claude-code)">
     <button type="button" class="secondary" onclick="this.parentElement.remove()">remove</button>
   </div>
 </template>
@@ -145,14 +177,27 @@ function addModelRow() {
 // row's `arm_seq` to know which arm (if any) was picked. Unlike the old
 // checkbox `value`, this never needs to change after creation, so there's
 // no need to keep it in sync with the arm id text as the user types.
+//
+// Extra factor rows (see the "arms" fieldset above) reuse the same join
+// key: each one carries a hidden `factor_arm_seq` set to its owning arm
+// row's `arm_seq`, so the server can group factor rows back onto the
+// right arm without nested form fields.
 let armRowSeq = {{ form_data.arms|length if form_data else 0 }};
 function addArmRow() {
   const tpl = document.getElementById('arm-row-template');
   document.getElementById('arm-rows').appendChild(tpl.content.cloneNode(true));
-  const row = document.getElementById('arm-rows').lastElementChild;
+  const group = document.getElementById('arm-rows').lastElementChild;
   const seq = String(armRowSeq++);
-  row.querySelector('input[name=arm_seq]').value = seq;
-  row.querySelector('input[name=arm_baseline]').value = seq;
+  group.dataset.seq = seq;
+  group.querySelector('input[name=arm_seq]').value = seq;
+  group.querySelector('input[name=arm_baseline]').value = seq;
+}
+function addFactorRow(button) {
+  const group = button.closest('.arm-row-group');
+  const tpl = document.getElementById('factor-row-template');
+  group.querySelector('.factor-rows').appendChild(tpl.content.cloneNode(true));
+  const row = group.querySelector('.factor-rows').lastElementChild;
+  row.querySelector('input[name=factor_arm_seq]').value = group.dataset.seq;
 }
 {% if not form_data %}
 addModelRow();
