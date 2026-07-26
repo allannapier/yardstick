@@ -1,9 +1,13 @@
 .venv/
-explore/dumps/
-explore/proxy.log
-explore/.master_key
-explore/.anthropic_key
+tools/provenance/dumps/
+tools/provenance/proxy.log
+tools/provenance/.master_key
+tools/provenance/.anthropic_key
 __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+
+# Generated website artifacts from experiment task runs (e.g. joes-shears-*),
+# not source.
+output/
