@@ -434,6 +434,8 @@ def compare(
     console.print(table)
     for warning in render.cost_warnings(comparison):
         console.print(f"[red]{warning}[/red]")
+    for warning in render.config_warnings(comparison):
+        console.print(f"[yellow]{warning}[/yellow]")
 
 
 @app.command()

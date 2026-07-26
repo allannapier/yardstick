@@ -81,6 +81,17 @@ def test_migration_4_adds_cost_source_column():
     assert "cost_source" in cols
 
 
+def test_migration_5_adds_config_snapshot_and_abandoned_columns():
+    """findings 13/14: `config_hash`/`task_json_snapshot` (finding 14) and
+    `abandoned` (finding 13) are new `runs` columns, added via
+    `_add_column_if_missing` the same way `thread_key` (migration 2) and
+    `cost_source` (migration 4) were."""
+    db.init_db()
+    with db.cursor() as cur:
+        cols = {r["name"] for r in cur.execute("PRAGMA table_info(runs)")}
+    assert {"config_hash", "task_json_snapshot", "abandoned"} <= cols
+
+
 def test_foreign_key_enforcement():
     db.init_db()
     with db.cursor() as cur:

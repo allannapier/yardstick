@@ -143,6 +143,91 @@ def test_finish_run_corrects_fingerprint_from_main_thread():
     assert run_row["system_prompt_hash"] == "sys-hash"
 
 
+# ---------------------------------------------------------------------------
+# finding 14: begin_run snapshots task_json + a config_hash onto the run row
+# itself, independent of the `experiments` row (which keeps being
+# overwritten by every `ys start`) -- see `runs.config_hash_for_arm` for
+# exactly what the hash covers and why.
+# ---------------------------------------------------------------------------
+
+def test_begin_run_snapshots_config_hash_and_task_json():
+    """Regression test for finding 14. Reverting the fix (the plain
+    `INSERT INTO runs (..., notes)` with no config_hash/task_json_snapshot
+    columns) makes this fail outright -- those columns would stay NULL."""
+    from ys import db
+
+    exp = _exp()
+    begun = runs.begin_run(exp, EXPERIMENT_YAML, "only-arm")
+    with db.cursor() as cur:
+        row = cur.execute(
+            "SELECT config_hash, task_json_snapshot FROM runs WHERE id = ?",
+            (begun.run_id,),
+        ).fetchone()
+    runs.finish_run()
+
+    expected_hash = runs.config_hash_for_arm(exp, exp.get_arm("only-arm"))
+    assert row["config_hash"] == expected_hash
+
+    import json
+
+    assert json.loads(row["task_json_snapshot"])["id"] == "t0"
+
+
+def test_config_hash_for_arm_changes_when_success_check_changes():
+    """The thing finding 14 is actually about: a changed success_check must
+    always split an arm's run history into a different group."""
+    exp_true = _exp(check="true")
+    exp_false = _exp(check="false")
+    h_true = runs.config_hash_for_arm(exp_true, exp_true.get_arm("only-arm"))
+    h_false = runs.config_hash_for_arm(exp_false, exp_false.get_arm("only-arm"))
+    assert h_true != h_false
+
+
+def test_config_hash_for_arm_changes_when_arm_model_factor_changes():
+    """The other thing finding 14 calls out by name: a changed model under
+    the same arm id must also split the group, not silently aggregate."""
+    from ys.experiment import Experiment
+
+    def exp_with_model(model):
+        return Experiment.model_validate(
+            {
+                "experiment": "e",
+                "task": {"id": "t0", "success_check": "true"},
+                "arms": [{"id": "a", "factors": {"model": model}, "baseline": True}],
+            }
+        )
+
+    exp_a = exp_with_model("model-a")
+    exp_b = exp_with_model("model-b")
+    h_a = runs.config_hash_for_arm(exp_a, exp_a.get_arm("a"))
+    h_b = runs.config_hash_for_arm(exp_b, exp_b.get_arm("a"))
+    assert h_a != h_b
+
+
+def test_config_hash_for_arm_unaffected_by_question_or_task_id_field():
+    """Deliberately coarse in the other direction: editing `question` (a
+    comment-like field with no bearing on what the agent does or how it's
+    scored) must NOT split the group -- otherwise every unrelated YAML
+    tweak would spuriously fragment an arm's comparable history."""
+    from ys.experiment import Experiment
+
+    def exp_with_question(question):
+        return Experiment.model_validate(
+            {
+                "experiment": "e",
+                "question": question,
+                "task": {"id": "t0", "success_check": "true"},
+                "arms": [{"id": "a", "factors": {}, "baseline": True}],
+            }
+        )
+
+    exp1 = exp_with_question("does X help?")
+    exp2 = exp_with_question("a completely different question, reworded")
+    h1 = runs.config_hash_for_arm(exp1, exp1.get_arm("a"))
+    h2 = runs.config_hash_for_arm(exp2, exp2.get_arm("a"))
+    assert h1 == h2
+
+
 def test_delete_run_unknown_id_raises():
     with pytest.raises(runs.RunNotFound):
         runs.delete_run("no-such-run")

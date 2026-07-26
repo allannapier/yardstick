@@ -376,7 +376,7 @@ situation finding 3 puts everyone in on their first real run.
 banner: "42 requests since 14:02 could not be attributed to a run". This is the
 single highest-value diagnostic in the app.
 
-### 13. `--force` leaves the previous run orphaned forever [by inspection]
+### 13. `--force` leaves the previous run orphaned forever [by inspection] — fixed
 
 `state.set_active(force=True)` overwrites the active slot, but nothing closes the
 run it displaced. That run keeps `ended_at`, `task_success` and `wall_clock_s`
@@ -384,10 +384,32 @@ NULL permanently. `aggregate_run_metrics` counts every run in `n_runs` regardles
 of whether it finished, so each forced start permanently depresses the arm's
 success rate.
 
-**Fix:** mark the displaced run abandoned and exclude unfinished runs from
-aggregation, reporting them separately.
+**Fix:**
 
-### 14. `compare` mixes runs from different versions of the experiment [by inspection]
+- `state.set_active` now closes the displaced run out before overwriting the
+  active slot: a new `_abandon_displaced_run` (`ys/state.py`) stamps `ended_at`/
+  `wall_clock_s` (the same way a normal `ys end` would) and sets a new
+  `abandoned` column (migration 5, `ys/db.py`) to 1, guarded by
+  `WHERE ended_at IS NULL` so a run that already finished by the time `--force`
+  runs (e.g. `ys end` won a race) is left untouched. `task_success` is
+  deliberately left NULL — the task was never actually scored, which isn't the
+  same as failing it, so a forced start still shouldn't count as a recorded
+  failure either.
+- `aggregate_run_metrics` (`ys/metrics.py`) now excludes any run whose
+  `task_success` is still NULL — covering both an `abandoned` run and one that
+  simply never got an `ys end` for any other reason — from `n_runs`/`n_success`/
+  `success_rate` entirely, instead of silently counting an unscored run against
+  the arm forever. The excluded count is reported separately as the new
+  `n_unfinished`, surfaced as an "unfinished (excluded)" row in `ys compare`'s
+  table and the HTML report (`ys/render.py`) whenever any arm has one.
+- Regression tests: `tests/test_state.py::test_force_marks_the_displaced_run_abandoned_and_closes_it_out`
+  pins the abandon behavior (and
+  `test_force_does_not_touch_a_run_that_was_already_closed` pins the
+  `ended_at IS NULL` guard); `tests/test_metrics.py::test_aggregate_run_metrics_excludes_unfinished_runs_from_n_runs`
+  proves a forced/unfinished run no longer depresses the arm's success rate
+  (reverting either fix makes its respective test fail).
+
+### 14. `compare` mixes runs from different versions of the experiment [by inspection] — fixed
 
 `render.py`'s docstring already admits this: `experiments.config_yaml` and
 `task_json` are overwritten on every `ys start`, so there is no per-run record of
@@ -399,9 +421,49 @@ The guardrail that is supposed to refuse mismatched tasks only compares today's
 YAML against the single stored row, which was itself overwritten by the most
 recent start.
 
-**Fix:** snapshot `task_json` and a hash of the config onto each run row at
-`begin_run`. Group by that hash in `compare`, use only the current group by
-default, and warn when an arm's history spans more than one.
+**Fix:**
+
+- `begin_run` (`ys/runs.py`) now snapshots `task_json` onto the run row itself
+  (`task_json_snapshot`, independent of the `experiments` row, which keeps being
+  overwritten) plus a `config_hash` (migration 5, `ys/db.py`) computed by the new
+  `runs.config_hash_for_arm`. The hash covers exactly `task` (id/repo/ref/
+  prompt_file/success_check/timeout_s) and the specific arm's own `factors`
+  (where `model` lives) — deliberately *not* the raw YAML text (a comment edit or
+  a `question:` tweak would then spuriously split an arm's history for no real
+  reason) and deliberately *not* `metrics:`/`pricing:`/`billable_weights:`/other
+  arms' `factors` (those change how a run's numbers are displayed or priced
+  after the fact, not what the agent was asked to do or how it was judged). A
+  changed `task.success_check` or a changed `factors.model` under the same arm
+  id — the two cases the finding calls out by name — always produce a different
+  hash.
+- `ys/render.py`'s `compare_experiment` groups each arm's run history by
+  `config_hash` and aggregates only the group matching today's YAML by default.
+  A run recorded under any other hash is excluded and named in the new
+  `Comparison.config_warnings` (`render.config_warnings()`, printed by `ys
+  compare` and rendered as a banner in the HTML report the same way finding 9's
+  cost-unavailable banner is) — including how many runs were excluded and
+  whether that's because the config actually changed or because the run
+  predates this fix.
+- Runs written before this fix have no `config_hash` at all (`NULL`). That group
+  is never trusted as "current" by default, even when it's the only history an
+  arm has — silently treating unverifiable old data as matching today's config
+  is exactly the failure mode this finding is about, so the arm is instead
+  reported as having no comparable data (with an explicit warning naming the
+  excluded run count) until it's run again under the new schema.
+- The previous "refuse mismatched task.id" guardrail (comparing today's YAML
+  against the single, constantly-overwritten `experiments.task_json` row) is
+  superseded by the per-arm, per-run-hash check above and has been removed.
+- Regression tests: `tests/test_render.py::test_compare_experiment_excludes_runs_from_a_different_config_version`
+  proves two config versions of the same arm no longer aggregate together, and
+  `test_compare_experiment_never_trusts_a_pre_snapshot_run_as_current` /
+  `test_compare_experiment_excludes_arm_entirely_when_no_runs_match_current_config`
+  cover the no-snapshot and all-stale edge cases (reverting the grouping fix in
+  `compare_experiment` makes all three fail); `tests/test_runs.py` pins what the
+  hash covers directly (`test_config_hash_for_arm_changes_when_success_check_changes`,
+  `test_config_hash_for_arm_changes_when_arm_model_factor_changes`,
+  `test_config_hash_for_arm_unaffected_by_question_or_task_id_field`) and that
+  `begin_run` actually snapshots both columns
+  (`test_begin_run_snapshots_config_hash_and_task_json`).
 
 ### 15–18. Declared configuration that does nothing [by inspection]
 
