@@ -138,6 +138,78 @@ def test_migrations_apply_incrementally_and_only_once(monkeypatch):
     db.init_db()
 
 
+def _insert_experiment_arm_run(conn_or_cur, exp="e1", arm="a1", run="r1"):
+    conn_or_cur.execute(
+        "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+        "VALUES (?,?,NULL,'{}','','2026-01-01')",
+        (exp, exp),
+    )
+    conn_or_cur.execute(
+        "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) VALUES (?,?,?,'{}',0)",
+        (arm, exp, arm),
+    )
+    conn_or_cur.execute(
+        "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+        "VALUES (?,?,?,0,'2026-01-01')",
+        (run, exp, arm),
+    )
+
+
+def test_unique_index_rejects_duplicate_seq():
+    """Backstop for finding 7 -- even if some future write path allocates
+    seq without holding the write lock, a collision must be rejected rather
+    than silently corrupting the seq-ordered transition chain."""
+    db.init_db()
+    with db.cursor() as cur:
+        _insert_experiment_arm_run(cur)
+        cur.execute("INSERT INTO requests (run_id, seq, ts) VALUES ('r1', 1, 't1')")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.cursor() as cur:
+            cur.execute("INSERT INTO requests (run_id, seq, ts) VALUES ('r1', 1, 't2')")
+
+
+def test_migration_3_renumbers_pre_existing_seq_duplicates_before_indexing():
+    """A database written before the collector's BEGIN IMMEDIATE fix could
+    already have real (run_id, seq) duplicates on disk -- migration 3 must
+    renumber those (preserving relative write order via the autoincrement
+    id) instead of failing to add the UNIQUE index."""
+    db.init_db()
+    conn = db.connect()
+    try:
+        conn.execute("PRAGMA user_version = 2")  # pretend migration 3 never ran
+        conn.execute("DROP INDEX idx_requests_run_seq_unique")  # ...including its index
+        _insert_experiment_arm_run(conn)
+        # two requests that raced to the same seq under the old code, plus a
+        # normal non-colliding one
+        conn.execute("INSERT INTO requests (run_id, seq, ts) VALUES ('r1', 1, 't1')")
+        conn.execute("INSERT INTO requests (run_id, seq, ts) VALUES ('r1', 1, 't2')")
+        conn.execute("INSERT INTO requests (run_id, seq, ts) VALUES ('r1', 2, 't3')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db()  # must not raise despite the pre-existing duplicate
+
+    with db.cursor() as cur:
+        rows = cur.execute(
+            "SELECT ts, seq FROM requests WHERE run_id = 'r1' ORDER BY id"
+        ).fetchall()
+    seqs = [r["seq"] for r in rows]
+    assert len(seqs) == len(set(seqs))  # de-duplicated
+    assert seqs == sorted(seqs)  # relative write order preserved
+
+    conn = db.connect()
+    try:
+        assert db.schema_version(conn) == len(db.MIGRATIONS)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO requests (run_id, seq, ts) VALUES ('r1', ?, 't4')", (seqs[0],)
+            )
+    finally:
+        conn.close()
+
+
 def test_failed_migration_rolls_back_schema_change_and_version(monkeypatch):
     """A migration that fails partway through must not leave the schema
     change applied with the version bump missing (or vice versa) -- either

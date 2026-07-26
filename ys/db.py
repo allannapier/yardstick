@@ -37,6 +37,31 @@ def _migration_2(conn: sqlite3.Connection):
     )
 
 
+_MIGRATION_3 = """
+WITH ranked AS (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq, id) AS rn
+    FROM requests
+)
+UPDATE requests SET seq = (SELECT rn FROM ranked WHERE ranked.id = requests.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_run_seq_unique ON requests(run_id, seq);
+"""
+# 3: UNIQUE(run_id, seq) backstop for finding 7 -- `_next_seq` in
+# ys/collector.py read MAX(seq) and inserted with no constraint to catch a
+# collision, so two concurrent writers (parallel tool use, a subagent) could
+# read the same max and both write it, corrupting the transition chain that
+# `_resolve_thread` orders by seq. The collector now allocates seq inside a
+# `BEGIN IMMEDIATE` transaction, which serializes writers against this same
+# database file and should make a collision impossible going forward; the
+# index is a hard backstop in case some future write path doesn't go
+# through that transaction. A database written before the collector fix may
+# already have real (run_id, seq) duplicates on disk, which would make
+# `CREATE UNIQUE INDEX` fail outright -- the ROW_NUMBER() pass above
+# renumbers every run's requests densely in (seq, id) order first, which is
+# a no-op for a run with no duplicates and preserves relative order (id,
+# the autoincrement rowid, reflects actual write order) for one that has
+# them.
+
 # Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
 # Each entry is gated by user_version, so it runs at most once per database
 # file in the normal case -- but every entry must still converge cleanly if
@@ -132,6 +157,8 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_provider_call_id ON tool_calls(run_id,
 """,
     # 2: see _migration_2 above.
     _migration_2,
+    # 3: see _MIGRATION_3 above.
+    _MIGRATION_3,
 ]
 
 

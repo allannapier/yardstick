@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import datetime
 import sqlite3
 
@@ -416,6 +417,50 @@ def test_write_does_not_stamp_fingerprint_from_a_failed_request():
         run_row = cur.execute("SELECT model FROM runs WHERE id='r'").fetchone()
 
     assert run_row["model"] == "anthropic/claude-sonnet-5"
+
+
+def test_write_seq_allocation_is_race_free_under_concurrent_writers():
+    """Regression test for finding 7: `_next_seq`'s read-then-insert used to
+    run with no lock held, so concurrent writers to the same run (parallel
+    tool use, a subagent) could read the same MAX(seq) and both insert it.
+    `_write` now allocates seq inside a `BEGIN IMMEDIATE` transaction, which
+    serializes writers against this database file -- 20 threads hammering
+    the same run must still land 20 distinct, gapless seq values.
+
+    Uses a real run id, not 'unattributed': `_ensure_run_exists` only issues
+    writes (which incidentally also acquire the write lock, even without
+    the BEGIN IMMEDIATE fix) for the 'unattributed' bucket, so that id
+    doesn't exercise the race an ordinary run hits. Verified against a
+    build of this test with the BEGIN IMMEDIATE line reverted: it reliably
+    raised `sqlite3.IntegrityError` from the UNIQUE(run_id, seq) backstop
+    well under 20 concurrent writers."""
+    db.init_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}','','2026-01-01')"
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+
+    rec = extract_record(_fake_kwargs(), FakeResponse([]), None, None)
+    n = 20
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        list(pool.map(lambda _: _write("r", rec), range(n)))
+
+    with db.cursor() as cur:
+        seqs = [
+            r["seq"]
+            for r in cur.execute("SELECT seq FROM requests WHERE run_id = 'r' ORDER BY seq")
+        ]
+    assert seqs == list(range(1, n + 1))
 
 
 # --- write retry / drop accounting ------------------------------------------
