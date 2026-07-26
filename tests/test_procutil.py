@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -67,12 +68,29 @@ def test_stop_kills_live_process(tmp_path):
     assert not procutil.alive(proc.pid)
 
 
+# `_spawn` puts this leader in a session/process group of its own
+# (start_new_session=True, exactly as launch_detached does); the child it
+# spawns here stays in that same group, because Popen without
+# start_new_session doesn't move it. The child's pid is then published
+# atomically -- write-then-rename, so the waiting test can never read a
+# half-written file. Kept in Python rather than a shell one-liner so the test
+# doesn't depend on an external `bash`.
+_LEADER_SPAWNS_CHILD = (
+    "import pathlib, subprocess, sys, time;"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+    "tmp = pathlib.Path('child.pid.tmp');"
+    "tmp.write_text(str(child.pid));"
+    "tmp.rename('child.pid');"
+    "time.sleep(60)"
+)
+
+
 def test_stop_reaches_process_group_children(tmp_path):
     pid_path, port_path = _pid_path(tmp_path)
-    # A leader that forks a child sleep in the same session/process group --
+    # A leader that spawns a child in the same session/process group --
     # mirrors launch_detached's start_new_session=True, where a plain
     # os.kill(leader_pid) never reaches anything the leader spawned.
-    proc = _spawn(["bash", "-c", "sleep 60 & echo $! > child.pid; wait"], cwd=tmp_path)
+    proc = _spawn([sys.executable, "-c", _LEADER_SPAWNS_CHILD], cwd=tmp_path)
     with open(pid_path, "w") as f:
         f.write(str(proc.pid))
     open(port_path, "w").close()
@@ -149,12 +167,21 @@ def test_stop_with_force_escalates_to_sigkill(tmp_path):
 
 
 def test_port_in_use_false_when_nothing_listening():
-    assert procutil.port_in_use(65431) is False
+    # Bind an ephemeral port but never listen on it, and hold the binding for
+    # the duration of the check: the kernel handed the port out because it was
+    # free, and keeping it bound stops anything else on a shared CI runner
+    # taking it mid-test. connect_ex against a bound-but-not-listening port
+    # still gets ECONNREFUSED, so port_in_use is False -- which is the state
+    # this is asserting, and now without a window for another process to make
+    # it flakily true.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+        assert procutil.port_in_use(port) is False
 
 
 def test_port_in_use_true_when_something_listening():
-    import socket
-
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", 0))
     server.listen(1)
