@@ -12,6 +12,14 @@
   {% else %}<span class="pill fail">fail</span>{% endif %}
 </p>
 
+{% if run.notes %}<p class="muted">notes: {{ run.notes }}</p>{% endif %}
+
+{% if factors %}
+<p class="muted">factors:
+  {% for k, v in factors.items() %}<code>{{ k }}={{ v }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+</p>
+{% endif %}
+
 {% if not active_run or active_run.run_id != run.id %}
 <form method="post" action="/runs/{{ run.id }}/delete"
       onsubmit="return confirm('delete run {{ run.id }}? this cannot be undone.');">
@@ -34,9 +42,20 @@
 </div>
 {% endif %}
 
+{% if chart_svg %}
+<h2>context tokens per turn</h2>
+{{ chart_svg | safe }}
+{% endif %}
+
+{% if run.success_output %}
+<h2>success check output</h2>
+<pre class="yaml">{{ run.success_output }}</pre>
+{% endif %}
+
 <h2>requests</h2>
 <table>
-  <tr><th>seq</th><th>model</th><th>in</th><th>cache create</th><th>cache read</th><th>out</th><th>cost</th><th>transition</th></tr>
+  <thead><tr><th>seq</th><th>model</th><th>in</th><th>cache create</th><th>cache read</th><th>out</th><th>cost</th><th>transition</th></tr></thead>
+  <tbody id="requests-body">
   {% for r in requests %}
   <tr>
     <td>{{ r.seq }}</td>
@@ -49,6 +68,7 @@
     <td>{{ r.transition or "-" }}</td>
   </tr>
   {% endfor %}
+  </tbody>
 </table>
 
 {% if tool_calls %}
@@ -63,6 +83,43 @@
   </tr>
   {% endfor %}
 </table>
+{% endif %}
+
+{% if run.ended_at is none %}
+<script>
+// Item 3 ("nothing updates during a live run"): while this run hasn't
+// finished, poll its /live endpoint and refresh the request feed in
+// place, rather than leaving this page frozen at whatever it looked like
+// on load. On the "ended" transition -- however it happened, including
+// `ys end` from another terminal -- reload once to pick up the fields
+// /live doesn't carry (success_output, notes, the full metrics card)
+// instead of duplicating this template's rendering in JS.
+(function () {
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
+    });
+  }
+  function poll() {
+    fetch("/runs/{{ run.id }}/live")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        if (data.ended) { location.reload(); return; }
+        var rows = data.requests.map(function (r) {
+          return "<tr><td>" + r.seq + "</td><td class=\"muted\">" + esc(r.model) + "</td><td>" +
+            (r.input_tokens || 0) + "</td><td>" + (r.cache_creation || 0) + "</td><td>" +
+            (r.cache_read || 0) + "</td><td>" + (r.output_tokens || 0) + "</td><td>$" +
+            (r.response_cost || 0).toFixed(4) + "</td><td>" + esc(r.transition || "-") + "</td></tr>";
+        }).join("");
+        document.getElementById("requests-body").innerHTML = rows;
+        setTimeout(poll, 3000);
+      })
+      .catch(function () { setTimeout(poll, 5000); });
+  }
+  poll();
+})();
+</script>
 {% endif %}
 
 {% endblock %}

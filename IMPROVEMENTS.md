@@ -685,24 +685,69 @@ Beyond the defects, the dashboard is thin in ways that matter:
   button.~~ **Fixed** — both replaced with a styled `<a class="btn">` (see
   `base.html`'s `a.btn` rules), so there's exactly one interactive element
   where there was a `<button>` nested inside an `<a>`.
-- **It can't see the repo's own experiments.** `store.list_experiments()` reads
+- ~~**It can't see the repo's own experiments.** `store.list_experiments()` reads
   only `~/.yardstick/experiments`, so `experiments/example.yaml` — the file the
   README tells you to use — never appears. The docs and the UI disagree about
-  where experiments live.
-- **No edit, no YAML view, no delete.** An experiment is write-once through the
-  form; any change means hand-editing a file the UI won't show you.
-- **Nothing updates during a live run.** No auto-refresh, no running token/cost
+  where experiments live.~~ **Fixed** — `store.discovery_dirs()` now also
+  searches an `experiments/` directory next to the process's current working
+  directory (read-only), indexed by the parsed `experiment:` field rather than
+  filename (a discovered file's name need not match, e.g. `example.yaml`'s
+  `experiment:` is `mock-smoke-01`). `EXPERIMENTS_DIR` stays the only directory
+  the dashboard writes to and always wins a name collision;
+  `store.experiment_path` (and hence `save_experiment`) is unchanged, so every
+  route already keyed off it keeps working — `store.find_experiment` is the new
+  read-side resolver every name-keyed route goes through instead, and it still
+  runs `validate_name` first, so a URL-supplied name can't escape into an
+  arbitrary path just because more directories are searched. An experiment
+  discovered outside `EXPERIMENTS_DIR` is shown as **read-only** (view/run/
+  compare all work; edit/delete are refused with an explanation) so the
+  dashboard can never rewrite or remove a file that's part of a git checkout.
+- ~~**No edit, no YAML view, no delete.** An experiment is write-once through the
+  form; any change means hand-editing a file the UI won't show you.~~ **Fixed**
+  — `/experiments/{name}/yaml` renders `store.read_raw` (previously unused);
+  `/experiments/{name}/edit` reuses the same form defects 20/22/24 reworked,
+  pre-filled from the current definition; `/experiments/{name}/delete` removes
+  the YAML after a confirmation that names the recorded run count (defect 21's
+  house style) and explains that those runs are *not* deleted, just unreachable
+  from the dashboard until a same-named experiment exists again. All three are
+  refused for a discovered, non-`EXPERIMENTS_DIR` experiment (see above).
+- ~~**Nothing updates during a live run.** No auto-refresh, no running token/cost
   counter, no request feed. During the one phase where the user is watching, the
-  dashboard is a static page.
-- **The comparison view escapes the app.** `/experiments/{name}/compare` returns
-  the standalone report document with no shell and no way back.
-- **Run detail omits the useful parts**: no `success_output` (the check's own
+  dashboard is a static page.~~ **Fixed** — a small `/runs/{run_id}/live` JSON
+  endpoint (request count, turns, cost, billable tokens, per-request rows) is
+  polled every few seconds: from the active-run banner on every page (running
+  request/token/cost counters), and from `run_detail.html` itself while that
+  run hasn't ended (the request table refreshes in place; the page reloads
+  once on the ended transition to pick up the fields `/live` doesn't carry).
+  Dependency-free — small inline JS, no build step, no client library, matching
+  the rest of the dashboard.
+- ~~**The comparison view escapes the app.** `/experiments/{name}/compare` returns
+  the standalone report document with no shell and no way back.~~ **Fixed** —
+  embedded inside the app shell (`compare.html`, with a back-to-experiment link)
+  instead of forking the renderer. `render.render_html` gained a minimal
+  `standalone=False` seam (splits the existing body markup from its wrapping
+  `<title>`/`<style>`, default unchanged for `ys report --html`) so the
+  dashboard can embed just the fragment rather than nesting one HTML document's
+  `<title>`/`<style>` inside another's `<body>`.
+- ~~**Run detail omits the useful parts**: no `success_output` (the check's own
   output, the first thing you want when a run fails), no notes, no factors, no
-  per-turn chart.
-- **Only the `model` factor is expressible** in the new-experiment form, though
+  per-turn chart.~~ **Fixed** — all four now render on `/runs/{run_id}`:
+  `success_output` and `notes` straight from the `runs` row, `factors` from the
+  arm's `factors_json`, and a per-turn context-tokens chart as plain inline SVG
+  (hand-rolled, the same weight as `render.py`'s own `_sparkline_svg` — no
+  charting library) once a run has at least two main-thread requests recorded.
+- ~~**Only the `model` factor is expressible** in the new-experiment form, though
   `Arm.factors` is an arbitrary dict — so the harness-vs-harness comparison the
-  tool is named for can't be set up from the UI at all.
-- The mock model id hardcoded in the form (`claude-3-5-sonnet-20241022`) is stale.
+  tool is named for can't be set up from the UI at all.~~ **Fixed** — each arm
+  row in the form can now carry arbitrary extra factor key/value pairs (e.g.
+  `harness=claude-code` vs `harness=opencode`) alongside the dedicated `model`
+  field, joined back to their arm by the same stable `arm_seq` the baseline
+  radio group (defect 24) already uses. The extra-factor rows round-trip
+  through a validation failure the same way the rest of the form does.
+- ~~The mock model id hardcoded in the form (`claude-3-5-sonnet-20241022`) is
+  stale.~~ **Fixed** — updated to a current model id (it never reaches
+  Anthropic either way, since `mock_response` short-circuits it, but the form
+  shouldn't teach a dead id by example).
 
 And on the CLI side: there is no `ys runs list`. Runs can be deleted by id but
 never enumerated, so the only way to find an id is the dashboard or raw SQL.

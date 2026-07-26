@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}yardstick -- {{ experiment.experiment }} yaml{% endblock %}
+{% block content %}
+
+<div class="row" style="justify-content: space-between; margin-top: 1.5rem;">
+  <h2 style="margin-top:0">{{ experiment.experiment }} -- yaml</h2>
+  <a href="/experiments/{{ experiment.experiment }}" class="btn secondary">&larr; back to experiment</a>
+</div>
+
+{% if not managed %}
+<p class="muted">read-only: this file lives outside the dashboard's own experiments directory.
+  Use <a href="/experiments/{{ experiment.experiment }}/edit">edit</a> from the experiment page if
+  it's one the dashboard manages, or edit the file directly otherwise.</p>
+{% else %}
+<p><a href="/experiments/{{ experiment.experiment }}/edit" class="btn secondary">edit</a></p>
+{% endif %}
+
+<pre class="yaml">{{ raw }}</pre>
+
+{% endblock %}

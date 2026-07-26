@@ -307,7 +307,15 @@ def _compaction_timeline_svg(cur, run_id: str, width: int = 240, height: int = 2
     return f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}">' + "".join(marks) + "</svg>"
 
 
-def render_html(comparison: Comparison, cur) -> str:
+def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
+    """Render `comparison` as HTML. `standalone=True` (the default, used by
+    `ys report --html`) wraps the table/charts in their own `<title>` and
+    `<style>` so the result is a complete document. The dashboard's
+    `/experiments/{name}/compare` route (ys/web/app.py) embeds this inside
+    its own page shell instead of forking the renderer, so it passes
+    `standalone=False` to get just the body fragment -- avoiding a second,
+    conflicting `body { ... }` rule landing in the middle of that page.
+    """
     rows_html = []
     baseline = next((a for a in comparison.arms if a.is_baseline), None)
 
@@ -380,6 +388,16 @@ def render_html(comparison: Comparison, cur) -> str:
                 f'<div class="chart-label">transition timeline</div>{timeline}</div>'
             )
 
+    body = f"""<h1>{html.escape(comparison.experiment_name)}</h1>
+<p>task: {html.escape(comparison.task_id)} &middot; repeats: {comparison.repeats} &middot; (*) baseline</p>
+{warnings_html}
+<table><tr><th></th>{header_cells}</tr>{''.join(rows_html)}</table>
+<h2>per-run detail</h2>
+<div class="chart-grid">{''.join(charts_html)}</div>
+"""
+    if not standalone:
+        return body
+
     return f"""<title>{html.escape(comparison.experiment_name)} -- yardstick report</title>
 <style>
   :root {{ color-scheme: light dark; }}
@@ -397,10 +415,4 @@ def render_html(comparison: Comparison, cur) -> str:
   .cost-warning {{ border: 2px solid #e0555f; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; color: #e0555f; }}
   .cost-warning ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
 </style>
-<h1>{html.escape(comparison.experiment_name)}</h1>
-<p>task: {html.escape(comparison.task_id)} &middot; repeats: {comparison.repeats} &middot; (*) baseline</p>
-{warnings_html}
-<table><tr><th></th>{header_cells}</tr>{''.join(rows_html)}</table>
-<h2>per-run detail</h2>
-<div class="chart-grid">{''.join(charts_html)}</div>
-"""
+{body}"""
