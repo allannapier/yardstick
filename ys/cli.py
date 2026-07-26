@@ -203,6 +203,7 @@ HEADLINE_METRICS = [
     "redundant_tool_calls",
     "compaction_events",
     "background_requests",
+    "background_tokens",
     "active_s",
 ]
 

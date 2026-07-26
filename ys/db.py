@@ -23,10 +23,10 @@ def _migration_2(conn: sqlite3.Connection):
     run, each its own much shorter, unrelated message history. Without a way
     to tell them apart, transition classification, turn counts, and the
     run's fingerprint were all computed against whichever request happened
-    to land next in seq order. thread_key (derived in ys/collector.py from
-    the system prompt hash plus a hash of the first non-system message) lets
-    metrics scope themselves to the run's actual driving conversation. See
-    finding 4 in IMPROVEMENTS.md."""
+    to land next in seq order. thread_key (assigned in ys/collector.py by
+    chain-following each request to the most recent same-system-prompt
+    request it plausibly continues) lets metrics scope themselves to the
+    run's actual driving conversation. See finding 4 in IMPROVEMENTS.md."""
     _add_column_if_missing(conn, "requests", "thread_key", "TEXT")
     _add_column_if_missing(conn, "requests", "toolset_hash", "TEXT")
     _add_column_if_missing(conn, "requests", "system_prompt_hash", "TEXT")

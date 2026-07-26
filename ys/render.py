@@ -26,6 +26,7 @@ SECONDARY_METRICS = [
     "context_high_water",
     "compaction_events",
     "background_requests",
+    "background_tokens",
 ]
 
 

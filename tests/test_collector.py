@@ -325,6 +325,60 @@ def test_write_scopes_transitions_within_a_thread_not_across_interleaved_traffic
     assert rows[2]["thread_key"] != rows[0]["thread_key"]
 
 
+def test_write_thread_survives_a_compaction_that_rewrites_the_anchor_message():
+    """A harness-side compaction summarizes/rewrites the early history --
+    including whatever message an anchor-based thread key would have
+    pinned on. thread_key must be assigned by chain-following (does this
+    request's history plausibly extend the thread's last request?), not by
+    re-hashing a fixed anchor, or a legitimate compaction would be
+    misclassified as the start of a brand new thread and its metrics
+    would silently fall out of the main conversation."""
+    db.init_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('e','e',NULL,'{}','','2026-01-01')"
+        )
+        cur.execute(
+            "INSERT INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('a','e','a','{}',0)"
+        )
+        cur.execute(
+            "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('r','e','a',0,'2026-01-01')"
+        )
+
+    system = "You are a coding agent."
+    turn1 = [{"role": "user", "content": "please fix the bug"}]
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "looking into it"},
+        {"role": "user", "content": "any luck?"},
+    ]
+    # compaction: the original first message is gone, replaced by a summary
+    # -- an anchor-hash-based thread_key would see this as unrelated to
+    # turn1/turn2's anchor and start a new thread.
+    turn3_compacted = [
+        {"role": "user", "content": "summary: fixing a bug, made progress"},
+        {"role": "user", "content": "keep going"},
+    ]
+
+    def emit(messages):
+        rec = extract_record(_fake_kwargs(system=system, messages=messages), FakeResponse([]), None, None)
+        _write("r", rec)
+
+    emit(turn1)
+    emit(turn2)
+    emit(turn3_compacted)
+
+    with db.cursor() as cur:
+        rows = cur.execute(
+            "SELECT seq, transition, thread_key FROM requests WHERE run_id='r' ORDER BY seq"
+        ).fetchall()
+
+    assert rows[2]["transition"] == "compaction"
+    assert rows[2]["thread_key"] == rows[0]["thread_key"] == rows[1]["thread_key"]
+
+
 def test_write_does_not_stamp_fingerprint_from_a_failed_request():
     """A harness's rejected/throwaway first call (e.g. opencode's title-gen
     ping hitting a model the proxy doesn't recognise) must not permanently

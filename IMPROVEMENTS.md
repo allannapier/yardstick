@@ -125,14 +125,21 @@ then flags arms `UNCONTROLLED` essentially at random.
 It also inflates `turns` (a background title generation is not a turn) and
 distorts `overhead_tokens_per_turn`, which extrapolates from request 0 alone.
 
-**Fix:** added a `thread_key` column to `requests`, derived in
-`collector._thread_key` from the system prompt hash plus a hash of the first
-non-system message — background/subagent calls get a different system prompt,
-task instruction, or both, so they land in a different thread even when
-interleaved mid-run. `_write` now classifies each request's transition against
-the last request in the *same* thread (`collector._last_msg_hashes`), so an
-interleaved background call can no longer fabricate a compaction/reset event
-or break the main thread's continuation chain.
+**Fix:** added a `thread_key` column to `requests`, assigned in
+`collector._resolve_thread` by chain-following: a request joins the thread
+whose most recent request shares its system prompt *and* is a plausible
+parent per `_classify_transition` (continuation, compaction, or branch —
+anything but "reset"); no match starts a new thread. This was originally a
+static hash of the system prompt plus the first non-system message, which
+broke on the exact case the fix exists for — a harness-side compaction that
+summarizes/rewrites that first message would have looked like the start of a
+brand new thread instead of a continuation of the real one. Chain-following
+doesn't have that failure mode: a compaction is explicitly not a "reset", so
+it still resolves to the same thread. Background/subagent calls, which get a
+different system prompt, task instruction, or both, still correctly land in
+their own thread even when interleaved mid-run — an interleaved background
+call can no longer fabricate a compaction/reset event or break the main
+thread's continuation chain.
 
 `ys/metrics.py` computes turns, overhead, tool-call, redundancy, compaction,
 and context-growth/cache-reuse metrics over the run's largest thread only

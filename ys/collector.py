@@ -9,6 +9,7 @@ import hashlib
 import json
 import time
 import traceback
+import uuid
 
 from litellm.integrations.custom_logger import CustomLogger
 
@@ -78,27 +79,64 @@ def _classify_transition(prev: list, cur: list) -> str:
     return "reset"
 
 
-def _thread_anchor_hash(messages) -> str:
-    """Hash of the first non-system message in a request's history: the
-    stable anchor that identifies which conversation a request belongs to.
-    Claude Code interleaves the main conversation with background
+def _shared_prefix_len(prev: list, cur: list) -> int:
+    k = 0
+    for a, b in zip(prev, cur):
+        if a == b:
+            k += 1
+        else:
+            break
+    return k
+
+
+def _resolve_thread(cur, run_id: str, system_prompt_hash, msg_hashes: list) -> tuple:
+    """Assigns a request to a thread and classifies its transition within
+    that thread in one pass, so transition classification and conversation
+    metrics aren't computed across unrelated interleaved traffic (finding
+    4): Claude Code interleaves the main conversation with background
     (title-generation) requests and Task-subagent conversations in the same
-    run; each has its own distinct anchor even on the turns where the
-    surrounding system prompt happens to match."""
-    for m in messages or []:
-        if isinstance(m, dict) and m.get("role") != "system":
-            return _sha256(_canonical(m))
-    return ""
+    run, each its own unrelated, much shorter history.
 
+    A request joins the thread whose most recent request (a) shares this
+    request's system prompt and (b) is a plausible parent of this request's
+    history per _classify_transition -- continuation, compaction, or
+    branch, anything but "reset". Chain-following like this, rather than
+    hashing a fixed anchor message (an earlier version of this function),
+    is what lets a genuine harness-side compaction -- which rewrites/
+    summarizes the early history, including whatever message a fixed
+    anchor would have pinned on -- still resolve to the same thread instead
+    of registering as a new one. Ties go to the larger shared-message-
+    prefix match. No candidate (or an empty run) starts a new thread.
+    """
+    rows = cur.execute(
+        """
+        SELECT r.thread_key, r.system_prompt_hash, r.msg_hashes_json
+        FROM requests r
+        JOIN (
+            SELECT thread_key, MAX(seq) AS max_seq FROM requests
+            WHERE run_id = ? GROUP BY thread_key
+        ) latest ON r.thread_key IS latest.thread_key AND r.seq = latest.max_seq
+        WHERE r.run_id = ?
+        """,
+        (run_id, run_id),
+    ).fetchall()
 
-def _thread_key(system_prompt_hash, messages) -> str:
-    """Groups requests into the conversation they actually belong to, so
-    transition classification and conversation metrics aren't computed
-    across unrelated interleaved threads (finding 4). Not guaranteed stable
-    across a harness-side compaction that rewrites the first message -- see
-    _classify_transition, which is the piece that actually detects that
-    case within a thread."""
-    return _sha256(f"{system_prompt_hash or ''}|{_thread_anchor_hash(messages)}")
+    best = None  # (overlap, thread_key, transition)
+    for row in rows:
+        if row["system_prompt_hash"] != system_prompt_hash:
+            continue
+        prev_hashes = json.loads(row["msg_hashes_json"]) if row["msg_hashes_json"] else []
+        transition = _classify_transition(prev_hashes, msg_hashes)
+        if transition is None or transition == "reset":
+            continue
+        overlap = _shared_prefix_len(prev_hashes, msg_hashes)
+        if best is None or overlap > best[0]:
+            best = (overlap, row["thread_key"], transition)
+
+    if best is not None:
+        return best[1], best[2]
+
+    return _sha256(f"{system_prompt_hash or ''}|{uuid.uuid4().hex}"), None
 
 
 def _safe_token_count(model: str, text: str) -> int:
@@ -144,20 +182,6 @@ def _next_seq(cur, run_id: str) -> int:
         "SELECT COALESCE(MAX(seq), 0) AS m FROM requests WHERE run_id = ?", (run_id,)
     ).fetchone()
     return (row["m"] or 0) + 1
-
-
-def _last_msg_hashes(cur, run_id: str, thread_key: str):
-    """Scoped to (run_id, thread_key) so an interleaved background or
-    subagent request never becomes the "previous" request a main-thread
-    turn is classified against, and vice versa (finding 4)."""
-    row = cur.execute(
-        "SELECT msg_hashes_json FROM requests WHERE run_id = ? AND thread_key IS ? "
-        "ORDER BY seq DESC LIMIT 1",
-        (run_id, thread_key),
-    ).fetchone()
-    if not row or not row["msg_hashes_json"]:
-        return []
-    return json.loads(row["msg_hashes_json"])
 
 
 def _ensure_run_exists(cur, run_id: str):
@@ -247,7 +271,6 @@ def extract_record(kwargs: dict, response_obj, start_time, end_time) -> dict:
         "toolset_hash": _sha256(_canonical(tools)) if tools else None,
         "tool_count": len(tools) if isinstance(tools, list) else 0,
         "system_prompt_hash": system_prompt_hash,
-        "thread_key": _thread_key(system_prompt_hash, messages),
     }
 
 
@@ -325,8 +348,9 @@ def _write(run_id: str, rec: dict):
             run_id = "unattributed"
         _ensure_run_exists(cur, run_id)
         seq = _next_seq(cur, run_id)
-        prev_hashes = _last_msg_hashes(cur, run_id, rec["thread_key"])
-        transition = _classify_transition(prev_hashes, rec["msg_hashes"])
+        thread_key, transition = _resolve_thread(
+            cur, run_id, rec["system_prompt_hash"], rec["msg_hashes"]
+        )
 
         cur.execute(
             """INSERT INTO requests
@@ -356,7 +380,7 @@ def _write(run_id: str, rec: dict):
                 rec["system_tokens"],
                 rec["tools_tokens"],
                 transition,
-                rec["thread_key"],
+                thread_key,
                 rec["toolset_hash"],
                 rec["system_prompt_hash"],
             ),
