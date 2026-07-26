@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 from ys import db
 
 
@@ -26,9 +30,6 @@ def test_foreign_key_enforcement():
             "INSERT INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
             "VALUES ('r1','e1','a1',0,'2026-01-01')"
         )
-
-    import pytest
-    import sqlite3
 
     with pytest.raises(sqlite3.IntegrityError):
         with db.cursor() as cur:
@@ -95,3 +96,28 @@ def test_migrations_apply_incrementally_and_only_once(monkeypatch):
     # already at the latest version -- must not attempt to re-run the ALTER
     # TABLE, which would raise "duplicate column name"
     db.init_db()
+
+
+def test_failed_migration_rolls_back_schema_change_and_version(monkeypatch):
+    """A migration that fails partway through must not leave the schema
+    change applied with the version bump missing (or vice versa) -- either
+    both land or neither does, so a retry sees a clean starting point."""
+    db.init_db()
+
+    monkeypatch.setattr(
+        db,
+        "MIGRATIONS",
+        db.MIGRATIONS
+        + ["ALTER TABLE runs ADD COLUMN broken_col TEXT; SELECT this_is_not_a_real_column;"],
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        db.init_db()
+
+    conn = db.connect()
+    try:
+        assert db.schema_version(conn) == len(db.MIGRATIONS) - 1
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+        assert "broken_col" not in cols
+    finally:
+        conn.close()

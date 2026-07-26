@@ -5,13 +5,14 @@ from contextlib import contextmanager
 from ys import paths
 
 # Ordered migrations, applied in `init_db()` against `PRAGMA user_version`.
-# Each entry is executed at most once per database file, in order, and never
-# edited after release — a schema change (new table, new column) is a new
-# entry appended to this list, not an edit to an earlier one. Entries must be
-# idempotent-safe to replay (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF
-# NOT EXISTS`) so that a database created before migrations existed, which
-# has all these tables but `user_version = 0`, converges to the same state
-# as a fresh one instead of erroring on migration 1.
+# Each entry is gated by user_version, so it runs at most once per database
+# file — new entries do not need to be replay-safe. Migration 1 is the one
+# exception: a database created before this file existed already has every
+# one of these tables but `user_version = 0`, so its `CREATE TABLE IF NOT
+# EXISTS` / `CREATE INDEX IF NOT EXISTS` guards are what let it converge to
+# the same state as a fresh database instead of erroring. A schema change
+# (new table, new column) is a new entry appended to this list; earlier
+# entries are never edited after release.
 MIGRATIONS: list[str] = [
     # 1: initial schema
     """
@@ -110,14 +111,17 @@ def schema_version(conn: sqlite3.Connection) -> int:
 
 def init_db():
     conn = connect()
+    conn.isolation_level = None  # manual transaction control: each migration's schema change and version bump commit as one atomic unit
     try:
         current = schema_version(conn)
         for version, script in enumerate(MIGRATIONS, start=1):
             if version <= current:
                 continue
-            conn.executescript(script)
-            conn.execute(f"PRAGMA user_version = {version}")
-            conn.commit()
+            try:
+                conn.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {version};\nCOMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
     finally:
         conn.close()
 

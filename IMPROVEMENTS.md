@@ -194,7 +194,7 @@ corrupts the transition chain.
 transaction, and retry on conflict. Consider ordering by the autoincrement `id`
 and treating `seq` as a derived presentation value.
 
-### 8. No schema versioning [verified] — fixed on this branch
+### 8. No schema versioning [verified] — fixed
 
 The schema was applied with `CREATE TABLE IF NOT EXISTS` and nothing else. Every
 fix in this document that adds a column (`thread_key`, `cost_source`,
