@@ -228,6 +228,12 @@ def finish_run(manual_score: Optional[float] = None) -> FinishResult:
     # traceback (finding 28).
     db.call_with_retry(_with_cursor, _write_ended)
 
+    # Finding 11: record the drain-window fallback before clearing the
+    # active-run slot, so a request racing these two writes -- or arriving
+    # in the (short) gap between them -- still has `state.get_draining_run`
+    # to fall back to; `clear_active` still runs unconditionally right after
+    # so `ys status`/the next `ys start` see the slot free immediately.
+    state.mark_ended(run_id, active["experiment"], active["arm"], ended_at)
     state.clear_active()
 
     summary_metrics = {}
@@ -306,3 +312,29 @@ def delete_run(run_id: str) -> DeleteResult:
 
     arm_id = arm_row.split("::", 1)[1] if "::" in arm_row else arm_row
     return DeleteResult(run_id=run_id, experiment_name=experiment_name, arm_id=arm_id)
+
+
+@dataclass
+class UnattributedSummary:
+    count: int
+    since: Optional[str]  # "HH:MM" (UTC) of the earliest unattributed request, or None if count == 0
+
+
+def unattributed_summary() -> UnattributedSummary:
+    """A request the collector can't attribute to a real run -- no
+    `x-ys-run` header, no active-run file, and (finding 11) outside the
+    drain window of the run that most recently ended -- lands in the
+    synthetic 'unattributed' run (`ys/collector.py`'s `_resolve_run_id`/
+    `_ensure_run_exists`). Before this, nothing surfaced that anywhere: a
+    misconfigured harness produced a run with zero requests and no
+    explanation in the CLI or the dashboard -- exactly the situation
+    finding 3 puts everyone in on their first real run. `ys status`/`ys end`
+    print this so it's visible instead of silently invisible (finding 12).
+    """
+    with db.cursor() as cur:
+        row = cur.execute(
+            "SELECT COUNT(*) AS c, MIN(ts) AS earliest FROM requests WHERE run_id = 'unattributed'"
+        ).fetchone()
+    count = row["c"] or 0
+    since = row["earliest"][11:16] if count and row["earliest"] else None
+    return UnattributedSummary(count=count, since=since)

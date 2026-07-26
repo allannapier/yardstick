@@ -274,3 +274,62 @@ def test_begin_run_gives_up_after_exhausting_retries_on_a_persistent_lock(monkey
         runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
 
     assert state.get_active() is None
+
+
+# --- drain window on finish (finding 11) ------------------------------------
+
+
+def test_finish_run_leaves_a_draining_record_behind_for_stragglers():
+    """`finish_run` must record the ended run via `state.mark_ended` (finding
+    11), not just clear active.json -- otherwise a request landing right
+    after `ys end` (see ys/collector.py's `_resolve_run_id`) has no
+    attribution signal left and falls into 'unattributed'. Reverting
+    finish_run to skip the `state.mark_ended` call makes this fail."""
+    begun = runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
+    runs.finish_run()
+
+    draining = state.get_draining_run()
+    assert draining is not None
+    assert draining["run_id"] == begun.run_id
+    # the active slot is still freed immediately, unaffected by the drain
+    # record living in its own separate file
+    assert state.get_active() is None
+
+
+# --- unattributed traffic (finding 12) --------------------------------------
+
+
+def test_unattributed_summary_reports_zero_with_no_unattributed_requests():
+    summary = runs.unattributed_summary()
+    assert summary.count == 0
+    assert summary.since is None
+
+
+def test_unattributed_summary_counts_requests_and_reports_earliest_time():
+    from ys import db
+
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT OR IGNORE INTO experiments (id, name, question, task_json, config_yaml, created_at) "
+            "VALUES ('unattributed', 'unattributed', NULL, '{}', '', '2026-01-01T14:02:33Z')"
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO arms (id, experiment_id, label, factors_json, is_baseline) "
+            "VALUES ('unattributed', 'unattributed', 'unattributed', '{}', 0)"
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO runs (id, experiment_id, arm_id, repeat_idx, started_at) "
+            "VALUES ('unattributed', 'unattributed', 'unattributed', 0, '2026-01-01T14:02:33Z')"
+        )
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, status_code) "
+            "VALUES ('unattributed', 1, '2026-01-01T14:02:33Z', 200)"
+        )
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, status_code) "
+            "VALUES ('unattributed', 2, '2026-01-01T15:00:00Z', 200)"
+        )
+
+    summary = runs.unattributed_summary()
+    assert summary.count == 2
+    assert summary.since == "14:02"

@@ -20,6 +20,7 @@ def isolated_yardstick_home(monkeypatch, tmp_path):
         paths, "DROPPED_LOG_PATH", os.path.join(str(home), "dropped_requests.jsonl")
     )
     monkeypatch.setattr(paths, "ACTIVE_RUN_PATH", os.path.join(str(home), "active.json"))
+    monkeypatch.setattr(paths, "LAST_ENDED_RUN_PATH", os.path.join(str(home), "last_ended.json"))
     monkeypatch.setattr(paths, "PROXY_CONFIG_PATH", os.path.join(str(home), "proxy_config.yaml"))
     monkeypatch.setattr(paths, "PROXY_PID_PATH", os.path.join(str(home), "proxy.pid"))
     monkeypatch.setattr(paths, "PROXY_PORT_PATH", os.path.join(str(home), "proxy.port"))
