@@ -21,8 +21,19 @@ from ys import metrics
 from ys.experiment import Experiment
 from ys.runs import config_hash_for_arm
 
-PRIMARY_METRICS = ["cost_usd", "billable_tokens", "turns", "wall_clock_s"]
-SECONDARY_METRICS = [
+# Fallbacks used when an experiment's `metrics:` block doesn't declare
+# `primary`/`secondary`/`derived` (the default, empty lists) -- finding
+# 15-18: these used to be the *only* lists this module consulted, so a
+# carefully hand-written `metrics:` block in the YAML had no effect at all.
+# `compare_experiment` now prefers the experiment's declared lists and only
+# falls back to these, so existing YAMLs that already spell out the same
+# names (both files under experiments/) see no change in what's displayed,
+# but a YAML that declares something different now actually changes the
+# table/report. There is no DEFAULT_DERIVED_METRICS -- before finding
+# 15-18, nothing was ever displayed as "derived", so an experiment that
+# doesn't declare `metrics.derived` keeps seeing exactly that (empty).
+DEFAULT_PRIMARY_METRICS = ["cost_usd", "billable_tokens", "turns", "wall_clock_s"]
+DEFAULT_SECONDARY_METRICS = [
     "tool_calls",
     "redundant_tool_calls",
     "tool_error_rate",
@@ -65,6 +76,45 @@ class Comparison:
     # by `ys compare`/rendered in the HTML report the same way
     # `cost_warnings` is: prominently, not as a footnote.
     config_warnings: list = field(default_factory=list)
+    # Resolved from `experiment.metrics.primary`/`.secondary`/`.derived`
+    # (falling back to the DEFAULT_* lists above when undeclared) -- finding
+    # 15-18. `build_table`/`render_html` iterate `display_metrics()` instead
+    # of a hardcoded list, so a declared `metrics:` block actually changes
+    # what gets displayed.
+    primary_metrics: list = field(default_factory=lambda: list(DEFAULT_PRIMARY_METRICS))
+    secondary_metrics: list = field(default_factory=lambda: list(DEFAULT_SECONDARY_METRICS))
+    derived_metrics: list = field(default_factory=list)
+
+    def display_metrics(self) -> list:
+        """primary + secondary + derived, de-duplicated in that order and
+        with `cost_per_success` dropped -- it's a valid metric name (an
+        experiment can legitimately list it, see experiments/*.yaml's
+        `derived:` block) but it's an aggregate-level ratio already
+        rendered as its own fixed row above, not a per-run mean/spread, so
+        repeating it in the generic metric-row loop would just print a
+        bare '-' for it."""
+        seen = set()
+        out = []
+        for key in self.primary_metrics + self.secondary_metrics + self.derived_metrics:
+            if key == "cost_per_success" or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+
+def _resolve_metric_list(declared_metrics, field_name: str, default: list) -> list:
+    """`experiment.metrics.<field_name>` if the YAML actually declared that
+    field, else `default`. A plain `value or default` fallback can't tell
+    "the user wrote `secondary: []` on purpose, to show nothing there"
+    apart from "the user never wrote a `secondary:` key at all" -- both
+    parse to the same empty list. `model_fields_set` (populated by pydantic
+    from the raw dict this sub-model was built from, independent of the
+    parent) is what actually distinguishes them, so an explicit empty list
+    is honoured instead of silently falling back to the default."""
+    if field_name in declared_metrics.model_fields_set:
+        return list(getattr(declared_metrics, field_name))
+    return list(default)
 
 
 def _arm_row_id(experiment_name: str, arm_id: str) -> str:
@@ -177,6 +227,14 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
         key: weights.model_dump() for key, weights in experiment.billable_weights.items()
     }
 
+    # Finding 15-18: previously `aggregate_run_metrics` hardcoded the
+    # task_success gate regardless of `metrics.gate`. `Experiment` already
+    # validated the name against `VALID_GATE_NAMES` at YAML-load time, so
+    # this can't raise on a well-formed `Experiment` -- but `resolve_gate`
+    # still checks, rather than trusting that every caller went through
+    # pydantic first.
+    gate = metrics.resolve_gate(experiment.metrics.gate)
+
     results = []
     warnings = []
     for arm in experiment.arms:
@@ -195,7 +253,7 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
             continue
 
         aggregate = metrics.aggregate_run_metrics(
-            cur, run_ids, billable_weights_by_model=billable_weights_by_model
+            cur, run_ids, gate=gate, billable_weights_by_model=billable_weights_by_model
         )
         results.append(
             ArmResult(
@@ -223,6 +281,9 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
         repeats=experiment.repeats,
         arms=results,
         config_warnings=warnings,
+        primary_metrics=_resolve_metric_list(experiment.metrics, "primary", DEFAULT_PRIMARY_METRICS),
+        secondary_metrics=_resolve_metric_list(experiment.metrics, "secondary", DEFAULT_SECONDARY_METRICS),
+        derived_metrics=_resolve_metric_list(experiment.metrics, "derived", []),
     )
 
 
@@ -274,6 +335,27 @@ def cost_warnings(comparison: Comparison) -> list:
     return lines
 
 
+def repeat_count_warnings(comparison: Comparison) -> list:
+    """Finding 15-18: `repeats:` is advisory -- nothing checked that every
+    arm actually ended up with the same number of recorded runs. An arm
+    with 7 runs and another with 1 still print as an ordinary mean +/-
+    spread pair, with nothing in the table itself signalling that the two
+    numbers don't rest on comparable sample sizes. Returns one line per arm
+    only when the arms *disagree* with each other -- if every arm is short
+    by the same amount (e.g. nobody's gotten past repeat 1 yet), that's a
+    less misleading state than one arm racing ahead of the rest, so it's
+    not flagged."""
+    counts = {arm.label: arm.aggregate["n_runs"] for arm in comparison.arms}
+    if len(set(counts.values())) <= 1:
+        return []
+    return [
+        f"arm '{label}' has {n} recorded run(s) (experiment declares repeats: "
+        f"{comparison.repeats}) -- arms in this comparison don't have equal sample "
+        "sizes, so the means/spreads above are not an apples-to-apples comparison."
+        for label, n in counts.items()
+    ]
+
+
 def build_table(comparison: Comparison):
     from rich.table import Table
 
@@ -313,7 +395,7 @@ def build_table(comparison: Comparison):
         ],
     )
 
-    for key in PRIMARY_METRICS + SECONDARY_METRICS:
+    for key in comparison.display_metrics():
         row = [key]
         base_mean = baseline.aggregate["metrics"].get(key, {}).get("mean") if baseline else None
         for arm in comparison.arms:
@@ -447,9 +529,7 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
         )
         + "</tr>"
     )
-    for key in PRIMARY_METRICS:
-        rows_html.append(metric_row(key))
-    for key in SECONDARY_METRICS:
+    for key in comparison.display_metrics():
         rows_html.append(metric_row(key))
 
     warnings = cost_warnings(comparison)
@@ -465,6 +545,14 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
         config_warnings_html = (
             f'<div class="cost-warning"><strong>Some runs excluded (config changed)</strong>'
             f"<ul>{items}</ul></div>"
+        )
+
+    repeat_warnings = repeat_count_warnings(comparison)
+    repeat_warnings_html = ""
+    if repeat_warnings:
+        items = "".join(f"<li>{html.escape(w)}</li>" for w in repeat_warnings)
+        repeat_warnings_html = (
+            f'<div class="repeat-warning"><strong>Unequal repeats</strong><ul>{items}</ul></div>'
         )
 
     charts_html = []
@@ -483,6 +571,7 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
 <p>task: {html.escape(comparison.task_id)} &middot; repeats: {comparison.repeats} &middot; (*) baseline</p>
 {warnings_html}
 {config_warnings_html}
+{repeat_warnings_html}
 <table><tr><th></th>{header_cells}</tr>{''.join(rows_html)}</table>
 <h2>per-run detail</h2>
 <div class="chart-grid">{''.join(charts_html)}</div>
@@ -506,5 +595,7 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
   .chart-label {{ font-size: 0.75rem; color: #888; margin-top: 0.5rem; }}
   .cost-warning {{ border: 2px solid #e0555f; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; color: #e0555f; }}
   .cost-warning ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
+  .repeat-warning {{ border: 2px solid #d9922a; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; color: #d9922a; }}
+  .repeat-warning ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
 </style>
 {body}"""

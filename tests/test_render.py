@@ -14,6 +14,17 @@ def _make_experiment(arms):
     )
 
 
+def _make_experiment_with_metrics(arms, metrics_cfg):
+    return Experiment.model_validate(
+        {
+            "experiment": "e1",
+            "task": {"id": "t0", "success_check": "true"},
+            "arms": arms,
+            "metrics": metrics_cfg,
+        }
+    )
+
+
 def _seed_run(cur, experiment, arm_id, run_id, repeat_idx, cost, turns, task_success=1,
               model=None, cost_source=None, config_hash="__current__"):
     """Insert a run row (plus its requests) for `arm_id` of `experiment`.
@@ -303,3 +314,166 @@ def test_billable_weights_declared_on_experiment_flow_into_comparison():
     # tokens each @ weight 1.0 (undeclared -- Anthropic-shaped default):
     # (10*10 + 5*1) * 2 = 210.0
     assert comparison.arms[0].aggregate["metrics"]["billable_tokens"]["mean"] == pytest.approx(210.0)
+
+
+# ---------------------------------------------------------------------------
+# finding 15-18: metrics.primary/secondary/derived actually drive what's
+# displayed, instead of render.py's old hardcoded PRIMARY_METRICS/
+# SECONDARY_METRICS lists ignoring the YAML's metrics: block entirely.
+# ---------------------------------------------------------------------------
+
+
+def test_declared_metrics_primary_changes_comparison_display_metrics():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}],
+        {"primary": ["turns"], "secondary": []},
+    )
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 4)
+        comparison = render.compare_experiment(cur, exp)
+
+    assert comparison.display_metrics() == ["turns"]
+
+
+def test_declared_metrics_primary_changes_build_table_rows():
+    """End to end: a declared metrics.primary that's *different* from the
+    hardcoded defaults must change which rows ys compare actually prints,
+    not just the Comparison object's own bookkeeping."""
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}],
+        {"primary": ["turns"], "secondary": []},
+    )
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 4)
+        comparison = render.compare_experiment(cur, exp)
+
+    table = render.build_table(comparison)
+    from io import StringIO
+
+    from rich.console import Console
+
+    buf = StringIO()
+    Console(file=buf, width=200).print(table)
+    rendered = buf.getvalue()
+
+    assert "turns" in rendered
+    # the hardcoded defaults must NOT appear as row labels now that a
+    # different, narrower primary list was declared
+    assert "cost_usd" not in rendered
+    assert "billable_tokens" not in rendered
+    assert "wall_clock_s" not in rendered
+
+
+def test_declared_metrics_primary_changes_render_html_rows():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}],
+        {"primary": ["turns"], "secondary": []},
+    )
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 4)
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert ">turns<" in content
+    assert ">cost_usd<" not in content
+    assert ">billable_tokens<" not in content
+
+
+def test_undeclared_metrics_block_keeps_the_old_hardcoded_defaults():
+    """Backward compatibility: an experiment with no metrics: block at all
+    (Metrics()'s empty-list default) must display exactly what it always
+    did, not an empty table."""
+    db.init_db()
+    exp = _make_experiment([{"id": "a", "factors": {}, "baseline": True}])
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 4)
+        comparison = render.compare_experiment(cur, exp)
+
+    assert comparison.display_metrics() == render.DEFAULT_PRIMARY_METRICS + render.DEFAULT_SECONDARY_METRICS
+
+
+def test_cost_per_success_in_derived_is_not_duplicated_as_a_generic_row():
+    """cost_per_success is a valid, declarable metric name (both example
+    YAMLs list it under derived:) but it's an aggregate-level ratio already
+    rendered as its own fixed row -- it must not also appear as a generic
+    metric-row lookup (which would just print '-')."""
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}],
+        {"derived": ["cost_per_success", "tokens_per_turn"]},
+    )
+    assert exp.metrics.derived == ["cost_per_success", "tokens_per_turn"]
+
+
+# ---------------------------------------------------------------------------
+# finding 15-18: repeats is advisory -- unequal sample sizes across arms
+# must be flagged, not silently displayed as an ordinary mean +/- spread.
+# ---------------------------------------------------------------------------
+
+
+def test_repeat_count_warnings_flags_unequal_arms():
+    db.init_db()
+    exp = _make_experiment(
+        [
+            {"id": "a", "factors": {}, "baseline": True},
+            {"id": "b", "factors": {}},
+        ]
+    )
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 2)
+        _seed_run(cur, exp, "a", "ra2", 2, 0.01, 2)
+        _seed_run(cur, exp, "b", "rb1", 1, 0.01, 2)
+        comparison = render.compare_experiment(cur, exp)
+
+    warnings = render.repeat_count_warnings(comparison)
+    assert len(warnings) == 2
+    assert any("'a'" in w and "2 recorded run" in w for w in warnings)
+    assert any("'b'" in w and "1 recorded run" in w for w in warnings)
+
+
+def test_repeat_count_warnings_empty_when_arms_agree():
+    db.init_db()
+    exp = _make_experiment(
+        [
+            {"id": "a", "factors": {}, "baseline": True},
+            {"id": "b", "factors": {}},
+        ]
+    )
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 2)
+        _seed_run(cur, exp, "b", "rb1", 1, 0.01, 2)
+        comparison = render.compare_experiment(cur, exp)
+
+    assert render.repeat_count_warnings(comparison) == []
+
+
+def test_render_html_shows_repeat_warning_banner_when_unequal():
+    db.init_db()
+    exp = _make_experiment(
+        [
+            {"id": "a", "factors": {}, "baseline": True},
+            {"id": "b", "factors": {}},
+        ]
+    )
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 2)
+        _seed_run(cur, exp, "a", "ra2", 2, 0.01, 2)
+        _seed_run(cur, exp, "b", "rb1", 1, 0.01, 2)
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert "Unequal repeats" in content
+    assert content.count("<tr>") == content.count("</tr>")
+
+
+def test_render_html_no_repeat_warning_banner_when_equal():
+    db.init_db()
+    exp = _make_experiment([{"id": "a", "factors": {}, "baseline": True}])
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 2)
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert "Unequal repeats" not in content

@@ -10,6 +10,7 @@ import json
 import time
 import traceback
 import uuid
+from typing import Optional
 
 import yaml
 from litellm.integrations.custom_logger import CustomLogger
@@ -287,6 +288,41 @@ def _fill_fingerprint_if_missing(cur, run_id, model, tool_count, toolset_hash, s
     )
 
 
+def _ttft_ms(slo: dict) -> Optional[float]:
+    """Time to first token, in ms, from LiteLLM's own
+    `standard_logging_object` timestamps -- `startTime`/`completionStartTime`
+    (both epoch-second floats; camelCase is LiteLLM's own naming, not this
+    codebase's -- see `StandardLoggingPayload` in
+    litellm/types/utils.py). Finding 15-18: this was a schema column
+    hardcoded to None; verified against the installed litellm package
+    (not guessed) that both fields are actually there to use:
+
+    - Streaming: LiteLLM's streaming handler
+      (litellm_core_utils/streaming_handler.py) stamps
+      `completion_start_time` on the first chunk it receives, so
+      `completionStartTime - startTime` is a real time-to-first-token.
+    - Non-streaming: LiteLLM never sets `completion_start_time` at all;
+      `get_standard_logging_object_payload` (litellm_core_utils/
+      litellm_logging.py) defaults it to `end_time` when building the
+      payload. So for a non-streaming request this collapses to the full
+      round-trip latency (`completionStartTime == endTime`) -- which isn't
+      a bug in this function, it's the correct answer: a non-streaming
+      response arrives as a single event, so "time to first token" and
+      "time to last token" are the same moment.
+
+    Returns None if either timestamp is missing (e.g. a failed request with
+    no standard_logging_object at all) rather than fabricating a number.
+    """
+    start = slo.get("startTime")
+    completion_start = slo.get("completionStartTime")
+    if start is None or completion_start is None:
+        return None
+    try:
+        return (completion_start - start) * 1000
+    except TypeError:
+        return None
+
+
 def extract_record(kwargs: dict, response_obj, start_time, end_time) -> dict:
     """Pure extraction, no I/O. Kept separate from the DB write for testability."""
     slo = kwargs.get("standard_logging_object") or {}
@@ -328,7 +364,7 @@ def extract_record(kwargs: dict, response_obj, start_time, end_time) -> dict:
         "output_tokens": usage.get("completion_tokens"),
         "response_cost": slo.get("response_cost") or kwargs.get("response_cost") or 0.0,
         "latency_ms": latency_ms,
-        "ttft_ms": None,
+        "ttft_ms": _ttft_ms(slo),
         "status_code": 200 if slo.get("status") == "success" else 500,
         "error": slo.get("error_str"),
         "msg_count": len(messages),

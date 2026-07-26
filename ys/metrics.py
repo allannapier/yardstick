@@ -232,6 +232,15 @@ def _linear_slope(xs: list[float], ys: list[float]) -> Optional[float]:
 # 5.1 / 5.2 -- token accounting and cache efficiency
 # ---------------------------------------------------------------------------
 
+def _tokens_per_turn(billable_tokens: float, turns: int) -> Optional[float]:
+    """Finding 15-18: `derived: [tokens_per_turn]` was named in both example
+    experiments' `metrics:` block but never computed anywhere -- the
+    obvious, cheap derived metric (billable_tokens per conversational turn)
+    that field was presumably meant to enable. None for a run with no main-
+    thread turns rather than a division error."""
+    return (billable_tokens / turns) if turns else None
+
+
 def token_metrics(cur, run_id: str, billable_weights_by_model: Optional[dict] = None) -> dict:
     reqs = _requests(cur, run_id)
 
@@ -471,6 +480,10 @@ def compute_run_metrics(cur, run_id: str, billable_weights_by_model: Optional[di
     metrics.update(background_metrics(cur, run_id))
     metrics.update(main_thread_metrics(cur, run_id))
     metrics.update(outcome_metrics(cur, run_id))
+    # Derived from two metrics already computed above -- must run after both
+    # token_metrics (billable_tokens) and turn_metrics (turns). See finding
+    # 15-18 and `_tokens_per_turn`'s docstring.
+    metrics["tokens_per_turn"] = _tokens_per_turn(metrics["billable_tokens"], metrics["turns"])
     return metrics
 
 
@@ -502,7 +515,35 @@ _EFFICIENCY_METRICS = [
     "background_tokens",
     "wall_clock_s",
     "active_s",
+    "tokens_per_turn",
 ]
+
+
+# `Experiment.metrics.gate` (ys/experiment.py) is a string in the YAML,
+# validated there against `VALID_GATE_NAMES`; this is the other half --
+# turning that validated string into the predicate `aggregate_run_metrics`
+# actually gates on. Finding 15-18: previously `aggregate_run_metrics`
+# simply hardcoded the task_success predicate inline and ignored the
+# schema field entirely. Only one gate exists today (task_success is the
+# only boolean pass/fail signal this rig computes), but callers now go
+# through this registry instead of the hardcoded default, so a second gate
+# is a one-line addition here rather than a second hardcoded branch.
+_GATES: dict[str, Callable[[dict], bool]] = {
+    "task_success": lambda m: bool(m.get("task_success")),
+}
+
+
+def resolve_gate(name: str) -> Callable[[dict], bool]:
+    """Map a `metrics.gate` name to the predicate `aggregate_run_metrics`
+    uses to decide whether a run counts as a success. Raises ValueError
+    naming the valid options on an unknown name -- in practice unreachable
+    from a YAML that's already passed `Experiment` validation (which checks
+    the same registry), but this is also callable directly, so it
+    shouldn't trust its input either."""
+    try:
+        return _GATES[name]
+    except KeyError:
+        raise ValueError(f"unknown metrics.gate '{name}' -- valid options: {', '.join(sorted(_GATES))}")
 
 
 def aggregate_run_metrics(

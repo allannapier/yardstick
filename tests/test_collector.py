@@ -17,6 +17,7 @@ from ys.collector import (
     _redact,
     _resolve_cost,
     _resolve_run_id,
+    _ttft_ms,
     _write,
     extract_record,
 )
@@ -209,6 +210,55 @@ def test_extract_record_pulls_usage_and_overhead_fields():
     assert rec["system_tokens"] > 0
     assert rec["tools_tokens"] > 0
     assert rec["latency_ms"] == 1000.0
+
+
+# ---------------------------------------------------------------------------
+# finding 15-18: ttft_ms was a schema column hardcoded to None in every
+# extracted record. LiteLLM's own standard_logging_object carries the two
+# epoch-second timestamps (`startTime`/`completionStartTime`) needed to
+# compute it -- verified against the installed litellm package, not
+# guessed (see `_ttft_ms`'s docstring in ys/collector.py).
+# ---------------------------------------------------------------------------
+
+
+def test_ttft_ms_computed_from_standard_logging_object_timestamps():
+    # A streaming response: LiteLLM's streaming handler stamps
+    # completion_start_time the moment the first chunk arrives, distinct
+    # from startTime/endTime.
+    slo = {"startTime": 1000.0, "completionStartTime": 1000.25, "endTime": 1001.0}
+    assert _ttft_ms(slo) == pytest.approx(250.0)
+
+
+def test_ttft_ms_none_when_timestamps_missing():
+    assert _ttft_ms({}) is None
+    assert _ttft_ms({"startTime": 1000.0}) is None  # no completionStartTime at all
+
+
+def test_ttft_ms_equals_full_latency_for_non_streaming():
+    """Non-streaming: LiteLLM never sets completion_start_time, so
+    get_standard_logging_object_payload defaults it to end_time -- meaning
+    completionStartTime == endTime and ttft_ms collapses to the full
+    round-trip latency. Documented behaviour, not a bug: a non-streaming
+    response arrives as a single event, so "first token" and "last token"
+    are the same moment."""
+    slo = {"startTime": 1000.0, "completionStartTime": 1002.5, "endTime": 1002.5}
+    assert _ttft_ms(slo) == pytest.approx(2500.0)
+
+
+def test_extract_record_populates_ttft_ms_when_present():
+    kwargs = _fake_kwargs()
+    kwargs["standard_logging_object"]["startTime"] = 1000.0
+    kwargs["standard_logging_object"]["completionStartTime"] = 1000.4
+    rec = extract_record(kwargs, FakeResponse([]), None, None)
+    assert rec["ttft_ms"] == pytest.approx(400.0)
+
+
+def test_extract_record_ttft_ms_none_when_standard_logging_object_lacks_timestamps():
+    """The existing `_fake_kwargs` helper (used by most other tests in this
+    file) never sets startTime/completionStartTime -- ttft_ms must stay
+    None rather than raising or fabricating a value."""
+    rec = extract_record(_fake_kwargs(), FakeResponse([]), None, None)
+    assert rec["ttft_ms"] is None
 
 
 def test_write_falls_back_to_unattributed_for_unknown_run_id():
