@@ -1,6 +1,10 @@
+import os
+import re
+
 from fastapi.testclient import TestClient
 
 from ys import db, state
+from ys.web import store
 from ys.web.app import app
 
 client = TestClient(app)
@@ -31,7 +35,8 @@ def test_create_experiment_via_form():
             "model_value": ["hello"],
             "arm_id": ["arm-a"],
             "arm_model": ["probe-mock"],
-            "arm_baseline": ["arm-a"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
             "arm_notes": [""],
         },
         follow_redirects=False,
@@ -46,6 +51,11 @@ def test_create_experiment_via_form():
 
 
 def test_create_experiment_rejects_duplicate_arm_ids():
+    # Defect 22: a pydantic validation failure used to redirect to
+    # /experiments/new?error=<raw pydantic text>, discarding everything the
+    # user typed. It should instead re-render the form (so the name, task
+    # fields etc. the user already typed are still there) with a readable
+    # message, and not a redirect at all.
     resp = client.post(
         "/experiments",
         data={
@@ -59,20 +69,205 @@ def test_create_experiment_rejects_duplicate_arm_ids():
             "model_value": ["hi"],
             "arm_id": ["dup", "dup"],
             "arm_model": ["m1", "m1"],
+            "arm_seq": ["0", "1"],
             "arm_baseline": [],
             "arm_notes": ["", ""],
         },
         follow_redirects=False,
     )
-    assert resp.status_code == 303
-    assert "/experiments/new" in resp.headers["location"]
-    assert "error=" in resp.headers["location"]
+    assert resp.status_code == 400
+    assert "duplicate arm ids" in resp.text
+    # the raw pydantic dump ("1 validation error for Experiment", a link to
+    # errors.pydantic.dev) must not leak into the page
+    assert "validation error for Experiment" not in resp.text
+    # the user's other input is preserved, not discarded by a redirect
+    assert 'value="bad-exp"' in resp.text
+    assert 'value="t0"' in resp.text
+
+
+def test_create_experiment_non_numeric_timeout_reprompts_without_500():
+    # Defect 20: int(form.get("timeout_s")) on a non-numeric value used to
+    # raise straight through to a 500. It should become a field-level error
+    # and re-render the form with everything else intact instead.
+    resp = client.post(
+        "/experiments",
+        data={
+            "name": "bad-timeout-exp",
+            "question": "keep me",
+            "task_id": "t0",
+            "success_check": "true",
+            "timeout_s": "soon",
+            "repeats": "2",
+            "model_key": ["m1"],
+            "model_kind": ["mock"],
+            "model_value": ["hi"],
+            "arm_id": ["a"],
+            "arm_model": ["m1"],
+            "arm_seq": ["0"],
+            "arm_baseline": [],
+            "arm_notes": [""],
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "must be a whole number" in resp.text
+    assert 'value="bad-timeout-exp"' in resp.text
+    assert not os.path.exists(store.experiment_path("bad-timeout-exp"))
+
+
+def test_create_experiment_non_numeric_repeats_reprompts_without_500():
+    resp = client.post(
+        "/experiments",
+        data={
+            "name": "bad-repeats-exp",
+            "task_id": "t0",
+            "success_check": "true",
+            "timeout_s": "60",
+            "repeats": "lots",
+            "model_key": ["m1"],
+            "model_kind": ["mock"],
+            "model_value": ["hi"],
+            "arm_id": ["a"],
+            "arm_model": ["m1"],
+            "arm_seq": ["0"],
+            "arm_baseline": [],
+            "arm_notes": [""],
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "must be a whole number" in resp.text
 
 
 def test_experiment_detail_404_for_unknown_name():
     resp = client.get("/experiments/does-not-exist", follow_redirects=False)
+    assert resp.status_code == 404
+    assert "no experiment named" in resp.text
+
+
+def test_experiment_detail_invalid_name_returns_404_not_500():
+    # Defect 19: GET /experiments/foo.bar raised store.InvalidExperimentName
+    # straight through to a 500 -- no route caught it.
+    resp = client.get("/experiments/foo.bar", follow_redirects=False)
+    assert resp.status_code == 404
+    assert "not a valid experiment name" in resp.text
+
+
+def test_start_proxy_for_nonexistent_experiment_returns_404():
+    # Defect 23: starting the proxy for a nonexistent experiment had no
+    # existence check at all -- it surfaced whatever the proxy layer
+    # complained about first (e.g. a missing LITELLM_MASTER_KEY) and
+    # redirected to a detail page that then 500s on the same call site as
+    # defect 19.
+    resp = client.post("/experiments/does-not-exist-proxy/proxy/up", follow_redirects=False)
+    assert resp.status_code == 404
+
+
+def test_create_experiment_refuses_to_silently_overwrite_existing():
+    # Defect 21: re-submitting the form with a name that already has a
+    # YAML file silently overwrote it -- verified in the review by changing
+    # task.id on an experiment that already had runs recorded against it;
+    # those runs stay attached to the same experiment id and get
+    # aggregated with whatever the new definition produces. Refuse by
+    # default; only an explicit confirm_overwrite=on gets through.
+    payload = {
+        "name": "overwrite-exp",
+        "task_id": "t0",
+        "success_check": "true",
+        "timeout_s": "60",
+        "repeats": "1",
+        "model_key": ["m1"],
+        "model_kind": ["mock"],
+        "model_value": ["hi"],
+        "arm_id": ["a"],
+        "arm_model": ["m1"],
+        "arm_seq": ["0"],
+        "arm_baseline": ["0"],
+        "arm_notes": [""],
+    }
+    created = client.post("/experiments", data=payload, follow_redirects=False)
+    assert created.status_code == 303
+    original = store.read_raw("overwrite-exp")
+
+    changed = dict(payload)
+    changed["task_id"] = "different-task"
+    resp = client.post("/experiments", data=changed, follow_redirects=False)
+    assert resp.status_code == 400
+    assert "already exists" in resp.text
+    assert store.read_raw("overwrite-exp") == original  # not clobbered
+
+    changed["confirm_overwrite"] = "on"
+    resp2 = client.post("/experiments", data=changed, follow_redirects=False)
+    assert resp2.status_code == 303
+    assert "different-task" in store.read_raw("overwrite-exp")
+
+
+def test_new_experiment_form_uses_radio_buttons_for_baseline():
+    # Defect 24: the baseline control was a checkbox with a JS-synchronised
+    # `value`, so two arms could both be checked -- radios sharing one
+    # `name` make that unreachable natively.
+    resp = client.get("/experiments/new")
+    assert resp.status_code == 200
+    assert 'type="radio"' in resp.text
+    assert 'name="arm_baseline"' in resp.text
+    assert 'type="checkbox" name="arm_baseline"' not in resp.text
+
+
+def test_two_submitted_baselines_cannot_create_two_baseline_arms():
+    # Even a client that bypasses the radio group in the browser (e.g. a
+    # raw POST) can't create two baseline arms: the server keys off a
+    # single scalar `arm_baseline` value, not a set of checked values.
+    resp = client.post(
+        "/experiments",
+        data={
+            "name": "two-baseline-exp",
+            "task_id": "t0",
+            "success_check": "true",
+            "timeout_s": "60",
+            "repeats": "1",
+            "model_key": ["m1"],
+            "model_kind": ["mock"],
+            "model_value": ["hi"],
+            "arm_id": ["a", "b"],
+            "arm_model": ["m1", "m1"],
+            "arm_seq": ["0", "1"],
+            "arm_baseline": ["0", "1"],
+            "arm_notes": ["", ""],
+        },
+        follow_redirects=False,
+    )
     assert resp.status_code == 303
-    assert "error=" in resp.headers["location"]
+    detail = client.get("/experiments/two-baseline-exp")
+    assert detail.text.count("baseline</span>") <= 1
+
+
+def test_no_nested_interactive_elements_in_index_and_experiment_pages():
+    # Invalid HTML bullet: <a href="..."><button></button></a> nests two
+    # interactive elements, which is invalid and breaks keyboard/AT
+    # behavior. Neither page should do it any more.
+    index_html = client.get("/").text
+    assert re.search(r"<a[^>]*>\s*<button", index_html) is None
+
+    client.post(
+        "/experiments",
+        data={
+            "name": "html-check-exp",
+            "task_id": "t0",
+            "success_check": "true",
+            "timeout_s": "60",
+            "repeats": "1",
+            "model_key": ["m1"],
+            "model_kind": ["mock"],
+            "model_value": ["hi"],
+            "arm_id": ["a"],
+            "arm_model": ["m1"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
+            "arm_notes": [""],
+        },
+    )
+    detail_html = client.get("/experiments/html-check-exp").text
+    assert re.search(r"<a[^>]*>\s*<button", detail_html) is None
 
 
 def test_full_run_lifecycle_via_web():
@@ -89,7 +284,8 @@ def test_full_run_lifecycle_via_web():
             "model_value": ["hi"],
             "arm_id": ["only-arm"],
             "arm_model": ["m1"],
-            "arm_baseline": ["only-arm"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
             "arm_notes": [""],
         },
     )
@@ -144,7 +340,8 @@ def test_compare_view_after_a_run():
             "model_value": ["hi"],
             "arm_id": ["only-arm"],
             "arm_model": ["m1"],
-            "arm_baseline": ["only-arm"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
             "arm_notes": [""],
         },
     )
@@ -171,7 +368,8 @@ def test_compare_before_any_run_redirects_with_error():
             "model_value": ["hi"],
             "arm_id": ["only-arm"],
             "arm_model": ["m1"],
-            "arm_baseline": ["only-arm"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
             "arm_notes": [""],
         },
     )
@@ -194,7 +392,8 @@ def test_delete_run_removes_it_and_redirects_to_experiment():
             "model_value": ["hi"],
             "arm_id": ["only-arm"],
             "arm_model": ["m1"],
-            "arm_baseline": ["only-arm"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
             "arm_notes": [""],
         },
     )
@@ -239,7 +438,8 @@ def test_delete_active_run_is_refused():
             "model_value": ["hi"],
             "arm_id": ["only-arm"],
             "arm_model": ["m1"],
-            "arm_baseline": ["only-arm"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
             "arm_notes": [""],
         },
     )
@@ -271,7 +471,8 @@ def test_run_detail_page():
             "model_value": ["hi"],
             "arm_id": ["only-arm"],
             "arm_model": ["m1"],
-            "arm_baseline": ["only-arm"],
+            "arm_seq": ["0"],
+            "arm_baseline": ["0"],
             "arm_notes": [""],
         },
     )

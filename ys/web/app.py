@@ -49,6 +49,157 @@ def _ctx(request: Request, **extra) -> dict:
     }
 
 
+def _error_page(request: Request, status_code: int, message: str) -> HTMLResponse:
+    """A human-readable error page with the app's own chrome, instead of a
+    raw traceback (defect 19: an invalid experiment name in the URL raised
+    `store.InvalidExperimentName` straight through to a 500) or a 303
+    redirect to a page that then fails again on its own (defect 23: the
+    proxy-up route had no existence check and forwarded to a detail page
+    that 500s on the same unguarded `store.experiment_path` call).
+    """
+    return templates.TemplateResponse(
+        request, "error.html", _ctx(request, message=message), status_code=status_code
+    )
+
+
+def _load_experiment_or_404(request: Request, name: str):
+    """Resolve `name` to (path, experiment) for every route keyed by
+    experiment name, or return a ready-to-serve 404 response. Handles both
+    halves of defect 19/23 at the one call site they share: an invalid name
+    (`store.experiment_path` raising `InvalidExperimentName`) and a
+    well-formed but nonexistent one. Returns `(path, experiment, None)` on
+    success or `(None, None, error_response)` on failure -- callers do
+    `path, experiment, err = ...; if err: return err`.
+    """
+    try:
+        path = store.experiment_path(name)
+    except store.InvalidExperimentName as e:
+        return None, None, _error_page(request, 404, str(e))
+    if not os.path.exists(path):
+        return None, None, _error_page(request, 404, f"no experiment named '{name}'")
+    return path, load_experiment(path), None
+
+
+def _parse_int_field(form, name: str, default: int, field_errors: dict, label: str) -> int:
+    """Guard against defect 20: `int(form.get(...))` on a non-numeric
+    timeout_s/repeats raised straight through to a 500. A bad value becomes
+    a field-level error instead, and `default` is returned as a placeholder
+    -- the caller must check `field_errors` before saving, since this
+    function's job is only to keep the rest of the form-processing code
+    from crashing on the way to re-rendering the form.
+    """
+    raw = (form.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        field_errors[name] = f"{label} must be a whole number (got '{raw}')"
+        return default
+
+
+# Pydantic error locations that map onto one specific input in
+# new_experiment.html -- everything else (duplicate arm ids, more than one
+# baseline, an empty arms list) doesn't correspond to a single field and is
+# shown as a general message above the form instead.
+_TOP_LEVEL_FIELDS = {
+    ("experiment",): "name",
+    ("task", "id"): "task_id",
+    ("task", "success_check"): "success_check",
+    ("task", "timeout_s"): "timeout_s",
+    ("repeats",): "repeats",
+    ("arms",): "arms",
+}
+
+
+def _split_validation_errors(exc: ValidationError) -> tuple[dict[str, str], list[str]]:
+    """Translate pydantic's error list into what defect 22 asked for: short,
+    readable messages next to the field they're about, instead of raw
+    exception text (`str(exc)`, a multi-line dump including "For further
+    information visit https://errors.pydantic.dev/...") URL-encoded into a
+    query string.
+    """
+    field_errors: dict[str, str] = {}
+    general: list[str] = []
+    for err in exc.errors():
+        loc = tuple(err["loc"])
+        msg = err["msg"]
+        if msg.startswith("Value error, "):
+            msg = msg[len("Value error, "):]
+        field = _TOP_LEVEL_FIELDS.get(loc)
+        if field:
+            field_errors[field] = msg
+        else:
+            label = ".".join(str(p) for p in loc)
+            general.append(f"{label}: {msg}" if label else msg)
+    return field_errors, general
+
+
+def _form_snapshot(form) -> dict:
+    """Reconstruct the submitted form shape so new_experiment.html can
+    re-populate every field after a validation failure (defects 20/22) --
+    the old behaviour redirected to `/experiments/new` and discarded
+    everything the user had typed.
+    """
+    arm_ids = form.getlist("arm_id")
+    arm_models = form.getlist("arm_model")
+    arm_seqs = form.getlist("arm_seq")
+    baseline_seq = form.get("arm_baseline")
+    arm_notes = form.getlist("arm_notes")
+    arms = []
+    for i, arm_id in enumerate(arm_ids):
+        seq = arm_seqs[i] if i < len(arm_seqs) else str(i)
+        arms.append(
+            {
+                "id": arm_id,
+                "model": arm_models[i] if i < len(arm_models) else "",
+                "seq": seq,
+                "baseline": baseline_seq is not None and seq == baseline_seq,
+                "notes": arm_notes[i] if i < len(arm_notes) else "",
+            }
+        )
+
+    model_keys = form.getlist("model_key")
+    model_kinds = form.getlist("model_kind")
+    model_values = form.getlist("model_value")
+    models = []
+    for i, key in enumerate(model_keys):
+        models.append(
+            {
+                "key": key,
+                "kind": model_kinds[i] if i < len(model_kinds) else "mock",
+                "value": model_values[i] if i < len(model_values) else "",
+            }
+        )
+
+    return {
+        "name": form.get("name", ""),
+        "question": form.get("question", ""),
+        "task_id": form.get("task_id", ""),
+        "success_check": form.get("success_check", ""),
+        "timeout_s": form.get("timeout_s", ""),
+        "repeats": form.get("repeats", ""),
+        "confirm_overwrite": form.get("confirm_overwrite") == "on",
+        "arms": arms,
+        "models": models,
+    }
+
+
+def _new_experiment_response(
+    request: Request,
+    form_data: dict,
+    field_errors: dict,
+    general_errors: list,
+    status_code: int = 400,
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "new_experiment.html",
+        _ctx(request, form_data=form_data, field_errors=field_errors, general_errors=general_errors),
+        status_code=status_code,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Experiment list / create
 # ---------------------------------------------------------------------------
@@ -77,21 +228,68 @@ def new_experiment_form(request: Request):
 @app.post("/experiments")
 async def create_experiment(request: Request):
     form = await request.form()
+    snapshot = _form_snapshot(form)
+    field_errors: dict[str, str] = {}
 
+    timeout_s = _parse_int_field(form, "timeout_s", 1800, field_errors, "timeout (seconds)")
+    repeats = _parse_int_field(form, "repeats", 3, field_errors, "repeats per arm")
+
+    name = form.get("name", "").strip()
+    path = None
+    try:
+        store.validate_name(name)
+    except store.InvalidExperimentName as e:
+        field_errors["name"] = str(e)
+    else:
+        path = store.experiment_path(name)
+
+    # Defect 21: `store.save_experiment` writes `<name>.yaml` unconditionally,
+    # so re-using an existing experiment's name silently overwrote its
+    # definition -- the runs already recorded against that experiment id
+    # stay attached and get aggregated with whatever the new definition
+    # produces. Refuse by default; `confirm_overwrite` (a checkbox the user
+    # must tick, never on by default) is the only way past this, so the
+    # clobber can't happen by accident.
+    if path and os.path.exists(path) and not form.get("confirm_overwrite") == "on":
+        with db.cursor() as cur:
+            run_count = cur.execute(
+                "SELECT COUNT(*) AS c FROM runs WHERE experiment_id = ?", (name,)
+            ).fetchone()["c"]
+        note = (
+            f" It already has {run_count} recorded run(s) that would stay attached "
+            "and be aggregated with whatever this form saves."
+            if run_count
+            else ""
+        )
+        field_errors["name"] = (
+            f"an experiment named '{name}' already exists.{note} Check 'overwrite' "
+            "below to replace it, or pick a different name."
+        )
+
+    # arm_seq/arm_baseline are a matched pair from the radio group in
+    # new_experiment.html (defect 24): each row gets a stable seq at
+    # creation, and the single `arm_baseline` value the browser submits is
+    # whichever row's radio was checked. Because there's exactly one
+    # `arm_baseline` field name shared by every row, the browser's native
+    # radio-group behaviour makes "two arms marked baseline" unreachable
+    # from the form -- unlike the old checkboxes, which could both be
+    # checked and only failed later as a raw pydantic error (defect 22).
     arm_ids = form.getlist("arm_id")
     arm_models = form.getlist("arm_model")
-    arm_baselines = set(form.getlist("arm_baseline"))  # values of checked baseline radios
+    arm_seqs = form.getlist("arm_seq")
+    baseline_seq = form.get("arm_baseline")
     arm_notes = form.getlist("arm_notes")
 
     arms = []
     for i, arm_id in enumerate(arm_ids):
         if not arm_id.strip():
             continue
+        seq = arm_seqs[i] if i < len(arm_seqs) else None
         arms.append(
             {
                 "id": arm_id.strip(),
                 "factors": {"model": arm_models[i].strip()} if i < len(arm_models) else {},
-                "baseline": arm_id.strip() in arm_baselines,
+                "baseline": seq is not None and seq == baseline_seq,
                 "notes": (arm_notes[i].strip() or None) if i < len(arm_notes) else None,
             }
         )
@@ -118,22 +316,32 @@ async def create_experiment(request: Request):
             }
 
     data = {
-        "experiment": form.get("name", "").strip(),
+        "experiment": name,
         "question": form.get("question", "").strip() or None,
         "task": {
             "id": form.get("task_id", "").strip(),
             "success_check": form.get("success_check", "").strip(),
-            "timeout_s": int(form.get("timeout_s") or 1800),
+            "timeout_s": timeout_s,
         },
         "models": models,
         "arms": arms,
-        "repeats": int(form.get("repeats") or 3),
+        "repeats": repeats,
     }
+
+    # Defect 20/22: don't attempt to save (and don't 500) on a bad int or an
+    # already-existing name -- re-render the form with the user's input
+    # intact and the specific problem called out.
+    if field_errors:
+        return _new_experiment_response(request, snapshot, field_errors, [])
 
     try:
         experiment = store.save_experiment(data)
-    except (ValidationError, store.InvalidExperimentName) as e:
-        return _redirect("/experiments/new", error=str(e))
+    except store.InvalidExperimentName as e:
+        field_errors["name"] = str(e)
+        return _new_experiment_response(request, snapshot, field_errors, [])
+    except ValidationError as e:
+        field_errors, general_errors = _split_validation_errors(e)
+        return _new_experiment_response(request, snapshot, field_errors, general_errors)
 
     return _redirect(f"/experiments/{experiment.experiment}", ok="experiment created")
 
@@ -154,10 +362,9 @@ def _arm_runs(cur, experiment_name: str, arm_id: str) -> list[dict]:
 
 @app.get("/experiments/{name}", response_class=HTMLResponse)
 def experiment_detail(request: Request, name: str):
-    path = store.experiment_path(name)
-    if not os.path.exists(path):
-        return _redirect("/", error=f"no experiment named '{name}'")
-    experiment = load_experiment(path)
+    path, experiment, err = _load_experiment_or_404(request, name)
+    if err:
+        return err
 
     with db.cursor() as cur:
         arms_data = [
@@ -173,10 +380,9 @@ def experiment_detail(request: Request, name: str):
 
 @app.get("/experiments/{name}/compare", response_class=HTMLResponse)
 def experiment_compare(request: Request, name: str):
-    path = store.experiment_path(name)
-    if not os.path.exists(path):
-        return _redirect("/", error=f"no experiment named '{name}'")
-    experiment = load_experiment(path)
+    path, experiment, err = _load_experiment_or_404(request, name)
+    if err:
+        return err
 
     with db.cursor() as cur:
         try:
@@ -194,8 +400,15 @@ def experiment_compare(request: Request, name: str):
 
 
 @app.post("/experiments/{name}/proxy/up")
-def start_proxy(name: str):
-    path = store.experiment_path(name)
+def start_proxy(request: Request, name: str):
+    # Defect 23: there was no existence check here at all -- a nonexistent
+    # experiment reported whatever the proxy layer complained about first
+    # (e.g. "LITELLM_MASTER_KEY is not set", unrelated to the real problem)
+    # and redirected to a detail page that then 500s on the same unguarded
+    # `store.experiment_path` call defect 19 covers.
+    path, _experiment, err = _load_experiment_or_404(request, name)
+    if err:
+        return err
     try:
         proxy.proxy_up([path])
     except proxy.ProxyError as e:
@@ -222,8 +435,9 @@ async def start_run(request: Request, name: str):
     arm_id = form.get("arm_id", "")
     force = form.get("force") == "on"
 
-    path = store.experiment_path(name)
-    experiment = load_experiment(path)
+    path, experiment, err = _load_experiment_or_404(request, name)
+    if err:
+        return err
     with open(path) as f:
         config_yaml = f.read()
 

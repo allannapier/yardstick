@@ -4,50 +4,102 @@
 
 <h2>new experiment</h2>
 
+{% if general_errors %}
+<div class="flash error">
+  <ul style="margin:0; padding-left:1.2rem;">
+    {% for msg in general_errors %}<li>{{ msg }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <form method="post" action="/experiments">
 
   <div class="field">
     <label for="name">experiment name (used as the filename -- letters, digits, - and _ only)</label>
-    <input id="name" name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="harness-vs-model-01">
+    <input id="name" name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="harness-vs-model-01"
+           value="{{ form_data.name if form_data else '' }}">
+    {% if field_errors and field_errors.name %}<p class="field-error">{{ field_errors.name }}</p>{% endif %}
+    <label style="display:flex; align-items:center; gap:0.4rem; margin-top:0.4rem; font-size:0.85rem;">
+      <input type="checkbox" name="confirm_overwrite" style="width:auto"
+             {% if form_data and form_data.confirm_overwrite %}checked{% endif %}>
+      overwrite if an experiment with this name already exists
+    </label>
   </div>
 
   <div class="field">
     <label for="question">question (optional)</label>
-    <textarea id="question" name="question" rows="2" placeholder="What are we trying to learn?"></textarea>
+    <textarea id="question" name="question" rows="2" placeholder="What are we trying to learn?">{{ form_data.question if form_data else '' }}</textarea>
   </div>
 
   <fieldset>
     <legend>task -- the fixed constant every arm runs</legend>
     <div class="field">
       <label for="task_id">task id</label>
-      <input id="task_id" name="task_id" required placeholder="bughunt-seed-042">
+      <input id="task_id" name="task_id" required placeholder="bughunt-seed-042"
+             value="{{ form_data.task_id if form_data else '' }}">
+      {% if field_errors and field_errors.task_id %}<p class="field-error">{{ field_errors.task_id }}</p>{% endif %}
     </div>
     <div class="field">
       <label for="success_check">success check (shell command, exit 0 = success)</label>
-      <input id="success_check" name="success_check" required placeholder="pytest -q tests/test_seeded_bug.py">
+      <input id="success_check" name="success_check" required placeholder="pytest -q tests/test_seeded_bug.py"
+             value="{{ form_data.success_check if form_data else '' }}">
+      {% if field_errors and field_errors.success_check %}<p class="field-error">{{ field_errors.success_check }}</p>{% endif %}
     </div>
     <div class="field">
       <label for="timeout_s">timeout (seconds)</label>
-      <input id="timeout_s" name="timeout_s" type="number" value="1800">
+      <input id="timeout_s" name="timeout_s" type="number" value="{{ form_data.timeout_s if form_data else 1800 }}">
+      {% if field_errors and field_errors.timeout_s %}<p class="field-error">{{ field_errors.timeout_s }}</p>{% endif %}
     </div>
   </fieldset>
 
   <fieldset>
     <legend>models -- what a `model` factor value resolves to</legend>
-    <div id="model-rows"></div>
+    <div id="model-rows">
+      {% if form_data %}
+        {% for m in form_data.models %}
+        <div class="model-row">
+          <input name="model_key" placeholder="model key (e.g. probe-claude-mock)" required value="{{ m.key }}">
+          <select name="model_kind" onchange="this.nextElementSibling.placeholder = this.value === 'mock' ? 'mock response text' : 'real anthropic model id, e.g. claude-haiku-4-5-20251001'">
+            <option value="mock" {% if m.kind == 'mock' %}selected{% endif %}>mock</option>
+            <option value="real" {% if m.kind == 'real' %}selected{% endif %}>real</option>
+          </select>
+          <input name="model_value" placeholder="mock response text" value="{{ m.value }}">
+          <button type="button" class="secondary" onclick="this.parentElement.remove()">remove</button>
+        </div>
+        {% endfor %}
+      {% endif %}
+    </div>
     <button type="button" class="secondary" onclick="addModelRow()">+ add model</button>
     <p class="muted">"mock" costs nothing and always returns a canned response -- use it to test the pipeline. "real" routes to Anthropic using the ANTHROPIC_API_KEY you export before <code>ys proxy up</code>.</p>
   </fieldset>
 
   <fieldset>
     <legend>arms -- what you're comparing</legend>
-    <div id="arm-rows"></div>
+    {% if field_errors and field_errors.arms %}<p class="field-error">{{ field_errors.arms }}</p>{% endif %}
+    <div id="arm-rows">
+      {% if form_data %}
+        {% for a in form_data.arms %}
+        <div class="arm-row">
+          <input type="hidden" name="arm_seq" value="{{ a.seq }}">
+          <input name="arm_id" placeholder="arm id (e.g. sonnet-lean)" required value="{{ a.id }}">
+          <input name="arm_model" placeholder="model key (must match one above)" required value="{{ a.model }}">
+          <label style="display:flex; align-items:center; gap:0.3rem; white-space:nowrap;">
+            <input type="radio" name="arm_baseline" value="{{ a.seq }}" style="width:auto" {% if a.baseline %}checked{% endif %}>
+            baseline
+          </label>
+          <input name="arm_notes" placeholder="notes (optional)" value="{{ a.notes }}">
+          <button type="button" class="secondary" onclick="this.parentElement.remove()">remove</button>
+        </div>
+        {% endfor %}
+      {% endif %}
+    </div>
     <button type="button" class="secondary" onclick="addArmRow()">+ add arm</button>
   </fieldset>
 
   <div class="field">
     <label for="repeats">repeats per arm</label>
-    <input id="repeats" name="repeats" type="number" value="3" style="width: 6rem">
+    <input id="repeats" name="repeats" type="number" value="{{ form_data.repeats if form_data else 3 }}" style="width: 6rem">
+    {% if field_errors and field_errors.repeats %}<p class="field-error">{{ field_errors.repeats }}</p>{% endif %}
   </div>
 
   <button type="submit">create experiment</button>
@@ -67,10 +119,11 @@
 
 <template id="arm-row-template">
   <div class="arm-row">
+    <input type="hidden" name="arm_seq" value="">
     <input name="arm_id" placeholder="arm id (e.g. sonnet-lean)" required>
     <input name="arm_model" placeholder="model key (must match one above)" required>
     <label style="display:flex; align-items:center; gap:0.3rem; white-space:nowrap;">
-      <input type="checkbox" name="arm_baseline" value="" style="width:auto">
+      <input type="radio" name="arm_baseline" value="" style="width:auto">
       baseline
     </label>
     <input name="arm_notes" placeholder="notes (optional)">
@@ -83,20 +136,28 @@ function addModelRow() {
   const tpl = document.getElementById('model-row-template');
   document.getElementById('model-rows').appendChild(tpl.content.cloneNode(true));
 }
+// Each arm row's baseline control is a radio button sharing the name
+// `arm_baseline` across every row, so the browser itself guarantees at
+// most one can ever be checked -- the old checkbox version could have two
+// checked at once, which only surfaced as a raw pydantic error later.
+// `arm_seq` is a stable id assigned once per row at creation time; the
+// server matches whichever `arm_baseline` value comes back against each
+// row's `arm_seq` to know which arm (if any) was picked. Unlike the old
+// checkbox `value`, this never needs to change after creation, so there's
+// no need to keep it in sync with the arm id text as the user types.
+let armRowSeq = {{ form_data.arms|length if form_data else 0 }};
 function addArmRow() {
   const tpl = document.getElementById('arm-row-template');
-  const node = tpl.content.cloneNode(true);
-  document.getElementById('arm-rows').appendChild(node);
-  // the baseline checkbox's `value` must equal this row's arm_id for the
-  // server to know which arm was marked baseline (getlist("arm_baseline")
-  // is a set of checked *values*, matched against each row's arm_id).
+  document.getElementById('arm-rows').appendChild(tpl.content.cloneNode(true));
   const row = document.getElementById('arm-rows').lastElementChild;
-  const idInput = row.querySelector('input[name=arm_id]');
-  const baselineBox = row.querySelector('input[name=arm_baseline]');
-  idInput.addEventListener('input', () => { baselineBox.value = idInput.value; });
+  const seq = String(armRowSeq++);
+  row.querySelector('input[name=arm_seq]').value = seq;
+  row.querySelector('input[name=arm_baseline]').value = seq;
 }
+{% if not form_data %}
 addModelRow();
 addArmRow();
+{% endif %}
 </script>
 
 {% endblock %}

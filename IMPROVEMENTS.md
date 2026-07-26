@@ -478,22 +478,65 @@ and `ys doctor` (feature 4).
 
 ## P2 — the dashboard
 
-All six of these were reproduced against `ys/web/app.py`.
+All six of these were reproduced against `ys/web/app.py`. **Fixed** (findings
+19–24, plus the invalid-HTML bullet below the table).
 
 | # | Defect | Behaviour |
 |---|---|---|
-| 19 | Invalid experiment name in a URL | `GET /experiments/foo.bar` → **HTTP 500**. `store.experiment_path` raises `InvalidExperimentName`, which no route catches. |
-| 20 | Non-numeric `timeout_s` or `repeats` | **HTTP 500**. `int(form.get(...))` is unguarded. |
-| 21 | Creating an experiment that already exists | Silently overwrites the YAML — verified changing `task.id` on an experiment that already had runs, with no warning. The old runs stay attached to the same experiment id and are then aggregated together with the new ones. |
-| 22 | Validation failure | Raw pydantic error text is URL-encoded into a query string (`?error=1%20validation%20error%20for%20Experiment...`) and every field the user typed is discarded by the redirect. |
-| 23 | Starting the proxy for a nonexistent experiment | No existence check; reports whatever the proxy layer complains about first (`LITELLM_MASTER_KEY is not set`) and redirects to a page that then 500s. |
-| 24 | Two baseline arms | The form uses checkboxes with a JS-synchronised `value`, so two can be checked; the failure surfaces only as a raw pydantic string via defect 22. Should be radio buttons. |
+| 19 | Invalid experiment name in a URL — fixed | `GET /experiments/foo.bar` → **HTTP 500**. `store.experiment_path` raises `InvalidExperimentName`, which no route catches. |
+| 20 | Non-numeric `timeout_s` or `repeats` — fixed | **HTTP 500**. `int(form.get(...))` is unguarded. |
+| 21 | Creating an experiment that already exists — fixed | Silently overwrites the YAML — verified changing `task.id` on an experiment that already had runs, with no warning. The old runs stay attached to the same experiment id and are then aggregated together with the new ones. |
+| 22 | Validation failure — fixed | Raw pydantic error text is URL-encoded into a query string (`?error=1%20validation%20error%20for%20Experiment...`) and every field the user typed is discarded by the redirect. |
+| 23 | Starting the proxy for a nonexistent experiment — fixed | No existence check; reports whatever the proxy layer complains about first (`LITELLM_MASTER_KEY is not set`) and redirects to a page that then 500s. |
+| 24 | Two baseline arms — fixed | The form uses checkboxes with a JS-synchronised `value`, so two can be checked; the failure surfaces only as a raw pydantic string via defect 22. Should be radio buttons. |
+
+**Fix:**
+
+- 19 and 23 shared one root cause: `store.experiment_path`'s
+  `InvalidExperimentName` and a plain missing-file check were each handled in
+  some routes and not others. `app._load_experiment_or_404` centralizes both
+  into a real `404` response rendered from a new `error.html` page (extends
+  `base.html`, so it keeps the dashboard's own chrome instead of a bare
+  traceback or FastAPI's default error body), and every route keyed by
+  experiment name (`experiment_detail`, `experiment_compare`, `start_proxy`,
+  `start_run`) now goes through it.
+- 20 and 22 are the same shape of problem: a bad value used to either crash
+  (`int(...)` on non-numeric input) or get caught only late, as a pydantic
+  `ValidationError` whose raw text was URL-encoded into `?error=...` while the
+  redirect threw away everything else the user had typed. `create_experiment`
+  now guards the int conversions itself (`app._parse_int_field`) and
+  translates pydantic's error list into short, readable per-field messages
+  (`app._split_validation_errors` — errors that map to one input, like
+  `task.id`, are shown next to that field; errors like "duplicate arm ids"
+  that don't correspond to a single input are shown above the form). On any
+  failure the form re-renders (HTTP 400) with the submitted values intact
+  (`app._form_snapshot`) instead of redirecting to a query string.
+- 21: `store.save_experiment` still writes `<name>.yaml` unconditionally, but
+  `create_experiment` now refuses to call it when the file already exists,
+  unless a `confirm_overwrite` checkbox (off by default, never implied) was
+  submitted — and the refusal message names how many runs are already
+  recorded against that experiment id, since those are exactly what would end
+  up aggregated with whatever the new definition produces. This closes the
+  silent-corruption path without removing the ability to deliberately
+  replace a definition.
+- 24: the baseline checkbox is now a radio button. Every row's radio shares
+  the same `name="arm_baseline"`, so the browser's native radio-group
+  behaviour makes "two arms marked baseline" unreachable from the form,
+  closing the defect at the source rather than downstream in validation.
+  Each row also gets a stable `arm_seq` assigned once at creation, and the
+  server matches the single submitted `arm_baseline` value against each
+  row's `arm_seq` — this is what let the old JS value-syncing hack (keeping
+  the checkbox's `value` equal to the arm id text as the user typed it) be
+  deleted entirely; the seq never needs to change after creation.
 
 Beyond the defects, the dashboard is thin in ways that matter:
 
-- **Invalid HTML**: `<a href="..."><button></button></a>` in `index.html` and
-  `experiment.html`. Interactive elements cannot be nested; this breaks keyboard
-  and assistive-technology behaviour. Use a styled link or a form button.
+- ~~**Invalid HTML**: `<a href="..."><button></button></a>` in `index.html`
+  and `experiment.html`. Interactive elements cannot be nested; this breaks
+  keyboard and assistive-technology behaviour. Use a styled link or a form
+  button.~~ **Fixed** — both replaced with a styled `<a class="btn">` (see
+  `base.html`'s `a.btn` rules), so there's exactly one interactive element
+  where there was a `<button>` nested inside an `<a>`.
 - **It can't see the repo's own experiments.** `store.list_experiments()` reads
   only `~/.yardstick/experiments`, so `experiments/example.yaml` — the file the
   README tells you to use — never appears. The docs and the UI disagree about

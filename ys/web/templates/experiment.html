@@ -7,7 +7,7 @@
 <p class="muted">task: <code>{{ experiment.task.id }}</code> &middot; success check: <code>{{ experiment.task.success_check }}</code> &middot; repeats: {{ experiment.repeats }}</p>
 
 <div class="row">
-  <a href="/experiments/{{ experiment.experiment }}/compare"><button type="button" class="secondary">view comparison</button></a>
+  <a href="/experiments/{{ experiment.experiment }}/compare" class="btn secondary">view comparison</a>
   {% if not proxy_alive %}
   <form method="post" action="/experiments/{{ experiment.experiment }}/proxy/up" class="inline">
     <button type="submit">start proxy for this experiment</button>
