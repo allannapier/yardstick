@@ -42,6 +42,29 @@ def test_point_preserves_unrelated_claude_settings(fake_agents):
     assert config["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:4000"
 
 
+def test_point_with_model_sets_claude_code_model_env_vars(fake_agents):
+    path = harness.point("claude-code", 4000, "sk-test", model="claude-sonnet-5")
+    with open(path) as f:
+        config = json.load(f)
+    assert config["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-5"
+    assert config["env"]["ANTHROPIC_SMALL_FAST_MODEL"] == "claude-sonnet-5"
+    assert config["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-sonnet-5"
+
+
+def test_point_without_model_does_not_set_model_env_vars(fake_agents):
+    path = harness.point("claude-code", 4000, "sk-test")
+    with open(path) as f:
+        config = json.load(f)
+    assert "ANTHROPIC_MODEL" not in config.get("env", {})
+
+
+def test_point_with_model_sets_opencode_model(fake_agents):
+    path = harness.point("opencode", 4010, "sk-test", model="claude-sonnet-5")
+    with open(path) as f:
+        config = json.load(f)
+    assert config["model"] == "anthropic/claude-sonnet-5"
+
+
 def test_point_preserves_unrelated_opencode_settings(fake_agents):
     with open(fake_agents["opencode"], "w") as f:
         json.dump({"$schema": "https://opencode.ai/config.json", "mcp": {"foo": {"type": "local"}}}, f)

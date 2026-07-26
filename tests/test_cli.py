@@ -1,8 +1,10 @@
+import json
 import re
 
+import pytest
 from typer.testing import CliRunner
 
-from ys import db
+from ys import db, harness, proxy
 from ys.cli import app
 
 runner = CliRunner()
@@ -15,6 +17,13 @@ def plain(text: str) -> str:
     color codes landing mid-word (e.g. Rich highlighting 'only' inside
     'only-arm' splits the literal string with a reset code)."""
     return _ANSI.sub("", text)
+
+
+def unwrapped(text: str) -> str:
+    """`plain` plus collapsing Rich's line-wrapping, for substring assertions
+    against sentences long enough that Rich may wrap them at the terminal
+    width mid-phrase."""
+    return " ".join(plain(text).split())
 
 EXPERIMENT_YAML = """
 experiment: cli-test-exp
@@ -34,6 +43,34 @@ def _write_exp(tmp_path, check="true"):
     path = tmp_path / "exp.yaml"
     path.write_text(EXPERIMENT_YAML.format(check=check))
     return str(path)
+
+
+MODEL_EXPERIMENT_YAML = """
+experiment: cli-model-exp
+task:
+  id: t0
+  success_check: "true"
+  timeout_s: 5
+arms:
+  - id: model-arm
+    factors: {model: claude-sonnet-5}
+    baseline: true
+repeats: 1
+"""
+
+
+def _write_model_exp(tmp_path):
+    path = tmp_path / "model_exp.yaml"
+    path.write_text(MODEL_EXPERIMENT_YAML)
+    return str(path)
+
+
+@pytest.fixture
+def fake_claude_agent(monkeypatch, tmp_path):
+    claude_path = str(tmp_path / "claude_settings.json")
+    monkeypatch.setitem(harness.AGENTS, "claude-code", harness.AgentSpec("claude-code", [claude_path]))
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-test")
+    return claude_path
 
 
 def test_init_creates_db():
@@ -174,3 +211,50 @@ def test_start_refuses_orphan_row_on_failed_claim(tmp_path):
             "SELECT COUNT(*) AS c FROM runs WHERE arm_id = 'cli-test-exp::only-arm'"
         ).fetchone()["c"]
     assert count == 1
+
+
+def test_harness_point_requires_exp_and_arm_together(fake_claude_agent):
+    result = runner.invoke(app, ["harness", "point", "claude-code", "--exp", "some.yaml"])
+    assert result.exit_code != 0
+    assert "--exp and --arm must be given together" in plain(result.stdout)
+
+
+def test_harness_point_with_exp_arm_pins_model(tmp_path, fake_claude_agent):
+    exp = _write_model_exp(tmp_path)
+    result = runner.invoke(app, ["harness", "point", "claude-code", "--exp", exp, "--arm", "model-arm"])
+    assert result.exit_code == 0, result.stdout
+    assert "model=claude-sonnet-5" in plain(result.stdout)
+
+    with open(fake_claude_agent) as f:
+        config = json.load(f)
+    assert config["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-5"
+
+
+def test_harness_point_without_exp_arm_warns(fake_claude_agent):
+    result = runner.invoke(app, ["harness", "point", "claude-code"])
+    assert result.exit_code == 0, result.stdout
+    assert "no --exp/--arm given" in plain(result.stdout)
+
+
+def test_start_warns_when_proxy_missing_arm_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-test")
+    monkeypatch.setattr(proxy, "model_available", lambda model, port, key: False)
+
+    exp = _write_model_exp(tmp_path)
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "model-arm"])
+    assert result.exit_code == 0, result.stdout
+    assert "no explicit entry for model 'claude-sonnet-5'" in unwrapped(result.stdout)
+
+    runner.invoke(app, ["end"])
+
+
+def test_start_warns_when_proxy_unreachable(tmp_path, monkeypatch):
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-test")
+    monkeypatch.setattr(proxy, "model_available", lambda model, port, key: None)
+
+    exp = _write_model_exp(tmp_path)
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "model-arm"])
+    assert result.exit_code == 0, result.stdout
+    assert "could not reach the proxy" in unwrapped(result.stdout)
+
+    runner.invoke(app, ["end"])
