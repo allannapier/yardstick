@@ -227,7 +227,13 @@ def init_db():
                         f"BEGIN;\n{migration}\nPRAGMA user_version = {version};\nCOMMIT;"
                     )
             except Exception:
-                conn.execute("ROLLBACK")
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    # No transaction to roll back (e.g. the failure was the
+                    # BEGIN itself, or executescript already unwound it).
+                    # Never let cleanup replace the real migration error.
+                    pass
                 raise
     finally:
         conn.close()

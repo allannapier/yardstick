@@ -128,7 +128,7 @@ def stop(pid_path: str, port_path: str, force: bool = False, grace_s: float = 5.
         return (
             f"process (pid {pid}) did not stop within {grace_s:.0f}s of SIGTERM; it is "
             "still running and the pidfile was left in place so it can still be found. "
-            "Re-run with force=True (`--force`) to send SIGKILL."
+            "Re-run with `--force` to send SIGKILL."
         )
 
     _signal_process_group(pid, signal.SIGKILL)

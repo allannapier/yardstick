@@ -19,8 +19,8 @@ Three things stand between it and being trustworthy:
 
 1. **It doesn't run.** `ys/render.py` was a `SyntaxError` on every Python below
    3.12, so `ys compare`, `ys report`, and the entire dashboard were dead on the
-   project's own declared minimum of 3.10. Fixed on this branch; the cause was
-   the absence of any CI that runs the tests.
+   project's own declared minimum of 3.10. Fixed; the cause was the absence of
+   any CI that runs the tests.
 2. **The core loop doesn't connect end to end.** `ys harness point` never tells
    the agent which model to ask for, so a real Claude Code session requests a
    model name the proxy has never heard of.
@@ -34,7 +34,7 @@ Everything else is comparatively routine.
 
 ## P0 — broken right now
 
-### 1. `render.py` did not parse on Python < 3.12 [verified] — fixed on this branch
+### 1. `render.py` did not parse on Python < 3.12 [verified] — fixed
 
 ```python
 f"{' <span class=\"warn\">UNCONTROLLED</span>' if a.fingerprint_drifted else ''}</th>"
@@ -49,7 +49,7 @@ hard `SyntaxError`, so `import ys.render` fails — taking out `ys compare`,
 suite reported "62 passed" while 18 tests were silently never running. With the
 fix applied it is 80 passed.
 
-### 2. There is no CI running the tests [verified] — fixed on this branch
+### 2. There is no CI running the tests [verified] — fixed
 
 `.github/workflows/` contained only `pages.yml`, which deploys the docs site.
 Nothing ran `pytest`, which is exactly why a syntax error in a core module
@@ -63,7 +63,7 @@ lint pass in a separate job. `pyproject.toml` now declares a `dev` extra
 locally; the handful of real lint findings (unused imports, an unused local, a
 lambda-assignment, an f-string without placeholders) are fixed alongside it.
 
-### 3. `ys harness point` never sets the model, so real runs fail [verified] — fixed on this branch
+### 3. `ys harness point` never sets the model, so real runs fail [verified] — fixed
 
 `harness.point()` wrote only `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`. But
 `proxy.generate_config()` registers models under the experiment's *factor value*
@@ -97,7 +97,7 @@ same `model_list`.
 - The README quick start now points the harness with `--exp`/`--arm` so the model
   is pinned before the run starts, instead of pointing blind.
 
-### 4. Background and subagent traffic corrupts conversation metrics [verified] — fixed on this branch
+### 4. Background and subagent traffic corrupts conversation metrics [verified] — fixed
 
 `_classify_transition` compares each request's message-hash list against the
 single previous request in the same run. Claude Code interleaves background calls
@@ -159,7 +159,7 @@ fingerprint); since a plain `ALTER TABLE ADD COLUMN` isn't safe to replay,
 non-`CREATE ... IF NOT EXISTS` migrations are now Python callables that guard
 their own column additions (`db._add_column_if_missing`).
 
-### 5. `ys proxy down` silently orphans the proxy [verified] — fixed on this branch
+### 5. `ys proxy down` silently orphans the proxy [verified] — fixed
 
 ```
 stop() returned after 5.0s: 'stopped process (pid 11395)'
@@ -196,7 +196,7 @@ message that points at a log file rather than at the real cause.
 
 ## P1 — data integrity and robustness
 
-### 6. SQLite is configured for a single writer [by inspection] — fixed on this branch
+### 6. SQLite is configured for a single writer [by inspection] — fixed
 
 `db.connect()` set `foreign_keys` and nothing else. The collector writes from
 inside the proxy process while the CLI and the dashboard read and write the same
@@ -220,7 +220,7 @@ silently mid-run.
   `ys status` and `ys end` surface the count so a lossy run is visible rather
   than quietly short.
 
-### 7. `seq` assignment races [verified] — fixed on this branch
+### 7. `seq` assignment races [verified] — fixed
 
 `_next_seq` did `SELECT COALESCE(MAX(seq),0)+1` outside any explicit
 transaction, and writes are dispatched through a thread pool executor. Two
@@ -377,6 +377,105 @@ Also: `repeats` is advisory. Nothing warns when one arm has 7 runs and another h
 
 ---
 
+## P1 — residual gaps left by the fixes above
+
+Findings 25–29 came out of reviewing the merged fixes for findings 3, 4 and 6
+rather than the original pass over the code. None of them reopen the finding
+they belong to — each fix does what it claims — but each is a place where the
+fix rests on an assumption that isn't enforced, or is narrower than the finding
+it closed.
+
+### 25. Thread separation depends entirely on the system prompt hash [by inspection]
+
+`_resolve_thread` (finding 4) only considers a candidate thread whose most
+recent request shares this request's `system_prompt_hash`. That check is doing
+*all* of the work, because `_classify_transition` tests `len(cur) < len(prev)`
+before it tests the shared prefix: any shorter history is classified
+"compaction", and `_resolve_thread` accepts "compaction" as a plausible parent.
+
+So a subagent or background call that happened to share the main thread's
+system prompt would be pulled into the main thread as a fabricated compaction
+event — the exact failure finding 4 exists to prevent. It doesn't happen today
+because Claude Code's `Task` subagents and its title-generation calls both
+carry a different system prompt, but that is a property of one harness at one
+version, not of the algorithm.
+
+The ambiguity is real and not obviously resolvable from message hashes alone: a
+genuine harness-side compaction rewrites the early history into a summary, so
+its shared prefix with the pre-compaction history is also 0 — indistinguishable
+from an unrelated shorter conversation on hashes alone.
+
+**Fix:** at minimum, state the assumption in `_resolve_thread`'s docstring and
+add a test that pins the behaviour when the system prompts *do* match, so a
+future change to the transition classifier can't silently widen the hole. A
+stronger version needs a second signal — a large drop in message count with a
+zero shared prefix looks much more like a new thread than like a compaction,
+and compaction candidates could require the request to be within some ratio of
+the parent's size.
+
+### 26. The "main" thread is whichever thread is largest [by inspection]
+
+`metrics._main_thread_key` picks the `thread_key` with the most requests, ties
+broken by earliest `MIN(seq)`. A long-running `Task` subagent can plausibly
+issue more requests than the conversation that spawned it, and when it does it
+becomes "the main thread": `turns`, the compaction metrics, and the run's
+corrected fingerprint (`main_thread_fingerprint`, written at `finish_run`) all
+come from the subagent instead of the driving conversation.
+
+**Fix:** prefer the thread containing the run's first request — the driving
+conversation is the one that starts the run — or keep the largest-thread rule
+but warn when the largest thread doesn't contain `seq = 1`, which is the case
+where the two rules disagree.
+
+### 27. Pinning the small/fast model routes background traffic through the arm's model [by inspection]
+
+Finding 3's fix writes `ANTHROPIC_SMALL_FAST_MODEL` and
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` to the arm's model alongside `ANTHROPIC_MODEL`.
+Background traffic that a real session would send to a small, cheap model
+therefore runs on the arm's model, and `cost_usd`/`billable_tokens` — which are
+deliberately run-wide, since that spend is real — are inflated relative to an
+unmeasured session. `background_requests`/`background_tokens` (finding 4) make
+the traffic *visible* but don't remove it from the cost totals.
+
+The same PR added the `model_name: "*"` catch-all, so the requests would now
+route and record correctly *without* being pinned. Pinning is still the right
+default for a mock experiment — unpinned background traffic would bypass
+`mock_response` and hit the real API during what is supposed to be a dry smoke
+test — so this is a trade-off to make explicit rather than a bug to reverse.
+
+**Fix:** document the effect where `point()` writes the variables, and consider
+`ys harness point --no-pin-background` (or pinning only when the arm's model
+declares a `mock_response`) so a real cost comparison can opt out. Overlaps
+findings 9 and 10, which have to price this traffic correctly either way.
+
+### 28. Only the collector retries a locked write [by inspection]
+
+Finding 6 gave `YardstickLogger._handle` a retry loop, but every other writer —
+`ys start`, `ys end`, `ys runs delete`, the dashboard — goes through a bare
+`db.cursor()`. WAL plus `busy_timeout=5000` makes contention unlikely rather
+than impossible, and a write that outlasts the busy timeout still surfaces as
+an unhandled `database is locked` traceback from the CLI, with `ys end` (which
+races the tail of the proxy's in-flight writes) the most exposed.
+
+**Fix:** move the retry into a helper alongside `db.cursor()` and use it for the
+CLI/dashboard write paths too, rather than duplicating the loop per call site.
+
+### 29. `ys start` silently skips its own model check without a master key [by inspection]
+
+The `model_available` warning added for finding 3 is guarded by
+`if model and master_key`, where `master_key` is read from the `ys start`
+process's environment. Run `ys proxy up` in one terminal and `ys start` in
+another without re-exporting `LITELLM_MASTER_KEY` and the check doesn't run,
+doesn't warn that it didn't run, and the user proceeds believing a verified
+proxy is serving their model — a first-run scenario, and the one finding 3 is
+about.
+
+**Fix:** print a "couldn't verify — `LITELLM_MASTER_KEY` not set in this shell"
+line in that branch. Belongs to the same diagnostic surface as findings 12
+and `ys doctor` (feature 4).
+
+---
+
 ## P2 — the dashboard
 
 All six of these were reproduced against `ys/web/app.py`.
@@ -521,13 +620,16 @@ can complete the README quick start with a real agent.
 
 **Milestone 2 — make the numbers trustworthy.** Finding 8 (migrations, done —
 this is what the rest of the milestone builds its schema changes on), then 4
-(done), 6 (done), 7 (done), 9, 11, 12, 13, 14. This is the batch that decides
-whether the tool's output can be believed; nothing above it matters if
-`compaction_events` and `cost_usd` are wrong.
+(done), 6 (done), 7 (done), 9, 11, 12, 13, 14, plus the residual gaps those
+fixes left: 25 and 26 (both decide which requests the headline metrics are
+computed over), 27 (alongside 9 and 10, since all three are about cost being
+right), and 28. This is the batch that decides whether the tool's output can be
+believed; nothing above it matters if `compaction_events` and `cost_usd` are
+wrong.
 
 **Milestone 3 — make it usable.** The dashboard defect table (19–24), the HTML and
 experiment-discovery fixes, `ys doctor`, `ys runs list`, and the unattributed
-surface.
+surface — with finding 29 folded into the same diagnostic pass.
 
 **Milestone 4 — make it a lab.** Unattended runs, workspace isolation, real
 statistics. Resolve the dead-config items (15–18) here, since most of them are the
