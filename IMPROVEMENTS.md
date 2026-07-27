@@ -1495,13 +1495,158 @@ file; the `--env-only` path sidesteps it entirely.
   stated reasons above, pending someone who can verify the real mechanism
   against a live install.
 
-### 6. Smaller additions
+### 6. Smaller additions -- fixed
 
 - `ys export --csv` / `--json` so results can leave the tool.
 - Budget guard: `ys start --budget 5.00` warns or aborts when a run's recorded
-  cost crosses a threshold.
+  cost crosses a threshold; `ys run --budget` enforces it between repeats.
 - Cross-experiment comparison / leaderboard across tasks.
 - Per-turn drill-down charts in the dashboard, not only in the static report.
+
+**Fix:**
+
+- **Per-turn drill-down charts: already done, nothing further needed here.**
+  A prior PR (#17, folded into the P2 dashboard work) added
+  `ys/web/app.py`'s `_turn_chart_svg` -- a per-turn context-tokens inline SVG,
+  the same weight as `render.py`'s own `_sparkline_svg` -- rendered on
+  `/runs/{run_id}` (`run_detail.html`) once a run has at least two main-thread
+  requests. Verified present on `main` before starting this change; `ys/web/**`
+  was off-limits for this feature anyway, so this bullet is marked satisfied
+  rather than duplicated.
+- **`ys export --csv`/`--json`** (new `ys/export.py`). The unit of export is
+  **one row per run**, not one row per arm-aggregate and not one row per
+  request: `ys compare`/`ys report` already own the arm-aggregate view, and
+  `aggregate_run_metrics` deliberately *excludes* unfinished/abandoned runs
+  and runs from a stale config version before computing a mean (findings
+  13/14) -- exactly the detail an export needs to keep visible, not fold
+  away. Per-request rows are the finest granularity available but don't
+  carry "finished/abandoned" or "config group" as a row-level fact without a
+  join back to `runs`, defeating a self-contained file. A run row carries its
+  own identifying context directly: `experiment`, `arm`, `run_id`,
+  `config_hash` plus a `config_matches_current` boolean (finding 14), and a
+  `status` of `success`/`fail`/`unfinished`/`abandoned` (finding 13) instead
+  of a bare, ambiguous `task_success` column. `cost_unknown` mirrors finding
+  9's `cost_source`: true if any of the run's requests couldn't be priced by
+  LiteLLM or a declared `pricing:` override, so a `cost_usd` of exactly 0
+  in the file is never silently read as "measured and free." `ys export`
+  (`ys/cli.py`, additive) writes one or both formats; `--csv`'s quoting
+  (`csv.DictWriter`'s `QUOTE_MINIMAL`) and `None`-as-empty-cell behaviour
+  (vs. JSON's real `null`) are both covered directly in
+  `tests/test_export.py`, including a value containing a comma.
+- **Budget guard.** `ys start --budget 5.00` (the one permitted edit to an
+  existing `cli.py`/`runs.py` function, per this PR's scope) calls the new
+  `runs.arm_cost_summary` (additive), which sums `cost_usd` across the arm's
+  already-*finished* runs and flags whether any of them has an
+  unpriceable request. **What this can and can't check, made explicit:**
+  `ys start` returns before the harness sends a single request, so it
+  cannot know the run about to start's own cost -- enforcing that live
+  would mean instrumenting the request path inside the proxy/collector,
+  both off-limits for this change, and even then `ys start` itself is a
+  one-shot command that returns immediately, so it could never block on
+  traffic that hasn't happened yet. The guard instead checks the arm's own
+  recorded history: if those already-finished runs alone total at or above
+  the budget, `ys start` refuses to begin another repeat (`typer.Exit(1)`,
+  before the active-run slot is claimed, same ordering as the existing
+  `validate_task_paths` check); if the history includes a request neither
+  LiteLLM nor a declared `pricing:` override could price
+  (`cost_source='unknown'`, finding 9), it says so explicitly and does
+  *not* report "under budget" -- a guard that can't tell "genuinely free"
+  from "nothing could price it" is worse than none, per the finding this
+  feature depends on. **When the user actually finds out this run's own
+  cost:** unchanged -- `ys end` already prints `cost_usd` in its headline
+  metrics every time; the budget guard doesn't add a second check there,
+  so a budget-conscious user reads that number the same way they always
+  have, now with the arm's running total fresh from what `ys start` just
+  printed.
+- **The budget guard reaches the place money actually burns: `ys run
+  --budget`** (`runner.check_budget`, `runner.run_experiment`'s new
+  `budget` parameter, and the `--budget` option on `ys run`). The
+  history-only check above is an honest pre-flight for a single
+  hand-driven `ys start`, but a budget guard exists for *unattended*
+  operation, and feature 1's `ys run` is a loop that drives an agent N
+  times with nobody watching — a guard that never observes the runs it
+  guards is surprising there in a way it isn't for `ys start`. `ys run`
+  doesn't have `ys start`'s limitation for the repeats it drives itself:
+  once a repeat has finished and been scored, that repeat's real
+  `cost_usd` is recorded, so the loop totals the arm's spend after **every
+  repeat** and stops before starting one that would take it past the
+  threshold (`aborted_reason`, hence the CLI's existing nonzero exit — so
+  an overnight matrix in a shell script can tell it stopped early). The
+  running total is printed per repeat, with how much of it this loop is
+  responsible for, so a human scanning the log sees spend accumulate
+  rather than only learning about it at the end.
+  - **Same unit as `ys start --budget`**, deliberately: the arm's whole
+    recorded history, not just this invocation's repeats, so the two flags
+    can't disagree about what "$5.00 for this arm" means. The
+    per-invocation figure is reported alongside it rather than being what
+    the threshold is compared against.
+  - **Checked before the first repeat too**, and before the harness is
+    pointed — an arm already over budget costs nothing at all, not even a
+    mutated config file to reset afterwards.
+  - **Finding 9's honesty rule carried in unchanged:** if any counted run
+    has a request neither LiteLLM nor a declared `pricing:` override could
+    price, the total is a **floor**, not a measurement. That still supports
+    one sound conclusion — a floor at or over the budget is definitely over
+    it, so the stop condition is computed identically either way — but
+    never the opposite one, so an under-budget total with unpriced runs
+    present is reported as unverifiable ("cannot confirm this arm is under
+    budget", pointing at `pricing:` as the fix) instead of "under budget".
+    The loop **continues** in that case rather than refusing to run:
+    an unpriced model is finding 9's common case, and the fix for it is a
+    `pricing:` block, not abandoning the experiment.
+  - An overage on the *final* repeat is reported but is not an early abort:
+    there is nothing left to stop, and calling that "stopped early" would
+    be false.
+  - Tests (`tests/test_runner.py`, `tests/test_cli.py`): the between-repeats
+    stop ($1.00/repeat against a $1.50 budget must stop after repeat 2 of
+    3), the running total printed per repeat, the pre-flight refusal that
+    never invokes the agent once, the unpriced-repeat floor case, the
+    final-repeat overage that must *not* be an abort, no-budget behaviour
+    left unchanged, and `ys run --budget` end to end through the CLI
+    including the nonzero exit. Each was confirmed to fail with its own
+    half of the fix reverted.
+- **Cross-experiment leaderboard** (`render.build_leaderboard`/
+  `build_leaderboard_table`/`leaderboard_notes`, plus `ys leaderboard` in
+  `cli.py`, all additive). Ranks each experiment's own arms on one metric,
+  then lays every experiment's rows side by side. Rank is scoped **within**
+  each experiment, never a single ordering across every arm of every
+  experiment given: two experiments are two different tasks, so a mean on
+  one isn't comparable in magnitude to a mean on the other (no shared zero
+  point) -- what *can* honestly cross the experiment boundary is "is this
+  arm distinguishable from its own baseline's noise," which is exactly
+  feature 3's exact permutation test (`ys/statistics.py`,
+  `stats.metric_verdict`), computed per experiment exactly the way
+  `render.significance_verdicts` already does for `ys compare`. A
+  non-baseline row that ranks best in its experiment but isn't
+  distinguishable from its baseline (e.g. the plan's own n=3 example, where
+  `min_two_sided_p(3, 3) == 0.1` means no result at that n could ever reach
+  significance) is marked `distinguishable=False` and carries the same
+  verdict sentence `ys compare` prints, rather than a bare rank number
+  standing in for a claim the data can't support. `ys leaderboard --exp a
+  --exp b --metric cost_usd` prints the table plus an "is the ranking
+  real?" section for any row with a computed verdict, mirroring `ys
+  compare`'s own "is the difference real?" section.
+- Tests: `tests/test_export.py` (new) covers round-tripping both formats,
+  CSV quoting, `None`-as-empty-cell vs. JSON `null`, the `status`/
+  `config_matches_current`/`cost_unknown` fields, and arm-filtering.
+  `tests/test_cli.py` adds coverage for `ys export`'s file-writing/empty-run
+  cases, the budget guard firing (aborts once history already meets the
+  budget -- proven to fail without the check by reverting it locally
+  during development), the budget guard's unpriced-history case, and `ys
+  leaderboard` end to end (including the "not distinguishable from noise"
+  marker for the n=3 case). `tests/test_render.py` adds direct unit coverage
+  for `build_leaderboard`'s per-experiment rank scoping, its
+  distinguishable/not-distinguishable branches, and a large-effect case
+  that *is* significant (so the leaderboard doesn't just always hedge).
+- Left out, deliberately: the budget guard still doesn't add a live,
+  mid-*request* meter — enforcement is per completed repeat, so a single
+  runaway repeat can still overshoot the threshold before anything can
+  check it. Stopping mid-turn would mean instrumenting the request path
+  inside the proxy/collector, a much larger change, and a repeat killed
+  halfway is an unscorable data point rather than a cheap one. The
+  leaderboard doesn't attempt
+  a single global rank across experiments -- see above for why that would
+  misrepresent different tasks as directly comparable in magnitude.
 
 ---
 

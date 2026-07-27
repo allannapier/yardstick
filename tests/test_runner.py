@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from ys import runner, state
+from ys import db, runner, state
 from ys.experiment import Experiment
 
 
@@ -454,3 +454,155 @@ def test_run_experiment_resets_file_based_harness_even_when_the_loop_aborts(monk
 
     status = harness.status("opencode")
     assert status.config_exists is False
+
+
+# --- run_experiment: the budget guard (feature 6) --------------------------
+
+
+def _fake_agent_spending(cost, cost_source="litellm"):
+    """A fake agent invocation that also records what it 'spent'. The
+    runner puts YS_RUN_ID in the subprocess environment, so writing one
+    priced request row against it is exactly the shape of what a real
+    agent's traffic leaves behind through the proxy's collector -- which is
+    what makes the between-repeats check have anything real to total."""
+    def _run(cmd, **kwargs):
+        run_id = kwargs["env"]["YS_RUN_ID"]
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO requests (run_id, seq, ts, model, input_tokens, output_tokens, "
+                "response_cost, cost_source) VALUES (?,1,?,?,?,?,?,?)",
+                (run_id, "2026-01-01T00:00:00Z", "test-model", 10, 5, cost, cost_source),
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    return _agent_only(_run)
+
+
+def _events(sink):
+    return "\n".join(e.message for e in sink)
+
+
+def test_run_experiment_stops_between_repeats_once_the_budget_is_spent(monkeypatch, prompt_file):
+    """Feature 6's budget guard at the place money actually burns: each
+    repeat costs $1.00 against a $1.50 budget, so the loop must stop after
+    repeat 2 rather than driving the agent a third time. Reverting the
+    between-repeats check in run_experiment lets all 3 repeats run -- this
+    test fails without it."""
+    monkeypatch.setattr(runner.subprocess, "run", _fake_agent_spending(1.00))
+    exp = _experiment(prompt_file)
+    sink = []
+
+    summary = runner.run_experiment(
+        exp, _yaml_for(prompt_file), "only-arm", agent_name="claude-code",
+        repeats=3, port=4000, master_key="sk-test", settle_s=0,
+        budget=1.50, on_event=sink.append,
+    )
+
+    assert summary.repeats_completed == 2
+    assert summary.aborted_reason is not None
+    assert "stopping before repeat 3/3" in summary.aborted_reason
+    assert "$2.00" in summary.aborted_reason and "$1.50" in summary.aborted_reason
+
+
+def test_run_experiment_reports_the_running_total_after_every_repeat(monkeypatch, prompt_file):
+    monkeypatch.setattr(runner.subprocess, "run", _fake_agent_spending(0.25))
+    exp = _experiment(prompt_file)
+    sink = []
+
+    summary = runner.run_experiment(
+        exp, _yaml_for(prompt_file), "only-arm", agent_name="claude-code",
+        repeats=3, port=4000, master_key="sk-test", settle_s=0,
+        budget=5.00, on_event=sink.append,
+    )
+
+    assert summary.repeats_completed == 3
+    assert summary.aborted_reason is None
+    output = _events(sink)
+    assert "$0.25 of $5.00" in output
+    assert "$0.50 of $5.00" in output
+    assert "$0.75 of $5.00" in output
+
+
+def test_run_experiment_refuses_to_start_a_single_repeat_when_already_over_budget(monkeypatch, prompt_file):
+    """The pre-flight leg: an arm whose recorded history already meets the
+    budget must not invoke the agent even once."""
+    invoked = []
+
+    def _spy(cmd, **kwargs):
+        invoked.append(cmd)
+        return _fake_agent_spending(3.00)(cmd, **kwargs)
+
+    monkeypatch.setattr(runner.subprocess, "run", _agent_only(_spy))
+    exp = _experiment(prompt_file)
+
+    # One prior repeat spends $3.00 of a $2.00 budget...
+    runner.run_experiment(
+        exp, _yaml_for(prompt_file), "only-arm", agent_name="claude-code",
+        repeats=1, port=4000, master_key="sk-test", settle_s=0,
+    )
+    assert len(invoked) == 1
+    invoked.clear()
+
+    # ...so a second `ys run` against the same arm never starts at all.
+    summary = runner.run_experiment(
+        exp, _yaml_for(prompt_file), "only-arm", agent_name="claude-code",
+        repeats=2, port=4000, master_key="sk-test", settle_s=0, budget=2.00,
+    )
+
+    assert invoked == []
+    assert summary.repeats_completed == 0
+    assert "refusing to start any repeat" in summary.aborted_reason
+
+
+def test_run_experiment_treats_an_unpriced_repeat_as_a_floor_not_a_measurement(monkeypatch, prompt_file):
+    """Finding 9's honesty rule carried into the loop: a repeat whose
+    requests couldn't be priced makes the running total a floor, so the
+    guard must not report the arm as being under budget on the strength of
+    an understated number."""
+    monkeypatch.setattr(runner.subprocess, "run", _fake_agent_spending(0.0, cost_source="unknown"))
+    exp = _experiment(prompt_file)
+    sink = []
+
+    summary = runner.run_experiment(
+        exp, _yaml_for(prompt_file), "only-arm", agent_name="claude-code",
+        repeats=2, port=4000, master_key="sk-test", settle_s=0,
+        budget=5.00, on_event=sink.append,
+    )
+
+    output = _events(sink)
+    assert summary.repeats_completed == 2  # unpriceable != unrunnable
+    assert "FLOOR" in output
+    assert "Cannot confirm this arm is under budget" in output
+    assert [e for e in sink if e.level == "warning" and "budget guard" in e.message]
+
+
+def test_run_experiment_over_budget_on_the_final_repeat_is_reported_not_an_abort(monkeypatch, prompt_file):
+    """Nothing is left to stop once the last repeat has run, so blowing the
+    budget there is reported without being dressed up as an early abort."""
+    monkeypatch.setattr(runner.subprocess, "run", _fake_agent_spending(2.00))
+    exp = _experiment(prompt_file)
+    sink = []
+
+    summary = runner.run_experiment(
+        exp, _yaml_for(prompt_file), "only-arm", agent_name="claude-code",
+        repeats=1, port=4000, master_key="sk-test", settle_s=0,
+        budget=0.50, on_event=sink.append,
+    )
+
+    assert summary.repeats_completed == 1
+    assert summary.aborted_reason is None
+    assert "at or over the $0.50 budget" in _events(sink)
+
+
+def test_run_experiment_without_a_budget_never_checks_one(monkeypatch, prompt_file):
+    monkeypatch.setattr(runner.subprocess, "run", _fake_agent_spending(9.99))
+    exp = _experiment(prompt_file)
+    sink = []
+
+    summary = runner.run_experiment(
+        exp, _yaml_for(prompt_file), "only-arm", agent_name="claude-code",
+        repeats=2, port=4000, master_key="sk-test", settle_s=0, on_event=sink.append,
+    )
+
+    assert summary.repeats_completed == 2
+    assert "budget guard" not in _events(sink)

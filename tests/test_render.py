@@ -670,3 +670,148 @@ def test_render_html_no_bootstrap_ci_with_a_single_run():
         content = render.render_html(comparison, cur)
 
     assert "CI95[" not in content
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: cross-experiment leaderboard
+# ---------------------------------------------------------------------------
+
+
+def test_build_leaderboard_ranks_within_each_experiment_lower_is_better():
+    """cost_usd is a lower-is-better metric -- the cheaper arm within an
+    experiment must rank 1st, and rank is scoped per experiment (never a
+    single ordering across the two different tasks here)."""
+    db.init_db()
+    exp1 = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    exp1 = Experiment.model_validate({**exp1.model_dump(), "experiment": "exp1"})
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp1, "a", [1.02, 0.98, 1.00])
+        _seed_three_runs(cur, exp1, "b", [0.80, 0.85, 0.81])  # cheaper -> should rank 1st
+        comparison = render.compare_experiment(cur, exp1)
+
+    rows = render.build_leaderboard([comparison], metric="cost_usd")
+    rank_by_arm = {r.arm_id: r.rank for r in rows}
+    assert rank_by_arm["b"] == 1
+    assert rank_by_arm["a"] == 2
+
+
+def test_build_leaderboard_flags_arms_not_distinguishable_from_noise():
+    """The plan's own n=3 case: a cheaper-on-paper arm whose difference
+    can never reach exact-test significance at n=3 must be flagged
+    distinguishable=False (not silently ranked as a clear win) -- reusing
+    the same stats.metric_verdict feature 3 already computes for
+    significance_verdicts."""
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.02, 0.98, 1.00])
+        _seed_three_runs(cur, exp, "b", [0.80, 0.85, 0.81])
+        comparison = render.compare_experiment(cur, exp)
+
+    rows = render.build_leaderboard([comparison], metric="cost_usd")
+    row_b = next(r for r in rows if r.arm_id == "b")
+    assert row_b.rank == 1  # cheapest on paper ...
+    assert row_b.distinguishable is False  # ... but not a settled win
+    assert row_b.note is not None
+    assert "repeats needed" in row_b.note
+
+    row_a = next(r for r in rows if r.arm_id == "a")
+    assert row_a.is_baseline
+    assert row_a.distinguishable is None  # baseline has nothing to compare itself against
+
+
+def test_build_leaderboard_marks_significant_difference_when_distinguishable():
+    """A large, clean effect at n=4 (min_n_for_exact_significance(3) == 4,
+    see ys/statistics.py) must come back distinguishable=True, so the
+    leaderboard doesn't *always* hedge -- only when the test genuinely
+    can't tell noise from signal."""
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        for i, cost in enumerate([1.00, 1.01, 0.99, 1.00], start=1):
+            _seed_run(cur, exp, "a", f"ra{i}", i, cost, 2)
+        for i, cost in enumerate([0.10, 0.11, 0.09, 0.10], start=1):
+            _seed_run(cur, exp, "b", f"rb{i}", i, cost, 2)
+        comparison = render.compare_experiment(cur, exp)
+
+    rows = render.build_leaderboard([comparison], metric="cost_usd")
+    row_b = next(r for r in rows if r.arm_id == "b")
+    assert row_b.rank == 1
+    assert row_b.distinguishable is True
+    assert "distinguishable from noise" in row_b.note
+
+
+def test_build_leaderboard_scopes_rank_within_each_experiment_not_globally():
+    """Two experiments (two different tasks) with very different cost
+    scales -- ranking must never compare arm-a of exp1 against arm-a of
+    exp2 directly; each experiment's own arms are only ranked against each
+    other."""
+    db.init_db()
+    exp1 = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    exp1 = Experiment.model_validate({**exp1.model_dump(), "experiment": "exp1"})
+    exp2 = Experiment.model_validate({**exp1.model_dump(), "experiment": "exp2"})
+    with db.cursor() as cur:
+        for i, cost in enumerate([10.0, 10.1, 9.9], start=1):
+            _seed_run(cur, exp1, "a", f"e1ra{i}", i, cost, 2)
+        for i, cost in enumerate([1.0, 1.1, 0.9], start=1):
+            _seed_run(cur, exp1, "b", f"e1rb{i}", i, cost, 2)
+        comparison1 = render.compare_experiment(cur, exp1)
+
+        for i, cost in enumerate([0.01, 0.011, 0.009], start=1):
+            _seed_run(cur, exp2, "a", f"e2ra{i}", i, cost, 2)
+        for i, cost in enumerate([0.05, 0.051, 0.049], start=1):
+            _seed_run(cur, exp2, "b", f"e2rb{i}", i, cost, 2)
+        comparison2 = render.compare_experiment(cur, exp2)
+
+    rows = render.build_leaderboard([comparison1, comparison2], metric="cost_usd")
+    ranks = {(r.experiment_name, r.arm_id): r.rank for r in rows}
+    assert ranks[("exp1", "b")] == 1
+    assert ranks[("exp1", "a")] == 2
+    assert ranks[("exp2", "a")] == 1
+    assert ranks[("exp2", "b")] == 2
+
+
+def test_leaderboard_notes_only_include_rows_with_a_computed_verdict():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.02, 0.98, 1.00])
+        _seed_three_runs(cur, exp, "b", [0.80, 0.85, 0.81])
+        comparison = render.compare_experiment(cur, exp)
+
+    rows = render.build_leaderboard([comparison], metric="cost_usd")
+    notes = render.leaderboard_notes(rows)
+    assert len(notes) == 1  # only the non-baseline arm gets a verdict sentence
+    assert "arm-b" not in notes[0]  # arm ids here are just "a"/"b"
+    assert "b is" in notes[0]
+
+
+def test_build_leaderboard_table_renders_without_error():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.02, 0.98, 1.00])
+        _seed_three_runs(cur, exp, "b", [0.80, 0.85, 0.81])
+        comparison = render.compare_experiment(cur, exp)
+
+    rows = render.build_leaderboard([comparison], metric="cost_usd")
+    table = render.build_leaderboard_table(rows, "cost_usd")
+    assert table.row_count == 2

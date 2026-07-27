@@ -760,3 +760,189 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
   .verdict-banner ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
 </style>
 {body}"""
+
+
+# ---------------------------------------------------------------------------
+# Feature 6 -- cross-experiment leaderboard. Ranks arms across *different*
+# experiments (different tasks) on one metric, reusing exactly the same
+# gate-passing / current-config-hash population `compare_experiment` already
+# assembles per experiment (findings 13/14) and the same significance
+# machinery `significance_verdicts` uses (feature 3) -- a leaderboard is
+# precisely where a difference within noise looks like a ranking if nothing
+# stops it from being presented as one.
+# ---------------------------------------------------------------------------
+
+# Metrics where a *lower* mean is the better outcome -- the leaderboard sorts
+# ascending for these (cheaper/faster/fewer wins) and descending for
+# everything else. Mirrors render.py's own _METRIC_DIRECTION_WORDS/
+# _COUNT_METRICS above in spirit (this rig is overwhelmingly "lower is
+# better"), but kept as its own explicit set rather than reusing those --
+# they're about word choice in a sentence, this is about sort order, and
+# conflating the two would make a future addition to one silently change
+# the other.
+_LOWER_IS_BETTER_METRICS = frozenset(
+    {
+        "cost_usd",
+        "cost_per_success",
+        "billable_tokens",
+        "wall_clock_s",
+        "active_s",
+        "turns",
+        "tool_calls",
+        "tool_error_rate",
+        "redundant_tool_calls",
+        "redundancy_rate",
+        "compaction_events",
+        "tokens_dropped",
+        "context_high_water",
+        "tokens_per_turn",
+        "overhead_tokens_per_turn",
+        "fixed_overhead_tokens",
+        "overhead_share",
+    }
+)
+
+
+@dataclass
+class LeaderboardRow:
+    experiment_name: str
+    task_id: str
+    arm_id: str
+    is_baseline: bool
+    value: Optional[float]
+    n: int
+    # 1-based rank *within this experiment's own arms* on the chosen metric
+    # -- never a single rank across every experiment. Comparing arms across
+    # different tasks is inherently apples-to-oranges (a different task
+    # means a different baseline cost/duration/difficulty), so this answers
+    # "which arm did best on the task it happened to run," not "which arm
+    # is best" -- see `build_leaderboard`'s docstring.
+    rank: Optional[int]
+    # None: this row *is* the baseline, or the experiment has no baseline
+    # arm at all, or there weren't enough observations on either side to
+    # run the test -- not the same as "not distinguishable", which is a
+    # real (negative) answer from the test.
+    distinguishable: Optional[bool]
+    # The feature-3 verdict sentence for this arm vs its own experiment's
+    # baseline, when one could be computed -- reused verbatim from
+    # `_format_metric_verdict` so the leaderboard never invents a second
+    # form of words for the same judgment `ys compare` already prints.
+    note: Optional[str]
+
+
+def build_leaderboard(comparisons: list, metric: str = "cost_usd") -> list:
+    """Rank each experiment's arms on `metric`, then lay every experiment's
+    rows side by side -- feature 6's cross-experiment leaderboard.
+
+    `comparisons` is a list of already-built `Comparison` objects (one per
+    experiment, from `compare_experiment`) -- reusing them rather than
+    re-querying means the leaderboard automatically inherits
+    `compare_experiment`'s own honesty about which runs count (only
+    gate-passing runs matching today's config_hash, findings 13/14)
+    instead of a second, possibly-inconsistent aggregation.
+
+    Ranking is deliberately scoped **within** each experiment, never a
+    single ordering across every arm of every experiment: two experiments
+    are two different tasks, so "arm X's mean cost_usd is lower than arm
+    Y's" is meaningless once X and Y ran different tasks -- there is no
+    shared zero point. What *can* honestly cross experiment boundaries is
+    "is arm X distinguishable from its own baseline's noise" (feature 3's
+    permutation test, scoped per-experiment already), so that's the signal
+    surfaced per row instead of a global rank.
+
+    Every non-baseline row with a baseline to compare against gets a
+    `distinguishable` verdict computed the same way
+    `significance_verdicts` computes one -- so a leaderboard row that
+    *looks* like the best rank in its experiment but isn't actually
+    distinguishable from its baseline's noise carries that caveat with it
+    rather than being presented as a settled win.
+    """
+    rows = []
+    for comparison in comparisons:
+        baseline = next((a for a in comparison.arms if a.is_baseline), None)
+        lower_is_better = metric in _LOWER_IS_BETTER_METRICS
+
+        verdict_by_arm = {}
+        if baseline is not None:
+            baseline_values = baseline.aggregate["metrics"].get(metric, {}).get("values") or []
+            for arm in comparison.arms:
+                if arm.is_baseline:
+                    continue
+                arm_values = arm.aggregate["metrics"].get(metric, {}).get("values") or []
+                verdict = stats.metric_verdict(baseline_values, arm_values)
+                if verdict is not None:
+                    verdict_by_arm[arm.arm_id] = verdict
+
+        candidates = []
+        for arm in comparison.arms:
+            value = arm.aggregate["metrics"].get(metric, {}).get("mean")
+            if value is not None:
+                candidates.append((arm.arm_id, value))
+        candidates.sort(key=lambda pair: pair[1], reverse=not lower_is_better)
+        rank_by_arm = {arm_id: i + 1 for i, (arm_id, _) in enumerate(candidates)}
+
+        for arm in comparison.arms:
+            stat = arm.aggregate["metrics"].get(metric, {})
+            verdict = verdict_by_arm.get(arm.arm_id)
+            note = None
+            if verdict is not None and baseline is not None:
+                note = _format_metric_verdict(metric, arm.label, baseline.label, verdict)
+            rows.append(
+                LeaderboardRow(
+                    experiment_name=comparison.experiment_name,
+                    task_id=comparison.task_id,
+                    arm_id=arm.arm_id,
+                    is_baseline=arm.is_baseline,
+                    value=stat.get("mean"),
+                    n=stat.get("n", 0),
+                    rank=rank_by_arm.get(arm.arm_id),
+                    distinguishable=verdict.significant if verdict is not None else None,
+                    note=note,
+                )
+            )
+    return rows
+
+
+def build_leaderboard_table(rows: list, metric: str):
+    from rich.table import Table
+
+    table = Table(title=f"cross-experiment leaderboard -- {metric}")
+    table.add_column("experiment")
+    table.add_column("task")
+    table.add_column("arm")
+    table.add_column("rank", justify="right")
+    table.add_column(metric, justify="right")
+    table.add_column("n", justify="right")
+    # no_wrap: this cell's text ("not distinguishable from noise") is the
+    # one substantive judgment in the whole row -- letting Rich wrap it
+    # across lines at a narrow terminal width makes it easy to miss (and
+    # awkward to assert on in tests), so it stays a single line.
+    table.add_column("vs baseline", no_wrap=True)
+    for r in rows:
+        if r.is_baseline:
+            vs = "baseline"
+        elif r.distinguishable is True:
+            vs = "distinguishable from noise"
+        elif r.distinguishable is False:
+            vs = "[yellow]not distinguishable from noise[/yellow]"
+        else:
+            vs = "-"
+        table.add_row(
+            r.experiment_name,
+            r.task_id,
+            r.arm_id,
+            str(r.rank) if r.rank is not None else "-",
+            _fmt(r.value),
+            str(r.n),
+            vs,
+        )
+    return table
+
+
+def leaderboard_notes(rows: list) -> list:
+    """One verdict sentence per ranked-but-not-baseline row that actually
+    got a significance verdict computed -- printed under the table the same
+    way `ys compare`'s "is the difference real?" section is, so a rank in
+    the table is never the last word on its own when a `[yellow]not
+    distinguishable[/yellow]` marker is sitting next to it."""
+    return [r.note for r in rows if r.note]
