@@ -86,6 +86,92 @@ def test_generate_config_always_includes_catch_all_entry(tmp_path):
     assert catch_all["litellm_params"]["api_key"] == "os.environ/ANTHROPIC_API_KEY"
 
 
+# --- feature 5: provider-agnostic model fallback / catch-all ---------------
+
+
+def test_generate_config_fallback_does_not_double_prefix_an_already_prefixed_model(tmp_path):
+    """Regression test for the pre-feature-5 bug: `_fallback_params` used to
+    blindly prepend `anthropic/` to every `factors.model` value with no
+    explicit `models:` entry, so an already-provider-prefixed value like
+    `openai/gpt-4o` came out as `anthropic/openai/gpt-4o` -- reverting the
+    `"/" in model_value` check in `ys.proxy._fallback_params` makes this
+    fail."""
+    exp_path = _write_experiment(
+        tmp_path / "exp.yaml",
+        models={},
+        arms=[{"id": "a", "factors": {"model": "openai/gpt-4o"}}],
+    )
+    config_path = proxy.generate_config([exp_path])
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    entry = next(m for m in config["model_list"] if m["model_name"] == "openai/gpt-4o")
+    assert entry["litellm_params"]["model"] == "openai/gpt-4o"
+    assert entry["litellm_params"]["api_key"] == "os.environ/OPENAI_API_KEY"
+
+
+def test_generate_config_fallback_omits_api_key_for_a_provider_without_a_simple_one(tmp_path):
+    """bedrock/vertex_ai use AWS SigV4 creds / a GCP service-account file,
+    not a plain bearer token -- `_fallback_params` must not fabricate an
+    `api_key` field pointed at a made-up env var name for them."""
+    exp_path = _write_experiment(
+        tmp_path / "exp.yaml",
+        models={},
+        arms=[{"id": "a", "factors": {"model": "bedrock/anthropic.claude-3-5-sonnet"}}],
+    )
+    config_path = proxy.generate_config([exp_path])
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    entry = next(m for m in config["model_list"] if m["model_name"] == "bedrock/anthropic.claude-3-5-sonnet")
+    assert entry["litellm_params"]["model"] == "bedrock/anthropic.claude-3-5-sonnet"
+    assert "api_key" not in entry["litellm_params"]
+
+
+def test_catch_all_follows_the_single_declared_provider(tmp_path):
+    """When every declared model agrees on a provider, the catch-all should
+    route background/unregistered traffic to that same provider instead of
+    always assuming Anthropic -- a Codex CLI or Aider run's own background
+    traffic would carry an OpenAI-shaped model id, and an anthropic/*
+    catch-all would send that straight to the wrong API."""
+    exp_path = _write_experiment(
+        tmp_path / "exp.yaml",
+        models={"gpt4-arm": {"model": "openai/gpt-4o", "api_key": "os.environ/OPENAI_API_KEY"}},
+        arms=[{"id": "a", "factors": {"model": "gpt4-arm"}}],
+    )
+    config_path = proxy.generate_config([exp_path])
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    catch_all = next(m for m in config["model_list"] if m["model_name"] == "*")
+    assert catch_all["litellm_params"]["model"] == "openai/*"
+    assert catch_all["litellm_params"]["api_key"] == "os.environ/OPENAI_API_KEY"
+
+
+def test_catch_all_falls_back_to_anthropic_when_providers_are_mixed(tmp_path):
+    """A genuine cross-provider comparison (the tool's own premise) can't
+    pick a single catch-all provider -- falls back to the original
+    anthropic/* default rather than guessing between the two."""
+    exp_path = _write_experiment(
+        tmp_path / "exp.yaml",
+        models={
+            "claude-arm": {"model": "anthropic/claude-sonnet-5", "api_key": "os.environ/ANTHROPIC_API_KEY"},
+            "gpt-arm": {"model": "openai/gpt-4o", "api_key": "os.environ/OPENAI_API_KEY"},
+        },
+        arms=[
+            {"id": "a", "factors": {"model": "claude-arm"}},
+            {"id": "b", "factors": {"model": "gpt-arm"}},
+        ],
+    )
+    config_path = proxy.generate_config([exp_path])
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    catch_all = next(m for m in config["model_list"] if m["model_name"] == "*")
+    assert catch_all["litellm_params"]["model"] == "anthropic/*"
+    assert catch_all["litellm_params"]["api_key"] == "os.environ/ANTHROPIC_API_KEY"
+
+
 def test_model_available_returns_none_when_proxy_unreachable():
     # Nothing is listening on this port during a unit test.
     assert proxy.model_available("some-model", 65432, "sk-test") is None

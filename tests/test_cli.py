@@ -88,8 +88,18 @@ def _write_exp_with_prompt_file(tmp_path, prompt_file):
 
 @pytest.fixture
 def fake_claude_agent(monkeypatch, tmp_path):
+    """Isolates every agent harness.py knows about, not just claude-code --
+    `ys end`'s automatic reset (feature 5) walks every entry in
+    harness.AGENTS, so a test exercising it must never let that walk fall
+    through to a real ~/.config/opencode or ~/.codex/config.toml."""
     claude_path = str(tmp_path / "claude_settings.json")
     monkeypatch.setitem(harness.AGENTS, "claude-code", harness.AgentSpec("claude-code", [claude_path]))
+    monkeypatch.setitem(
+        harness.AGENTS, "opencode", harness.AgentSpec("opencode", [str(tmp_path / "opencode.jsonc")])
+    )
+    monkeypatch.setitem(
+        harness.AGENTS, "codex-cli", harness.AgentSpec("codex-cli", [str(tmp_path / "codex_config.toml")])
+    )
     monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-test")
     return claude_path
 
@@ -484,3 +494,86 @@ def test_start_warns_when_master_key_unset_skips_model_check(tmp_path, monkeypat
     assert "LITELLM_MASTER_KEY not set in this shell" in unwrapped(result.stdout)
 
     runner.invoke(app, ["end"])
+
+
+# --- feature 5: --env-only never touches the config file --------------------
+
+
+def test_harness_point_env_only_never_writes_the_config_file(tmp_path, fake_claude_agent):
+    """The CLI-level regression test for feature 5's harness-safety half:
+    `ys harness point claude-code --env-only` must print export statements
+    and never create/modify the (fake, isolated) claude-code settings file
+    at all. Reverting --env-only's wiring in cli.py -- falling through to
+    the normal harness.point() call -- makes this fail by writing the file."""
+    exp = _write_model_exp(tmp_path)
+    assert not __import__("os").path.exists(fake_claude_agent)
+
+    result = runner.invoke(
+        app,
+        ["harness", "point", "claude-code", "--exp", exp, "--arm", "model-arm", "--env-only"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "export ANTHROPIC_BASE_URL=" in plain(result.stdout)
+    assert "export ANTHROPIC_MODEL=claude-sonnet-5" in plain(result.stdout)
+    assert not __import__("os").path.exists(fake_claude_agent)
+
+
+def test_harness_point_env_only_unsupported_agent_reports_error(fake_claude_agent):
+    result = runner.invoke(app, ["harness", "point", "opencode", "--env-only"])
+    assert result.exit_code != 0
+    assert "not supported for opencode" in plain(result.stdout) or "opencode" in plain(result.stdout)
+
+
+# --- feature 5: automatic harness reset on `ys end` -------------------------
+
+
+def test_end_automatically_resets_a_pointed_harness(tmp_path, fake_claude_agent):
+    """Regression test for feature 5's other harness-safety half: before
+    this, nothing ever reset a harness `ys harness point` had pointed --
+    only a manual `ys harness reset` did, and a crash (or simply forgetting)
+    left the plaintext API key sitting in the (fake, isolated) settings file
+    indefinitely. `ys end` must reset it automatically by default. Reverting
+    the `_auto_reset_pointed_harnesses()` call in cli.py's `end()` makes this
+    fail: the file would still report ANTHROPIC_BASE_URL pointed at the
+    proxy after `ys end` returns."""
+    exp = _write_model_exp(tmp_path)
+    runner.invoke(app, ["harness", "point", "claude-code", "--exp", exp, "--arm", "model-arm"])
+    with open(fake_claude_agent) as f:
+        assert json.load(f)["env"]["ANTHROPIC_BASE_URL"]  # sanity: really pointed
+
+    task_exp = _write_exp(tmp_path)
+    runner.invoke(app, ["start", "--exp", task_exp, "--arm", "only-arm"])
+    end = runner.invoke(app, ["end"])
+    assert end.exit_code == 0, end.stdout
+
+    assert not __import__("os").path.exists(fake_claude_agent)  # restored: never existed before
+
+
+def test_end_keep_harness_pointed_leaves_it_pointed(tmp_path, fake_claude_agent):
+    """--keep-harness-pointed is the opt-out for a multi-repeat workflow --
+    `ys end` must leave the harness's config exactly as `ys harness point`
+    left it."""
+    exp = _write_model_exp(tmp_path)
+    runner.invoke(app, ["harness", "point", "claude-code", "--exp", exp, "--arm", "model-arm"])
+
+    task_exp = _write_exp(tmp_path)
+    runner.invoke(app, ["start", "--exp", task_exp, "--arm", "only-arm"])
+    end = runner.invoke(app, ["end", "--keep-harness-pointed"])
+    assert end.exit_code == 0, end.stdout
+    assert "--keep-harness-pointed" in unwrapped(end.stdout)
+
+    with open(fake_claude_agent) as f:
+        config = json.load(f)
+    assert config["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:4000"
+
+    runner.invoke(app, ["harness", "reset", "claude-code"])  # clean up for other tests
+
+
+def test_end_reset_harness_is_a_no_op_when_nothing_was_pointed(tmp_path, fake_claude_agent):
+    """`ys end` must not error out (or print anything alarming) when no
+    harness was ever pointed -- the common case for most of this test file's
+    other runs."""
+    exp = _write_exp(tmp_path)
+    runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    end = runner.invoke(app, ["end"])
+    assert end.exit_code == 0, end.stdout
