@@ -833,6 +833,30 @@ def _agent_ok_env(monkeypatch, returncode=0, stderr=""):
     monkeypatch.setattr(ys_runner.subprocess, "run", _run)
 
 
+def _agent_spends(monkeypatch, cost, cost_source="litellm"):
+    """Layers on top of `_agent_ok_env`: the faked agent now also records a
+    priced request against the run it was invoked for (the runner passes
+    YS_RUN_ID in the subprocess env), so `ys run --budget` has real spend to
+    total between repeats. Delegates anything that isn't the agent binary to
+    whatever `subprocess.run` already is -- i.e. `_agent_ok_env`'s wrapper,
+    which in turn defers success_check and friends to the real one."""
+    current_run = subprocess.run
+
+    def _run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            with db.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO requests (run_id, seq, ts, model, input_tokens, output_tokens, "
+                    "response_cost, cost_source) VALUES (?,1,?,?,?,?,?,?)",
+                    (kwargs["env"]["YS_RUN_ID"], "2026-01-01T00:00:00Z", "test-model",
+                     10, 5, cost, cost_source),
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+        return current_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ys_runner.subprocess, "run", _run)
+
+
 def test_run_cmd_requires_agent_when_arm_has_no_agent_factor(tmp_path, fake_claude_agent):
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("do the task\n")
@@ -1030,6 +1054,26 @@ def test_start_budget_surfaces_unpriced_history_instead_of_claiming_under_budget
     assert "cost_source='unknown'" in output or "unknown" in output
     assert "not 'under budget'" in output
     runner.invoke(app, ["end"])
+
+
+def test_run_cmd_budget_stops_the_loop_early_and_exits_nonzero(monkeypatch, run_cmd_exp, fake_claude_agent):
+    """`ys run --budget` end to end: unlike `ys start --budget`, this loop
+    sees what the repeats it drives actually cost, so it stops mid-loop
+    once the arm's spend reaches the threshold -- and exits nonzero, so an
+    overnight matrix in a shell script can tell that it stopped early."""
+    _agent_ok_env(monkeypatch)
+    _agent_spends(monkeypatch, 1.00)
+    exp = run_cmd_exp(check="true", repeats=4)
+
+    result = runner.invoke(
+        app, ["run", "--exp", exp, "--arm", "only-arm", "--budget", "1.50", "--settle-s", "0"]
+    )
+
+    assert result.exit_code == 1
+    output = unwrapped(result.stdout)
+    assert "2/4" in output  # stopped two repeats short
+    assert "budget guard" in output
+    assert "stopping before repeat 3/4" in output
 
 
 # ---------------------------------------------------------------------------

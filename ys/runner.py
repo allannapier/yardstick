@@ -25,6 +25,11 @@ section:
     authenticate. A task that runs fine but fails its own success_check is
     NOT a failure for this counter: that's a real experimental outcome, not
     a sign something is broken and retrying blindly.
+  - `budget` (feature 6) totals the arm's real recorded spend after every
+    repeat and stops before starting one that would go past the threshold
+    -- see `check_budget` for why the guard is enforced here rather than
+    only in `ys start`, and for how it stays honest about runs LiteLLM
+    couldn't price.
   - `on_event` gives the caller (ys/cli.py) a line per repeat/phase so a
     human watching an overnight matrix can tell what's happening, not stare
     at a silent terminal for hours.
@@ -42,7 +47,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from ys import harness, proxy, runs, state, workspace
+from ys import db, harness, proxy, runs, state, workspace
 
 # Binary each agent's CLI is invoked as -- keyed the same as ys/harness.py's
 # AGENTS dict, so an --agent value that's valid for `ys harness point` is
@@ -148,6 +153,92 @@ def preflight(task, agent_name: str, master_key: str) -> list:
 class RunEvent:
     level: str  # "info" | "warning" | "error" | "success"
     message: str
+
+
+@dataclass
+class BudgetCheck:
+    """One evaluation of `--budget` against what the arm has actually spent
+    so far. `total_cost_usd` is a *floor* whenever `has_unknown_cost` is
+    True -- see `check_budget` below."""
+    total_cost_usd: float
+    n_runs: int
+    has_unknown_cost: bool
+    over: bool
+    message: str
+
+
+def check_budget(experiment_name: str, arm_id: str, budget: float, spent_before_loop: float = 0.0) -> BudgetCheck:
+    """Feature 6's budget guard, at the one place in this codebase where
+    money is spent with nobody watching.
+
+    `ys start --budget` can only check the arm's *already-finished*
+    history, because `ys start` returns before the harness sends a single
+    request (see `runs.arm_cost_summary`). `ys run` doesn't have that
+    limitation for the repeats it drives itself: once a repeat's `ys end`
+    equivalent has run, that repeat's real `cost_usd` is recorded, so the
+    loop can total the arm's spend and stop *before* starting a repeat that
+    would take it past the threshold. That's the version of the guard worth
+    having, and it's why `--budget` is enforced between repeats here rather
+    than only once up front.
+
+    The budget is measured against the arm's whole recorded history, not
+    just this invocation's repeats -- the same unit `ys start --budget`
+    uses, so the two flags can't disagree about what "$5 for this arm"
+    means. `spent_before_loop` is subtracted only to *report* how much of
+    that total this loop is responsible for; it never changes the verdict.
+
+    Honesty about unpriced runs (finding 9): `has_unknown_cost` means at
+    least one counted run has a request neither LiteLLM nor a declared
+    `pricing:` override could price, so `total_cost_usd` is a floor rather
+    than a measurement. That still supports one sound conclusion -- a floor
+    at or over the budget is definitely over the budget, so `over` is
+    computed the same way either way -- but it can never support the
+    opposite one. Under-budget with unknown cost present is reported as
+    unverifiable rather than as "under budget", and the loop continues:
+    refusing to run at all would make `--budget` unusable for exactly the
+    models finding 9 is about (an unpriced model is the common case, and
+    the fix for it is a `pricing:` block, not abandoning the run).
+    """
+    with db.cursor() as cur:
+        summary = runs.arm_cost_summary(cur, experiment_name, arm_id)
+
+    total = summary.total_cost_usd
+    this_loop = total - spent_before_loop
+    over = total >= budget
+    floor_note = (
+        " -- and that total is a FLOOR, not a measurement: at least one counted run has a "
+        "request neither LiteLLM nor a declared `pricing:` override could price "
+        "(cost_source='unknown', finding 9)"
+    )
+
+    if over:
+        message = (
+            f"budget guard: arm '{arm_id}' has recorded ${total:.2f} across "
+            f"{summary.n_runs} finished run(s) (${this_loop:.2f} of it in this loop), at "
+            f"or over the ${budget:.2f} budget"
+        )
+        if summary.has_unknown_cost:
+            message += floor_note + ", so real spend is at least this much"
+    elif summary.has_unknown_cost:
+        message = (
+            f"budget guard: arm '{arm_id}' has recorded ${total:.2f} of a ${budget:.2f} "
+            f"budget across {summary.n_runs} finished run(s) (${this_loop:.2f} of it in "
+            f"this loop){floor_note}. Cannot confirm this arm is under budget -- declare "
+            "a `pricing:` block for the arm's model to make this guard enforceable"
+        )
+    else:
+        message = (
+            f"budget guard: ${total:.2f} of ${budget:.2f} spent on arm '{arm_id}' across "
+            f"{summary.n_runs} finished run(s) (${this_loop:.2f} of it in this loop)"
+        )
+
+    return BudgetCheck(
+        total_cost_usd=total,
+        n_runs=summary.n_runs,
+        has_unknown_cost=summary.has_unknown_cost,
+        over=over,
+        message=message,
+    )
 
 
 @dataclass
@@ -301,6 +392,7 @@ def run_experiment(
     master_key: str,
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     settle_s: float = DEFAULT_SETTLE_S,
+    budget: Optional[float] = None,
     on_event: Callable[[RunEvent], None] = lambda evt: None,
 ) -> RunSummary:
     try:
@@ -315,6 +407,22 @@ def run_experiment(
 
     with open(task.prompt_file) as f:
         prompt = f.read()
+
+    summary = RunSummary(experiment_name=experiment.experiment, arm_id=arm_id, repeats_requested=repeats)
+
+    # The budget guard's pre-flight leg: checked before the harness is
+    # pointed and before the first repeat, so an arm that's already over
+    # its budget costs nothing at all -- not even a mutated config file to
+    # reset afterwards.
+    spent_before_loop = 0.0
+    if budget is not None:
+        pre = check_budget(experiment.experiment, arm_id, budget)
+        spent_before_loop = pre.total_cost_usd
+        if pre.over:
+            summary.aborted_reason = pre.message + " -- refusing to start any repeat."
+            on_event(RunEvent("error", summary.aborted_reason))
+            return summary
+        on_event(RunEvent("warning" if pre.has_unknown_cost else "info", pre.message))
 
     model = arm.factors.get("model")
 
@@ -337,7 +445,6 @@ def run_experiment(
         pointed_file_scope = "user"
         agent_env = {}
 
-    summary = RunSummary(experiment_name=experiment.experiment, arm_id=arm_id, repeats_requested=repeats)
     consecutive_failures = 0
 
     try:
@@ -366,6 +473,23 @@ def run_experiment(
                     )
                     on_event(RunEvent("error", summary.aborted_reason))
                     break
+
+            # The repeat just finished, so its own cost_usd is recorded and
+            # the arm's running total is real -- check it before committing
+            # to another repeat. On the final repeat there's nothing left to
+            # stop, so an overage is reported but isn't an early abort.
+            if budget is not None:
+                check = check_budget(experiment.experiment, arm_id, budget, spent_before_loop)
+                if check.over and i < repeats:
+                    summary.aborted_reason = (
+                        check.message + f" -- stopping before repeat {i + 1}/{repeats}."
+                    )
+                    on_event(RunEvent("error", summary.aborted_reason))
+                    break
+                on_event(RunEvent(
+                    "warning" if (check.over or check.has_unknown_cost) else "info",
+                    check.message,
+                ))
 
             if i < repeats:
                 # finding 11's drain window, raced by an automated loop:

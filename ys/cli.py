@@ -604,6 +604,20 @@ def run_cmd(
             "by a fast automated loop -- see IMPROVEMENTS.md feature 1). Default: 2.0."
         ),
     ),
+    budget: Optional[float] = typer.Option(
+        None,
+        "--budget",
+        help=(
+            "USD budget guard for this arm (feature 6 in IMPROVEMENTS.md). Unlike "
+            "`ys start --budget`, this loop sees the cost of the repeats it drives: it "
+            "totals the arm's spend after every repeat and stops before starting one that "
+            "would go past the budget. Measured against the arm's whole recorded history, "
+            "not just this invocation, so it means the same thing as `ys start --budget`. "
+            "If any counted run couldn't be priced (cost_source='unknown', finding 9) the "
+            "total is reported as a floor and the guard says so rather than claiming "
+            "'under budget'."
+        ),
+    ),
 ):
     """Drive an agent non-interactively through --repeats repeats of an arm's
     task, scoring each one (IMPROVEMENTS.md feature 1: unattended runs)."""
@@ -646,6 +660,8 @@ def run_cmd(
         kwargs["max_consecutive_failures"] = max_consecutive_failures
     if settle_s is not None:
         kwargs["settle_s"] = settle_s
+    if budget is not None:
+        kwargs["budget"] = budget
 
     def _on_event(evt):
         style = {"info": "dim", "warning": "yellow", "error": "red", "success": "green"}.get(evt.level)

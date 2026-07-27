@@ -283,6 +283,25 @@ own real `cost_usd` only once it finishes — that's `ys end`'s printed summary,
 unchanged.
 
 ```bash
+ys run --exp experiments/unattended-example.yaml --arm arm-a --repeats 10 --budget 5.00
+```
+
+An unattended loop *does* see what it spends: each repeat's real `cost_usd` is
+recorded once that repeat finishes, so `ys run --budget` totals the arm's spend
+after every repeat, prints the running total, and stops before starting a
+repeat that would take it past the threshold (exiting nonzero, so a shell
+script driving an overnight matrix can tell it stopped early). It's measured
+against the same unit `ys start --budget` uses — the arm's whole recorded
+history — and it's checked once before the first repeat too, so an arm that's
+already over budget costs nothing at all.
+
+The same honesty applies: if any counted run couldn't be priced, the total is
+reported as a *floor* and the guard says it cannot confirm you're under budget
+rather than claiming you are. Declare a `pricing:` block for the arm's model to
+make it enforceable. Enforcement is per completed repeat, so a single runaway
+repeat can still overshoot — `--budget` bounds a loop, not an individual turn.
+
+```bash
 ys leaderboard --exp exp-a.yaml --exp exp-b.yaml --metric cost_usd
 ```
 

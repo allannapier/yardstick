@@ -1499,7 +1499,7 @@ file; the `--env-only` path sidesteps it entirely.
 
 - `ys export --csv` / `--json` so results can leave the tool.
 - Budget guard: `ys start --budget 5.00` warns or aborts when a run's recorded
-  cost crosses a threshold.
+  cost crosses a threshold; `ys run --budget` enforces it between repeats.
 - Cross-experiment comparison / leaderboard across tasks.
 - Per-turn drill-down charts in the dashboard, not only in the static report.
 
@@ -1554,11 +1554,57 @@ file; the `--env-only` path sidesteps it entirely.
   from "nothing could price it" is worse than none, per the finding this
   feature depends on. **When the user actually finds out this run's own
   cost:** unchanged -- `ys end` already prints `cost_usd` in its headline
-  metrics every time; the budget guard doesn't add a second check there
-  (this PR's file-set rules restrict `cli.py`/`runs.py` edits to the single
-  new `--budget` option on `start`), so a budget-conscious user reads that
-  number the same way they always have, now with the arm's running total
-  fresh from what `ys start` just printed.
+  metrics every time; the budget guard doesn't add a second check there,
+  so a budget-conscious user reads that number the same way they always
+  have, now with the arm's running total fresh from what `ys start` just
+  printed.
+- **The budget guard reaches the place money actually burns: `ys run
+  --budget`** (`runner.check_budget`, `runner.run_experiment`'s new
+  `budget` parameter, and the `--budget` option on `ys run`). The
+  history-only check above is an honest pre-flight for a single
+  hand-driven `ys start`, but a budget guard exists for *unattended*
+  operation, and feature 1's `ys run` is a loop that drives an agent N
+  times with nobody watching — a guard that never observes the runs it
+  guards is surprising there in a way it isn't for `ys start`. `ys run`
+  doesn't have `ys start`'s limitation for the repeats it drives itself:
+  once a repeat has finished and been scored, that repeat's real
+  `cost_usd` is recorded, so the loop totals the arm's spend after **every
+  repeat** and stops before starting one that would take it past the
+  threshold (`aborted_reason`, hence the CLI's existing nonzero exit — so
+  an overnight matrix in a shell script can tell it stopped early). The
+  running total is printed per repeat, with how much of it this loop is
+  responsible for, so a human scanning the log sees spend accumulate
+  rather than only learning about it at the end.
+  - **Same unit as `ys start --budget`**, deliberately: the arm's whole
+    recorded history, not just this invocation's repeats, so the two flags
+    can't disagree about what "$5.00 for this arm" means. The
+    per-invocation figure is reported alongside it rather than being what
+    the threshold is compared against.
+  - **Checked before the first repeat too**, and before the harness is
+    pointed — an arm already over budget costs nothing at all, not even a
+    mutated config file to reset afterwards.
+  - **Finding 9's honesty rule carried in unchanged:** if any counted run
+    has a request neither LiteLLM nor a declared `pricing:` override could
+    price, the total is a **floor**, not a measurement. That still supports
+    one sound conclusion — a floor at or over the budget is definitely over
+    it, so the stop condition is computed identically either way — but
+    never the opposite one, so an under-budget total with unpriced runs
+    present is reported as unverifiable ("cannot confirm this arm is under
+    budget", pointing at `pricing:` as the fix) instead of "under budget".
+    The loop **continues** in that case rather than refusing to run:
+    an unpriced model is finding 9's common case, and the fix for it is a
+    `pricing:` block, not abandoning the experiment.
+  - An overage on the *final* repeat is reported but is not an early abort:
+    there is nothing left to stop, and calling that "stopped early" would
+    be false.
+  - Tests (`tests/test_runner.py`, `tests/test_cli.py`): the between-repeats
+    stop ($1.00/repeat against a $1.50 budget must stop after repeat 2 of
+    3), the running total printed per repeat, the pre-flight refusal that
+    never invokes the agent once, the unpriced-repeat floor case, the
+    final-repeat overage that must *not* be an abort, no-budget behaviour
+    left unchanged, and `ys run --budget` end to end through the CLI
+    including the nonzero exit. Each was confirmed to fail with its own
+    half of the fix reverted.
 - **Cross-experiment leaderboard** (`render.build_leaderboard`/
   `build_leaderboard_table`/`leaderboard_notes`, plus `ys leaderboard` in
   `cli.py`, all additive). Ranks each experiment's own arms on one metric,
@@ -1592,10 +1638,13 @@ file; the `--env-only` path sidesteps it entirely.
   for `build_leaderboard`'s per-experiment rank scoping, its
   distinguishable/not-distinguishable branches, and a large-effect case
   that *is* significant (so the leaderboard doesn't just always hedge).
-- Left out, deliberately: the budget guard doesn't add a live, mid-run
-  meter (would need the off-limits proxy/collector), and doesn't add a
-  second check inside `ys end` (this PR's scope permits exactly one edit to
-  an existing `start`/`runs.py` function). The leaderboard doesn't attempt
+- Left out, deliberately: the budget guard still doesn't add a live,
+  mid-*request* meter — enforcement is per completed repeat, so a single
+  runaway repeat can still overshoot the threshold before anything can
+  check it. Stopping mid-turn would mean instrumenting the request path
+  inside the proxy/collector, a much larger change, and a repeat killed
+  halfway is an unscorable data point rather than a cheap one. The
+  leaderboard doesn't attempt
   a single global rank across experiments -- see above for why that would
   misrepresent different tasks as directly comparable in magnitude.
 
