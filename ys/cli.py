@@ -619,5 +619,139 @@ def report(
     console.print(f"wrote [bold]{html}[/bold]")
 
 
+runs_app = typer.Typer(help="enumerate recorded runs")
+app.add_typer(runs_app, name="runs")
+
+
+@runs_app.command("list")
+def runs_list_cmd(
+    exp: Optional[str] = typer.Option(
+        None,
+        "--exp",
+        help="path to the experiment YAML -- filters to this experiment and checks "
+        "each run's config_hash against today's YAML (finding 14)",
+    ),
+    arm: Optional[str] = typer.Option(None, "--arm", help="arm id to filter to"),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="show at most this many runs (most recent first)"
+    ),
+):
+    """List recorded runs -- id, experiment, arm, start time, status and
+    success -- so a run id can be found without the dashboard or raw SQL
+    (P2 in IMPROVEMENTS.md)."""
+    from rich.table import Table
+
+    experiment_obj = None
+    experiment_name = None
+    if exp:
+        experiment_obj = load_experiment(exp)
+        experiment_name = experiment_obj.experiment
+
+    rows = runs.list_runs(experiment=experiment_name, arm=arm, limit=limit, experiment_obj=experiment_obj)
+
+    if not rows:
+        console.print("no runs recorded")
+        return
+
+    table = Table()
+    # overflow="fold" (wrap the cell onto another line) rather than Rich
+    # Table's default ellipsis-truncation -- a run id or experiment name is
+    # exactly the information this command exists to show; silently
+    # truncating it on a narrow terminal would defeat the point.
+    table.add_column("run id", overflow="fold")
+    table.add_column("experiment", overflow="fold")
+    table.add_column("arm", overflow="fold")
+    table.add_column("repeat")
+    table.add_column("started (UTC)", overflow="fold")
+    table.add_column("status")
+    table.add_column("success")
+    table.add_column("config")
+
+    status_style = {
+        "finished": "finished",
+        "unfinished": "[yellow]unfinished[/yellow]",
+        "abandoned": "[red]abandoned[/red]",
+    }
+    for r in rows:
+        success_str = "-" if r.success is None else ("yes" if r.success else "no")
+        if r.config_current is None:
+            config_str = "-"
+        elif r.config_current:
+            config_str = "[green]current[/green]"
+        else:
+            config_str = "[yellow]stale[/yellow]"
+        table.add_row(
+            r.run_id,
+            r.experiment_id,
+            r.arm_id,
+            str(r.repeat_idx),
+            r.started_at,
+            status_style[r.status],
+            success_str,
+            config_str,
+        )
+    # A run id, an experiment name and a UTC timestamp per row don't fit
+    # Rich's default 80-column fallback width without truncating the exact
+    # information this command exists to show. `console.print(..., width=N)`
+    # can only ever *narrow* Rich's own render (it clamps to
+    # min(N, console.width), never widens it), so a real terminal still gets
+    # its own actual width either way -- only when there's no terminal to
+    # detect at all (piped/redirected output, or this file's own tests) does
+    # a dedicated wider Console kick in, since 80 columns in that case is an
+    # arbitrary fallback, not a real constraint worth truncating data for.
+    render_console = console if console.is_terminal else Console(width=200)
+    render_console.print(table)
+
+
+@app.command()
+def doctor(
+    exp: Optional[str] = typer.Option(
+        None,
+        "--exp",
+        help="experiment YAML -- combine with --arm to also verify the running "
+        "proxy serves the arm's model",
+    ),
+    arm: Optional[str] = typer.Option(
+        None, "--arm", help="arm id whose model factor to verify against the running proxy"
+    ),
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        help="port to check the proxy on (default: the last `ys proxy up`/`ys proxy "
+        "down` port, or 4000)",
+    ),
+):
+    """Read-only preflight over every moving part -- home directory, schema
+    version, proxy process, generated proxy config, task.prompt_file/repo,
+    each harness's config, both API keys, active-run state, and
+    unattributed/dropped request counts -- plus, with --exp/--arm, whether
+    the running proxy serves that arm's model. Never writes to the
+    database, starts/stops a process, runs a migration, or touches a
+    harness config file. Exits non-zero if any check fails (Feature 4 in
+    IMPROVEMENTS.md)."""
+    from ys import doctor as doctor_mod
+
+    if bool(exp) != bool(arm):
+        console.print("[red]--exp and --arm must be given together.[/red]")
+        raise typer.Exit(1)
+
+    results = doctor_mod.run_checks(exp, arm, port)
+
+    style = {
+        doctor_mod.PASS: "[green]PASS[/green]",
+        doctor_mod.WARN: "[yellow]WARN[/yellow]",
+        doctor_mod.FAIL: "[red]FAIL[/red]",
+        doctor_mod.SKIP: "[dim]SKIP[/dim]",
+    }
+    for r in results:
+        console.print(f"{style[r.status]}  [bold]{r.name}[/bold]: {r.message}")
+
+    n_fail = sum(1 for r in results if r.status == doctor_mod.FAIL)
+    n_warn = sum(1 for r in results if r.status == doctor_mod.WARN)
+    console.print(f"\n{len(results)} check(s): {n_fail} failed, {n_warn} warning(s)")
+    if n_fail:
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

@@ -155,24 +155,42 @@ def scopes_for_agent(agent_name: str) -> list:
     return ["user", "project"] if spec.project_relpath else ["user"]
 
 
-def _backup_dir() -> str:
-    paths.ensure_home()
+def _backup_dir(create: bool = False) -> str:
+    """`create=False` (the default) only computes the path -- no
+    `paths.ensure_home()`, no `os.makedirs` -- so every read-only caller
+    (`_load_manifest`, and hence `status()`/`reset()`'s existence check)
+    can compute where a manifest *would* live without bringing
+    YARDSTICK_HOME into existence just by asking. Only `_snapshot_if_absent`
+    (the one path that's about to write a manifest) passes `create=True`.
+    `ys doctor`'s hard "must not mutate anything" rule depends on this split:
+    `check_harness_config` calls `harness.status()` in a loop (one call per
+    agent), and before this split every one of those calls created
+    ~/.yardstick, ~/.yardstick/experiments and ~/.yardstick/harness_backups
+    as a side effect of merely asking whether a backup existed."""
     d = os.path.join(paths.YARDSTICK_HOME, "harness_backups")
-    os.makedirs(d, exist_ok=True)
+    if create:
+        paths.ensure_home()
+        os.makedirs(d, exist_ok=True)
     return d
 
 
-def _manifest_path(agent_name: str, scope: str = "user") -> str:
+def _manifest_path(agent_name: str, scope: str = "user", create: bool = False) -> str:
     # "user" keeps the original, unsuffixed filename -- backward compatible
     # with any manifest a pre-feature-5 install already wrote, and the
     # common case stays exactly as before. Project scope gets its own
     # manifest file so pointing both scopes for the same agent can't clobber
     # each other's backup.
     suffix = "" if scope == "user" else f"-{scope}"
-    return os.path.join(_backup_dir(), f"{agent_name}{suffix}.json")
+    return os.path.join(_backup_dir(create=create), f"{agent_name}{suffix}.json")
 
 
 def _load_manifest(agent_name: str, scope: str = "user") -> Optional[dict]:
+    """Read-only: always resolves the manifest path with `create=False`.
+    Called from `status()`/`reset()`'s existence check as well as
+    `_snapshot_if_absent`'s own "does one already exist" check below --
+    none of those should ever create ~/.yardstick, and `os.path.exists`
+    against a path inside a directory that doesn't exist simply (and
+    correctly) returns False, no error."""
     path = _manifest_path(agent_name, scope)
     if not os.path.exists(path):
         return None
@@ -183,7 +201,9 @@ def _load_manifest(agent_name: str, scope: str = "user") -> Optional[dict]:
 def _snapshot_if_absent(agent_name: str, config_path: str, scope: str = "user"):
     """Capture the true original state exactly once. No-op on later calls,
     even if the live file has since been modified by `point` -- the whole
-    point is that this snapshot never moves."""
+    point is that this snapshot never moves. This is the one path allowed
+    to create the backup directory (`create=True`) -- it's only ever called
+    from `point()`, a command whose entire job is to write files."""
     if _load_manifest(agent_name, scope) is not None:
         return
     existed = os.path.exists(config_path)
@@ -192,7 +212,7 @@ def _snapshot_if_absent(agent_name: str, config_path: str, scope: str = "user"):
         with open(config_path) as f:
             raw = f.read()
     manifest = {"config_path": config_path, "existed": existed, "raw": raw}
-    with open(_manifest_path(agent_name, scope), "w") as f:
+    with open(_manifest_path(agent_name, scope, create=True), "w") as f:
         json.dump(manifest, f, indent=2)
 
 

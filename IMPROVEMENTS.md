@@ -946,8 +946,17 @@ Beyond the defects, the dashboard is thin in ways that matter:
   Anthropic either way, since `mock_response` short-circuits it, but the form
   shouldn't teach a dead id by example).
 
-And on the CLI side: there is no `ys runs list`. Runs can be deleted by id but
-never enumerated, so the only way to find an id is the dashboard or raw SQL.
+And on the CLI side: there was no `ys runs list` — runs could be deleted by id
+but never enumerated, so the only way to find an id was the dashboard or raw
+SQL — **fixed**: `ys runs list` (`ys/runs.py`'s `list_runs`) prints run id,
+experiment, arm, repeat, start time, status (`finished` / `unfinished` /
+`abandoned` — finding 13's three-way split, named per row instead of only
+summarized in `ys compare`), success, and — with `--exp` — whether each run's
+stored `config_hash` still matches today's YAML (finding 14's "which of these
+runs still count" question, the one that sends people to raw SQL in the first
+place; a run predating finding 14, or whose arm the current YAML no longer
+declares, is reported as not current rather than silently trusted).
+`--exp`/`--arm` filter, `--limit` caps the row count, most recent first.
 
 ---
 
@@ -1090,7 +1099,7 @@ effect helper so users can choose `repeats` deliberately.
   `ys compare`/`ys report --html`, including the no-baseline and
   no-primary-metrics empty cases.
 
-### 4. `ys doctor`
+### 4. `ys doctor` — fixed
 
 There are many moving parts — home directory, schema version, proxy process,
 generated config, harness config, two API keys, active-run state — and the failure
@@ -1098,6 +1107,81 @@ modes are mostly silent. A single preflight command that checks all of them,
 verifies the running proxy serves the current experiment's models, and reports
 unattributed request counts would prevent most of the wasted runs this review
 found paths to.
+
+**Fix:**
+
+- `ys/doctor.py` (new module, kept out of `ys/cli.py` so the check logic is
+  directly testable) runs a fixed list of checks, each returning pass / warn
+  / fail plus one specific, actionable message — the value of a preflight
+  command is entirely in the wording, not the verdict:
+  - **yardstick home** — the directory exists and is writable.
+  - **schema version** — `PRAGMA user_version` against `db.MIGRATIONS`
+    (finding 8), via a plain read connection so the check itself never
+    creates the database or applies a migration.
+  - **proxy process** — pidfile/port sanity via `procutil`/`proxy.proxy_status`
+    (finding 5): running; a stale pidfile with the port now free (run `ys
+    proxy up`); or, finding 5's exact silent-orphan scenario, a stale pidfile
+    with the port *still* bound by something else (fail — run `ys proxy down
+    --force`).
+  - **generated proxy config** — whether `ys proxy up`'s last generated
+    `model_list` parses, and, with `--exp`/`--arm`, whether it has an
+    explicit entry for that arm's model. The static, read-from-disk sibling
+    of the live check below — still useful with the proxy not running.
+  - **task paths** — with `--exp`, reuses `experiment.validate_task_paths`
+    (findings 15-18) verbatim, so a `task.prompt_file`/`task.repo` typo shows
+    up in `ys doctor` before you even get to `ys start`.
+  - **harness config**, one row per agent per scope — reuses `harness.status`
+    to report whether each agent's config is currently pointed at a proxy,
+    and, if so, whether a proxy is actually running there (fail if not: real
+    requests would fail until `ys proxy up` again or `ys harness reset`).
+    Driven by `harness.scopes_for_agent` (the same list feature 5's `ys end`
+    auto-reset loop uses), so claude-code gets a row for both `user` and
+    `project` scope rather than only ever checking the default; an
+    `env_only` agent (aider) gets a single, dedicated "env-only" row instead
+    of a misleading "config doesn't exist" one.
+  - **API keys** — `LITELLM_MASTER_KEY` and `ANTHROPIC_API_KEY` presence in
+    this shell's environment (the two the plan calls out by name).
+  - **active-run state** — cross-checks `active.json` against the `runs`
+    table, catching the exact mismatch `ys end` raises
+    `ActiveRunMissingDbRow` for, before `ys end` hits it.
+  - **unattributed requests** — reuses `runs.unattributed_summary()`
+    (finding 12) verbatim — "the single highest-value diagnostic in the
+    app" per this plan.
+  - **dropped requests** — reuses `dropped.count()` (finding 6) verbatim.
+  - **proxy serves model** — with `--exp`/`--arm` both given, reuses
+    `proxy.model_available`/`proxy.model_check_skipped_message` (findings
+    3/29) verbatim against the *running* proxy; without them, a `skip` row
+    says so instead of silently omitting the check.
+- Strictly read-only, unlike every neighbouring command: no `db.init_db()`/
+  migration, no `paths.ensure_home()`, no starting/stopping the proxy or
+  dashboard, no writing to a harness config. Where a reused helper would
+  normally have a side effect (`db.connect()`'s `paths.ensure_home()`,
+  `db.cursor()` on a database that doesn't exist yet), `ys doctor` works
+  around it — a plain `sqlite3.connect` guarded by an existence check —
+  rather than accepting the side effect as a shortcut. A user running `ys
+  doctor` to find out why something is broken must never have the act of
+  asking change the answer. This rule caught a real leak from feature 5,
+  merged mid-review: `harness.status()` (called once per agent/scope by the
+  harness-config check above) went through `_load_manifest`/`_manifest_path`
+  to `harness._backup_dir()`, which called `paths.ensure_home()`
+  unconditionally just to compute where a backup manifest *would* live —
+  so running `ys doctor` on a machine that had never run any other
+  yardstick command silently created `~/.yardstick` (and its `experiments`/
+  `harness_backups` subdirectories) as a side effect of merely asking.
+  `_backup_dir()` gained a `create: bool = False` default (`ys/harness.py`):
+  every read path (`_load_manifest`, hence `status()`/`reset()`'s existence
+  check) computes the path without creating anything; only
+  `_snapshot_if_absent` — which is only ever reached from `point()`, a
+  command whose entire job is to write files — passes `create=True`.
+  `tests/test_doctor.py` pins this directly: it points `YARDSTICK_HOME` at a
+  directory that has deliberately never been created and asserts
+  `run_checks`/`check_harness_config` leave it that way, with and without
+  `--exp`/`--arm` (both reach the harness-config loop) — reverting
+  `_backup_dir`'s `create` split makes those fail.
+- `ys doctor` exits non-zero if any check fails (not on warnings), so it's
+  usable as a script gate.
+- `ys runs list` (below) reuses the same instinct — surface a diagnostic
+  instead of sending the user to raw SQL — for enumerating runs specifically.
 
 ### 5. Provider and harness breadth — fixed
 

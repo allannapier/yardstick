@@ -76,6 +76,23 @@ ys compare --exp experiments/example.yaml
 ys report  --exp experiments/example.yaml --html report.html
 ```
 
+Enumerate recorded runs (id, experiment, arm, status, success — the
+config column flags a run whose config_hash doesn't match today's YAML):
+
+```bash
+ys runs list --exp experiments/example.yaml
+```
+
+Preflight everything at once — home directory, schema version, proxy
+process, generated config, harness config, both API keys, active-run
+state, and unattributed/dropped request counts, plus (with `--exp`/`--arm`)
+whether the running proxy actually serves that arm's model. Read-only;
+exits non-zero if anything fails:
+
+```bash
+ys doctor --exp experiments/example.yaml --arm arm-a
+```
+
 Optional dashboard for setting up experiments and browsing runs in a browser:
 
 ```bash

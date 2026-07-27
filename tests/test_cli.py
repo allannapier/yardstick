@@ -633,3 +633,138 @@ def test_end_reset_harness_is_a_no_op_when_nothing_was_pointed(tmp_path, fake_cl
     runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
     end = runner.invoke(app, ["end"])
     assert end.exit_code == 0, end.stdout
+
+
+# --- ys runs list (P2 in IMPROVEMENTS.md) ------------------------------------
+
+
+def test_runs_list_reports_no_runs_recorded():
+    result = runner.invoke(app, ["runs", "list"])
+    assert result.exit_code == 0, result.stdout
+    assert "no runs recorded" in plain(result.stdout)
+
+
+def test_runs_list_shows_id_experiment_arm_status_and_success(tmp_path):
+    exp = _write_exp(tmp_path)
+    start = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    run_id = re.search(r"run (\S+)", plain(start.stdout)).group(1)
+    end = runner.invoke(app, ["end"])
+    assert end.exit_code == 0, end.stdout
+
+    result = runner.invoke(app, ["runs", "list"])
+    assert result.exit_code == 0, result.stdout
+    out = unwrapped(result.stdout)
+    assert run_id in out
+    assert "cli-test-exp" in out
+    assert "only-arm" in out
+    assert "finished" in out
+
+
+def test_runs_list_filters_by_experiment_and_arm(tmp_path):
+    exp = _write_exp(tmp_path)
+    runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    runner.invoke(app, ["end"])
+
+    other_path = tmp_path / "other.yaml"
+    other_path.write_text(EXPERIMENT_YAML.format(check="true").replace("cli-test-exp", "other-exp"))
+    runner.invoke(app, ["start", "--exp", str(other_path), "--arm", "only-arm"])
+    runner.invoke(app, ["end"])
+
+    result = runner.invoke(app, ["runs", "list", "--exp", exp])
+    assert result.exit_code == 0, result.stdout
+    out = unwrapped(result.stdout)
+    assert "cli-test-exp" in out
+    assert "other-exp" not in out
+
+
+def test_runs_list_marks_unfinished_and_abandoned_runs(tmp_path):
+    exp = _write_exp(tmp_path)
+    runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    # displaces the still-active run above, marking it abandoned (finding 13)
+    runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm", "--force"])
+
+    result = runner.invoke(app, ["runs", "list"])
+    assert result.exit_code == 0, result.stdout
+    out = unwrapped(result.stdout)
+    assert "abandoned" in out
+    assert "unfinished" in out
+
+    runner.invoke(app, ["end"])  # tidy up the still-active forced run
+
+
+def test_runs_list_shows_config_currency_when_exp_given(tmp_path):
+    exp = _write_exp(tmp_path, check="true")
+    runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    runner.invoke(app, ["end"])
+
+    result = runner.invoke(app, ["runs", "list", "--exp", exp])
+    assert result.exit_code == 0, result.stdout
+    assert "current" in unwrapped(result.stdout)
+
+
+def test_runs_list_respects_limit(tmp_path):
+    exp = _write_exp(tmp_path)
+    for _ in range(3):
+        runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+        runner.invoke(app, ["end"])
+
+    result = runner.invoke(app, ["runs", "list", "--exp", exp, "--limit", "1"])
+    assert result.exit_code == 0, result.stdout
+    # 3 header/border rows aside, exactly one run row -- cheapest check is
+    # that the table renders without error and the run count line isn't
+    # ambiguous; assert indirectly via the underlying data instead.
+    from ys import runs as runs_module
+
+    rows = runs_module.list_runs(experiment="cli-test-exp", limit=1)
+    assert len(rows) == 1
+
+
+# --- ys doctor (Feature 4 in IMPROVEMENTS.md) --------------------------------
+
+
+def test_doctor_exits_zero_on_a_clean_slate(fake_claude_agent):
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.stdout
+    assert "PASS" in plain(result.stdout)
+
+
+def test_doctor_requires_exp_and_arm_together():
+    result = runner.invoke(app, ["doctor", "--exp", "some.yaml"])
+    assert result.exit_code != 0
+    assert "--exp and --arm must be given together" in plain(result.stdout)
+
+
+def test_doctor_exits_nonzero_when_a_check_fails(fake_claude_agent):
+    """Pointing claude-code at a proxy and then leaving no proxy running is
+    a FAIL in check_harness_config -- ys doctor's exit code must reflect it.
+    `fake_claude_agent` isolates every agent harness.py knows about and
+    exports LITELLM_MASTER_KEY, so this never touches a real config file."""
+    result = runner.invoke(app, ["harness", "point", "claude-code", "--port", "4000"])
+    assert result.exit_code == 0, result.stdout
+
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code != 0
+    assert "FAIL" in plain(result.stdout)
+
+
+def test_doctor_reports_unattributed_and_dropped_counts(fake_claude_agent):
+    from ys import dropped
+
+    _insert_unattributed_request()
+    dropped.record("some-run", "database is locked")
+
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.stdout
+    out = unwrapped(result.stdout)
+    assert "unattributed requests" in out
+    assert "dropped requests" in out
+    assert "1 request(s)" in out
+
+
+def test_doctor_verifies_model_availability_with_exp_and_arm(tmp_path, monkeypatch, fake_claude_agent):
+    monkeypatch.setattr(proxy, "model_available", lambda model, port, key: True)
+
+    exp = _write_model_exp(tmp_path)
+    result = runner.invoke(app, ["doctor", "--exp", exp, "--arm", "model-arm"])
+    assert result.exit_code == 0, result.stdout
+    assert "proxy serves model" in unwrapped(result.stdout)

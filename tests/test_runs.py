@@ -418,3 +418,155 @@ def test_unattributed_summary_counts_requests_and_reports_earliest_time():
     summary = runs.unattributed_summary()
     assert summary.count == 2
     assert summary.since == "14:02"
+
+
+# --- ys runs list (P2 in IMPROVEMENTS.md) -----------------------------------
+#
+# "there is no `ys runs list`. Runs can be deleted by id but never
+# enumerated, so the only way to find an id is the dashboard or raw SQL."
+
+
+def test_list_runs_empty_when_nothing_recorded():
+    assert runs.list_runs() == []
+
+
+def test_list_runs_filters_by_experiment_and_arm():
+    exp_a = Experiment.model_validate(
+        {
+            "experiment": "list-exp-a",
+            "task": {"id": "t0", "success_check": "true"},
+            "arms": [{"id": "arm-1", "factors": {}, "baseline": True}],
+        }
+    )
+    exp_b = Experiment.model_validate(
+        {
+            "experiment": "list-exp-b",
+            "task": {"id": "t0", "success_check": "true"},
+            "arms": [{"id": "arm-1", "factors": {}, "baseline": True}],
+        }
+    )
+    yaml_a = "experiment: list-exp-a\ntask: {id: t0, success_check: 'true'}\narms: [{id: arm-1, factors: {}, baseline: true}]\n"
+    yaml_b = "experiment: list-exp-b\ntask: {id: t0, success_check: 'true'}\narms: [{id: arm-1, factors: {}, baseline: true}]\n"
+
+    begun_a = runs.begin_run(exp_a, yaml_a, "arm-1")
+    runs.finish_run()
+    begun_b = runs.begin_run(exp_b, yaml_b, "arm-1")
+    runs.finish_run()
+
+    only_a = runs.list_runs(experiment="list-exp-a")
+    assert [r.run_id for r in only_a] == [begun_a.run_id]
+
+    only_b_arm1 = runs.list_runs(experiment="list-exp-b", arm="arm-1")
+    assert [r.run_id for r in only_b_arm1] == [begun_b.run_id]
+
+    everything = runs.list_runs()
+    assert {r.run_id for r in everything} == {begun_a.run_id, begun_b.run_id}
+
+
+def test_list_runs_reports_finished_status_and_success():
+    runs.begin_run(_exp(check="true"), _yaml_for("true"), "only-arm")
+    runs.finish_run()
+
+    rows = runs.list_runs()
+    assert len(rows) == 1
+    assert rows[0].status == "finished"
+    assert rows[0].success is True
+
+
+def test_list_runs_reports_unfinished_status_and_no_success():
+    begun = runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
+    rows = runs.list_runs()
+    assert len(rows) == 1
+    assert rows[0].run_id == begun.run_id
+    assert rows[0].status == "unfinished"
+    assert rows[0].success is None
+    runs.finish_run()  # tidy up the active slot
+
+
+def test_list_runs_reports_abandoned_status():
+    """Finding 13: a run displaced by `--force` is closed out with
+    `abandoned=1` and no verdict -- `ys runs list` must call that out
+    distinctly from an ordinary unfinished run, not just lump it in."""
+    displaced = runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
+    runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm", force=True)
+
+    rows = {r.run_id: r for r in runs.list_runs()}
+    assert rows[displaced.run_id].status == "abandoned"
+    assert rows[displaced.run_id].success is None
+
+    runs.finish_run()  # tidy up the still-active forced run
+
+
+def test_list_runs_respects_limit_and_most_recent_first():
+    for _ in range(3):
+        runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
+        runs.finish_run()
+
+    all_rows = runs.list_runs()
+    assert len(all_rows) == 3
+    assert all_rows[0].repeat_idx == 3  # most recent (highest repeat_idx) first
+
+    limited = runs.list_runs(limit=2)
+    assert len(limited) == 2
+    assert [r.repeat_idx for r in limited] == [3, 2]
+
+
+def test_list_runs_config_current_true_when_matching_todays_yaml():
+    exp = _exp(check="true")
+    runs.begin_run(exp, _yaml_for("true"), "only-arm")
+    runs.finish_run()
+
+    rows = runs.list_runs(experiment_obj=exp)
+    assert rows[0].config_current is True
+
+
+def test_list_runs_config_current_false_when_config_changed():
+    """The thing finding 14 exists for: a changed success_check must not be
+    silently treated as 'still current'."""
+    old_exp = _exp(check="true")
+    runs.begin_run(old_exp, _yaml_for("true"), "only-arm")
+    runs.finish_run()
+
+    new_exp = _exp(check="false")
+    rows = runs.list_runs(experiment_obj=new_exp)
+    assert rows[0].config_current is False
+
+
+def test_list_runs_config_current_false_when_no_snapshot_recorded():
+    """A run written before finding 14 shipped has config_hash=NULL --
+    never trusted as current, same rule render.compare_experiment uses."""
+    exp = _exp()
+    begun = runs.begin_run(exp, EXPERIMENT_YAML, "only-arm")
+    runs.finish_run()
+
+    from ys import db
+
+    with db.cursor() as cur:
+        cur.execute("UPDATE runs SET config_hash = NULL WHERE id = ?", (begun.run_id,))
+
+    rows = runs.list_runs(experiment_obj=exp)
+    assert rows[0].config_current is False
+
+
+def test_list_runs_config_current_false_when_arm_no_longer_declared():
+    exp = _exp()
+    runs.begin_run(exp, EXPERIMENT_YAML, "only-arm")
+    runs.finish_run()
+
+    renamed_exp = Experiment.model_validate(
+        {
+            "experiment": "runs-test-exp",
+            "task": {"id": "t0", "success_check": "true"},
+            "arms": [{"id": "renamed-arm", "factors": {}, "baseline": True}],
+        }
+    )
+    rows = runs.list_runs(experiment_obj=renamed_exp)
+    assert rows[0].config_current is False
+
+
+def test_list_runs_config_current_none_when_no_experiment_obj_given():
+    runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
+    runs.finish_run()
+
+    rows = runs.list_runs()
+    assert rows[0].config_current is None
