@@ -474,6 +474,15 @@ def compare(
     # a number above is wrong, just that comparing it isn't apples-to-apples.
     for warning in render.repeat_count_warnings(comparison):
         console.print(f"[yellow]warning: {warning}[/yellow]")
+    # Feature 3: the question a comparison table alone can't answer -- is a
+    # difference real, or noise. One sentence per (arm, primary metric),
+    # printed after the other banners since it's the verdict that follows
+    # from the table, not a caveat about the table itself.
+    verdicts = render.significance_verdicts(comparison)
+    if verdicts:
+        console.print("\n[bold]is the difference real?[/bold]")
+        for verdict in verdicts:
+            console.print(f"  {verdict}")
 
 
 @app.command()

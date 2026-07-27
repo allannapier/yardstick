@@ -302,6 +302,37 @@ def test_aggregate_run_metrics_excludes_failed_runs_from_efficiency_but_not_n():
 
 
 # ---------------------------------------------------------------------------
+# feature 3: aggregate_run_metrics also carries each metric's raw per-run
+# values -- ys/statistics.py's bootstrap/permutation tests need the actual
+# observations, not just their mean/spread summary.
+# ---------------------------------------------------------------------------
+
+def test_aggregate_run_metrics_carries_raw_values_for_bootstrap_and_permutation_tests():
+    db.init_db()
+    with db.cursor() as cur:
+        _mk_run(cur, "r_ok1", task_success=1)
+        _mk_request(cur, "r_ok1", 1, input_tokens=100, output_tokens=50, response_cost=1.0)
+
+        _mk_run(cur, "r_ok2", task_success=1)
+        _mk_request(cur, "r_ok2", 1, input_tokens=200, output_tokens=100, response_cost=2.0)
+
+        # A failed run's metrics are excluded from the gate-passing
+        # population -- its values must not appear in "values" either,
+        # matching what "mean"/"n" already exclude it from (finding 13/14's
+        # population, same one feature 3's statistics must operate over).
+        _mk_run(cur, "r_fail", task_success=0)
+        _mk_request(cur, "r_fail", 1, input_tokens=1000, output_tokens=500, response_cost=5.0)
+
+    with db.cursor() as cur:
+        agg = metrics.aggregate_run_metrics(cur, ["r_ok1", "r_ok2", "r_fail"])
+
+    cost = agg["metrics"]["cost_usd"]
+    assert sorted(cost["values"]) == [1.0, 2.0]
+    assert len(cost["values"]) == cost["n"]
+    assert sum(cost["values"]) / len(cost["values"]) == pytest.approx(cost["mean"])
+
+
+# ---------------------------------------------------------------------------
 # finding 13: a run that never got an `ys end` (task_success still NULL --
 # e.g. one displaced by `--force`, which ys/state.py flags `abandoned`
 # without ever assigning it a verdict) must not count toward n_runs/

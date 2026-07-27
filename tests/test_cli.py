@@ -86,6 +86,30 @@ def _write_exp_with_prompt_file(tmp_path, prompt_file):
     return str(path)
 
 
+TWO_ARM_EXPERIMENT_YAML = """
+experiment: cli-two-arm-exp
+task:
+  id: t0
+  success_check: "true"
+  timeout_s: 5
+arms:
+  - id: arm-a
+    factors: {}
+    baseline: true
+  - id: arm-b
+    factors: {}
+repeats: 3
+metrics:
+  primary: [cost_usd]
+"""
+
+
+def _write_two_arm_exp(tmp_path):
+    path = tmp_path / "two_arm_exp.yaml"
+    path.write_text(TWO_ARM_EXPERIMENT_YAML)
+    return str(path)
+
+
 @pytest.fixture
 def fake_claude_agent(monkeypatch, tmp_path):
     claude_path = str(tmp_path / "claude_settings.json")
@@ -438,6 +462,38 @@ def test_compare_prints_cost_unknown_warning_for_unpriced_model(tmp_path):
     output = unwrapped(result.stdout)
     assert "cost unavailable for model 'claude-sonnet-5'" in output
     assert "COST UNKNOWN" in output
+
+
+def test_compare_prints_significance_verdict_for_primary_metric(tmp_path):
+    """Feature 3, end to end through the real CLI commands: `ys compare`
+    must print an explicit verdict sentence -- naming direction, effect
+    size, and (since n=3 here) that the difference can't be claimed
+    significant at this sample size -- for `metrics.primary`, not just the
+    raw table."""
+    exp = _write_two_arm_exp(tmp_path)
+    costs = {"arm-a": [1.02, 0.98, 1.00], "arm-b": [0.80, 0.85, 0.81]}
+    for arm_id, arm_costs in costs.items():
+        for cost in arm_costs:
+            start = runner.invoke(app, ["start", "--exp", exp, "--arm", arm_id])
+            assert start.exit_code == 0, start.stdout
+            run_id = re.search(r"run (\S+)", plain(start.stdout)).group(1)
+            with db.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO requests (run_id, seq, ts, model, input_tokens, output_tokens, "
+                    "response_cost, cost_source) VALUES (?,1,?,?,?,?,?,?)",
+                    (run_id, "2026-01-01T00:00:00Z", "test-model", 10, 5, cost, "litellm"),
+                )
+            end = runner.invoke(app, ["end"])
+            assert end.exit_code == 0, end.stdout
+
+    result = runner.invoke(app, ["compare", "--exp", exp])
+    assert result.exit_code == 0, result.stdout
+    output = unwrapped(result.stdout)
+    assert "is the difference real?" in output
+    assert "arm-b is" in output
+    assert "cheaper" in output
+    assert "cost_usd" in output
+    assert "repeats needed" in output
 
 
 def test_start_warns_when_proxy_missing_arm_model(tmp_path, monkeypatch):
