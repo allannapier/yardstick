@@ -384,12 +384,28 @@ _METRIC_DIRECTION_WORDS = {
 }
 _DEFAULT_DIRECTION_WORDS = ("lower", "higher")
 
+# "fewer"/"more" are quantity words that need the thing being counted next to
+# them -- "arm-b is 30% fewer than arm-a on turns" isn't a sentence. So the
+# count metrics take a different clause shape ("arm-b uses 30% fewer turns
+# than arm-a") that names the metric inline instead of trailing it with
+# "on {metric}". Everything else reads correctly in the relational form
+# ("18% cheaper than ... on cost_usd") and keeps it.
+_COUNT_METRICS = frozenset({"billable_tokens", "tokens_per_turn", "turns", "tool_calls"})
+
 
 def _direction_word(metric: str, relative_effect: Optional[float]) -> str:
     lower_word, higher_word = _METRIC_DIRECTION_WORDS.get(metric, _DEFAULT_DIRECTION_WORDS)
     if relative_effect is None or relative_effect >= 0:
         return higher_word
     return lower_word
+
+
+def _effect_clause(metric: str, arm_label: str, baseline_label: str, direction: str, pct_str: str) -> str:
+    """The "arm-b is 18% cheaper than arm-a on cost_usd" opening of a verdict
+    line, in whichever of the two shapes the metric's direction word needs."""
+    if metric in _COUNT_METRICS:
+        return f"{arm_label} uses {pct_str} {direction} {metric} than {baseline_label}"
+    return f"{arm_label} is {pct_str} {direction} than {baseline_label} on {metric}"
 
 
 def _format_metric_verdict(metric: str, arm_label: str, baseline_label: str, v: stats.MetricVerdict) -> str:
@@ -407,15 +423,20 @@ def _format_metric_verdict(metric: str, arm_label: str, baseline_label: str, v: 
     n_desc = f"n={v.n_baseline}" if v.n_baseline == v.n_arm else f"n={v.n_baseline} vs {v.n_arm}"
     perm = v.permutation
 
+    effect = _effect_clause(metric, arm_label, baseline_label, direction, pct_str)
+
     if v.significant:
         return (
-            f"{arm_label} is {pct_str} {direction} than {baseline_label} on {metric} "
-            f"({n_desc}, permutation p={perm.p_value:.3g}) -- distinguishable from noise."
+            f"{effect} ({n_desc}, permutation p={perm.p_value:.3g}) "
+            "-- distinguishable from noise."
         )
 
     if perm.exact and perm.min_possible_p is not None and perm.min_possible_p >= stats.DEFAULT_ALPHA:
+        # The enclosing sentence already opens with "but with {n_desc}", so
+        # this clause deliberately doesn't repeat the n ("but with n=3 the
+        # smallest p-value ... at n=3 is 0.1" said it twice).
         noise_clause = (
-            f"the smallest possible p-value an exact test could report at {n_desc} is "
+            f"the smallest possible p-value an exact test could report is "
             f"{perm.min_possible_p:.2g}, so no result here could reach significance"
         )
     else:
@@ -426,10 +447,7 @@ def _format_metric_verdict(metric: str, arm_label: str, baseline_label: str, v: 
     else:
         repeats_clause = "not enough repeats yet to estimate how many would be needed"
 
-    return (
-        f"{arm_label} is {pct_str} {direction} than {baseline_label} on {metric}, "
-        f"but with {n_desc} {noise_clause}; {repeats_clause}."
-    )
+    return f"{effect}, but with {n_desc} {noise_clause}; {repeats_clause}."
 
 
 def significance_verdicts(comparison: Comparison) -> list:
