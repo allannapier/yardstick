@@ -223,7 +223,15 @@ class FinishResult:
     summary_metrics: dict = field(default_factory=dict)
 
 
-def finish_run(manual_score: Optional[float] = None) -> FinishResult:
+def finish_run(manual_score: Optional[float] = None, cwd: Optional[str] = None) -> FinishResult:
+    """`cwd`, when given, is where `task.success_check` runs -- feature 2
+    (ys/workspace.py) passes the run's per-repeat workspace directory here
+    from ys/runner.py so the check sees the tree the agent actually worked
+    in, instead of unconditionally inheriting whatever directory the
+    calling process (`ys end`) happened to be invoked from. `None` (the
+    default) preserves that original behaviour exactly -- `subprocess.run`
+    treats `cwd=None` the same as not passing `cwd` at all -- so `ys end`'s
+    own interactive flow is unaffected."""
     active = state.get_active()
     if active is None:
         raise NoActiveRun("no active run")
@@ -255,7 +263,7 @@ def finish_run(manual_score: Optional[float] = None) -> FinishResult:
             )
         try:
             proc = subprocess.run(
-                check, shell=True, timeout=timeout_s, capture_output=True, text=True
+                check, shell=True, cwd=cwd, timeout=timeout_s, capture_output=True, text=True
             )
             task_success = proc.returncode == 0
             success_output = ((proc.stdout or "") + (proc.stderr or ""))[-4000:]

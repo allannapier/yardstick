@@ -99,6 +99,29 @@ def test_finish_run_manual_score_skips_check():
     assert result.task_success is True
 
 
+def test_finish_run_success_check_runs_in_the_given_cwd(tmp_path):
+    """Feature 2 (workspace isolation): success_check should run in a
+    per-run workspace, not unconditionally wherever the calling process
+    happened to be invoked from -- proven here with a check that only
+    passes if `cwd` was actually honoured."""
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    (workdir / "marker.txt").write_text("present\n")
+    check = "test -f marker.txt"
+    runs.begin_run(_exp(check=check), _yaml_for(check), "only-arm")
+    result = runs.finish_run(cwd=str(workdir))
+    assert result.task_success is True
+
+
+def test_finish_run_default_cwd_is_unchanged_from_before_feature_2():
+    """`cwd=None` (the default) must behave exactly as before this feature
+    -- i.e. inherit the calling process's own directory, not fail or change
+    behaviour just because the parameter exists now."""
+    runs.begin_run(_exp(check="true"), _yaml_for("true"), "only-arm")
+    result = runs.finish_run()
+    assert result.task_success is True
+
+
 def test_finish_run_includes_summary_metrics():
     runs.begin_run(_exp(), EXPERIMENT_YAML, "only-arm")
     result = runs.finish_run()

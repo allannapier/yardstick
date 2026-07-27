@@ -1,10 +1,12 @@
 import json
 import re
+import subprocess
 
 import pytest
 from typer.testing import CliRunner
 
 from ys import db, harness, proxy
+from ys import runner as ys_runner  # aliased -- `runner` below is the CliRunner instance
 from ys.cli import app
 
 runner = CliRunner()
@@ -768,3 +770,131 @@ def test_doctor_verifies_model_availability_with_exp_and_arm(tmp_path, monkeypat
     result = runner.invoke(app, ["doctor", "--exp", exp, "--arm", "model-arm"])
     assert result.exit_code == 0, result.stdout
     assert "proxy serves model" in unwrapped(result.stdout)
+
+
+# --- `ys run` (feature 1: unattended runs) ----------------------------------
+
+RUN_CMD_EXPERIMENT_YAML = """
+experiment: cli-run-exp
+task:
+  id: t0
+  success_check: "{check}"
+  timeout_s: 5
+  prompt_file: {prompt_file}
+arms:
+  - id: only-arm
+    factors: {{agent: claude-code}}
+    baseline: true
+repeats: {repeats}
+"""
+
+NO_AGENT_FACTOR_EXPERIMENT_YAML = """
+experiment: cli-run-no-agent-exp
+task:
+  id: t0
+  success_check: "true"
+  timeout_s: 5
+  prompt_file: {prompt_file}
+arms:
+  - id: only-arm
+    factors: {{}}
+    baseline: true
+repeats: 1
+"""
+
+
+@pytest.fixture
+def run_cmd_exp(tmp_path):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("do the task\n")
+
+    def _write(check="true", repeats=1):
+        path = tmp_path / "run_cmd_exp.yaml"
+        path.write_text(RUN_CMD_EXPERIMENT_YAML.format(check=check, prompt_file=prompt, repeats=repeats))
+        return str(path)
+
+    return _write
+
+
+def _agent_ok_env(monkeypatch, returncode=0, stderr=""):
+    """Fakes the agent-CLI boundary the way tests/test_runner.py does --
+    only the actual agent invocation (cmd[0] == 'claude') is faked; real
+    `success_check` (a plain shell string) still runs for real."""
+    monkeypatch.setattr(ys_runner, "check_agent_binary", lambda name: "/usr/bin/fake-" + name)
+    monkeypatch.setattr(proxy, "proxy_status", lambda: (True, 4242))
+
+    real_run = subprocess.run
+
+    def _run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "claude":
+            return subprocess.CompletedProcess(cmd, returncode, stdout="ok", stderr=stderr)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ys_runner.subprocess, "run", _run)
+
+
+def test_run_cmd_requires_agent_when_arm_has_no_agent_factor(tmp_path, fake_claude_agent):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("do the task\n")
+    path = tmp_path / "no_agent_exp.yaml"
+    path.write_text(NO_AGENT_FACTOR_EXPERIMENT_YAML.format(prompt_file=prompt))
+
+    result = runner.invoke(app, ["run", "--exp", str(path), "--arm", "only-arm"])
+    assert result.exit_code != 0
+    assert "no --agent given" in plain(result.stdout)
+
+
+def test_run_cmd_fails_loudly_when_prompt_file_missing(tmp_path, fake_claude_agent):
+    path = tmp_path / "missing_prompt_exp.yaml"
+    path.write_text(
+        RUN_CMD_EXPERIMENT_YAML.format(check="true", prompt_file=tmp_path / "nope.txt", repeats=1)
+    )
+    result = runner.invoke(app, ["run", "--exp", str(path), "--arm", "only-arm"])
+    assert result.exit_code != 0
+    assert "does not exist" in unwrapped(result.stdout)
+    with db.cursor() as cur:
+        assert cur.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"] == 0
+
+
+def test_run_cmd_fails_loudly_when_agent_binary_missing(monkeypatch, run_cmd_exp, fake_claude_agent):
+    monkeypatch.setattr(ys_runner, "check_agent_binary", lambda name: None)
+    monkeypatch.setattr(proxy, "proxy_status", lambda: (True, 4242))
+    exp = run_cmd_exp()
+
+    result = runner.invoke(app, ["run", "--exp", exp, "--arm", "only-arm"])
+    assert result.exit_code != 0
+    assert "not on PATH" in plain(result.stdout)
+
+
+def test_run_cmd_completes_repeats_and_prints_summary(monkeypatch, run_cmd_exp, fake_claude_agent):
+    _agent_ok_env(monkeypatch)
+    exp = run_cmd_exp(check="true", repeats=2)
+
+    result = runner.invoke(app, ["run", "--exp", exp, "--arm", "only-arm"])
+    assert result.exit_code == 0, result.stdout
+    out = unwrapped(result.stdout)
+    assert "2/2" in out
+    assert "2 succeeded" in out
+    assert "0 failed" in out
+
+
+def test_run_cmd_stops_early_and_reports_aborted_reason(monkeypatch, run_cmd_exp, fake_claude_agent):
+    _agent_ok_env(monkeypatch, returncode=1, stderr="proxy down")
+    exp = run_cmd_exp(check="true", repeats=5)
+
+    result = runner.invoke(
+        app, ["run", "--exp", exp, "--arm", "only-arm", "--max-consecutive-failures", "2"]
+    )
+    assert result.exit_code != 0
+    out = unwrapped(result.stdout)
+    assert "stopped early" in out
+    assert "2 consecutive" in out
+
+
+def test_run_cmd_repeats_flag_overrides_experiment_repeats(monkeypatch, run_cmd_exp, fake_claude_agent):
+    _agent_ok_env(monkeypatch)
+    exp = run_cmd_exp(check="true", repeats=1)
+
+    result = runner.invoke(app, ["run", "--exp", exp, "--arm", "only-arm", "--repeats", "3"])
+    assert result.exit_code == 0, result.stdout
+    assert "3/3" in unwrapped(result.stdout)

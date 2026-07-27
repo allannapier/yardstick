@@ -962,7 +962,7 @@ declares, is reported as not current rather than silently trusted).
 
 ## Features
 
-### 1. Unattended runs — the highest-value addition
+### 1. Unattended runs — the highest-value addition — fixed
 
 Today every repeat is hand-driven: point the harness, start, drive the agent
 yourself, end. That is the biggest threat to the rig's own validity, because the
@@ -975,7 +975,87 @@ human in the loop is an uncontrolled variable across repeats and arms, and
 one. This turns the tool from a logger into an experiment runner and makes
 overnight matrices possible.
 
-### 2. Workspace isolation per run
+**Fix:**
+
+- `ys run --exp E --arm A [--repeats N] [--agent A]` (`ys/cli.py`, business
+  logic in the new `ys/runner.py`) loops `repeats` (default: the
+  experiment's own `repeats:`) `begin_run`/invoke-agent/`finish_run` cycles
+  against one arm, non-interactively. `--agent` defaults to the arm's own
+  `factors.agent` if it has one.
+- **Command construction is a single, testable, easily-corrected place.**
+  None of `claude`/`opencode`/`codex`/`aider` are installed in this repo's
+  dev/test environment, so none of these forms were run against a real
+  binary — `ys/runner.py`'s `build_agent_command` is the one function that
+  builds them, so a wrong form is a one-line fix, not a hunt:
+  - `claude -p <prompt>`, `opencode run <prompt>`, `codex exec <prompt>` —
+    all three named explicitly in this finding's own text.
+  - `aider --message <prompt> --yes-always --no-auto-commits` — not one of
+    the three named above; reconstructed from aider's public docs the same
+    way feature 5's codex-cli/aider support was, and equally unverified.
+  - Say so again, plainly: **none of these four invocation forms have been
+    run against a live install.** `tests/test_runner.py` fakes the
+    subprocess boundary throughout (see below) rather than pretending to
+    have verified them.
+- **Money-burning protections**, all asked for by name in this finding:
+  - `ys/runner.py`'s `preflight` checks the agent's binary is on `PATH`
+    (`shutil.which`), `task.prompt_file` exists, the proxy is reachable
+    (`proxy.proxy_status`), and `LITELLM_MASTER_KEY` is set — *before* the
+    first repeat starts, not discovered mid-loop on repeat 2.
+  - `task.timeout_s` (already used by `success_check`) now also bounds
+    every single agent invocation.
+  - `--max-consecutive-failures` (default 3) hard-stops the whole loop
+    after that many agent-invocation failures *in a row* — nonzero exit,
+    an exception (e.g. the binary disappeared), or a timeout. A repeat that
+    ran fine but simply failed its own `success_check` does **not** count:
+    that's a real experimental outcome, not a sign the setup itself is
+    broken and blindly retrying it would burn paid requests for nothing.
+  - Progress is printed per repeat/phase (`ys/runner.py`'s `on_event`
+    callback, wired to Rich in `ys/cli.py`) so a human watching an
+    overnight matrix can tell what's happening.
+- **How the agent is pointed at the proxy: `--env-only` preferred.**
+  `run_experiment` tries `harness.env_exports()` (feature 5) first — the
+  spawned agent subprocess gets its own environment directly and the
+  user's real config file is never touched, which is exactly what an
+  unattended loop spawning subprocesses wants. It only falls back to
+  `harness.point()`/`harness.reset()` — once, around the whole loop, not
+  per repeat — for an agent `env_exports` doesn't support yet (opencode,
+  codex-cli today), and the fallback's `reset()` always runs in a `finally`
+  block, including when the loop aborts early.
+- **A fast loop racing its own drain window (finding 11).** `finish_run`
+  starts a 60s fallback so a straggling, header-less response still
+  attributes to the run that just ended — but a human pauses between
+  repeats without thinking about it, while an automated loop would
+  overwrite `active.json` for the *next* repeat within milliseconds,
+  flipping that attribution target before the window closes and silently
+  *contaminating* the next repeat with the previous one's tail (worse than
+  finding 11's original "falls into `unattributed`" failure mode). `--settle-s`
+  (default 2.0, well under the 60s drain window) pauses between repeats —
+  the agent subprocess already blocks until it exits, so the remaining gap
+  is only the proxy's own async collector write (finding 6) lagging the
+  HTTP response by a moment, not the full window. See the comment at the
+  `time.sleep` call site in `ys/runner.py`'s `run_experiment`.
+- `ys/runs.py`'s `finish_run` gained an optional `cwd` parameter (default
+  `None`, identical to before this feature — `subprocess.run(cwd=None)` is
+  the same as not passing `cwd`) so `success_check` runs in the repeat's
+  own workspace (feature 2) instead of unconditionally inheriting whatever
+  directory the calling process was invoked from. `ys end`'s own
+  interactive flow is unaffected.
+- **Verification.** 27 new tests in `tests/test_runner.py` and 6 more in
+  `tests/test_cli.py` cover: the repeat loop completing/scoring correctly;
+  a task failure vs. an invocation failure being counted differently; the
+  consecutive-failure guard tripping and resetting on an intervening
+  success; the settle-sleep happening between repeats but not after the
+  last one and not after an aborting failure; the missing-binary and
+  proxy-down preflight checks aborting before any repeat starts; and the
+  env-only-vs-point()/reset() harness-pointing choice for two different
+  agents. Every subprocess call is faked; nothing in this suite touches the
+  network, a real agent CLI, or a real `~/.claude`.
+- `experiments/unattended-example.yaml` (+ a companion `.prompt.md`)
+  demonstrates the schema end to end against a mocked model — free to run,
+  though `ys run` itself still needs a real agent CLI installed to actually
+  invoke one.
+
+### 2. Workspace isolation per run — fixed
 
 `success_check` runs via `shell=True` in whatever directory `ys end` happened to
 be invoked from. There is no working directory, no setup, no teardown, and no
@@ -986,6 +1066,76 @@ Add `task.workdir`, `task.setup`, `task.teardown`, and a per-run git
 worktree/clone from `repo`@`ref` so every repeat starts from an identical tree.
 Without this, repeats measure a moving target and the error bars are not what they
 appear to be.
+
+**Fix:**
+
+- `Task` (`ys/experiment.py`) gained `workdir`, `setup`, `teardown` fields
+  alongside the existing (previously inert) `repo`/`ref`/`prompt_file`. A
+  new module, `ys/workspace.py`, is the only place that constructs or
+  removes a workspace — kept deliberately separate from `ys/runner.py`
+  (feature 1), so each is independently testable and the "what may this
+  code delete" question has exactly one file to audit.
+  `Experiment.task.model_dump()` already feeds finding 14's `config_hash`,
+  so a changed `workdir`/`setup`/`teardown` correctly starts a new
+  comparable-runs group with no extra code.
+- `prepare_workspace(task, run_id)` picks one of three modes:
+  - `task.repo` set: a fresh `git clone` (+ `git checkout <ref>` if given)
+    into `~/.yardstick/workspaces/<run_id>/` — the actual "every repeat
+    starts from an identical tree" mechanism this finding asks for.
+    `task.workdir`, if also given, names a subdirectory *within* that
+    clone (e.g. a monorepo package) to actually run in.
+  - `task.repo` not set, `task.workdir` set: an existing directory the
+    caller manages, typically a real project checkout. Used as-is —
+    isolation is a best case here, not a guarantee, since there's no ref
+    to reset to between repeats; only whatever `setup`/`teardown` do on
+    their own.
+  - Neither set: falls back to the invoking process's own directory,
+    matching the pre-fix behaviour exactly.
+- **The safety rule this finding's constraints demanded, stated once and
+  enforced in one place:** only a directory yardstick itself created,
+  under `~/.yardstick/workspaces/<run_id>/`, may ever be deleted.
+  `Workspace.managed` records whether a directory was created here (a
+  `repo` clone) or supplied by the caller; `cleanup_workspace` refuses
+  unless *both* `managed` is `True` *and* the resolved path is a real
+  child of that root — two independent checks, not just the flag, so a
+  future bug that mislabels a caller-supplied directory still can't delete
+  it. A `task.workdir` pointing at a real project is therefore never
+  touched by cleanup no matter what its path looks like, and neither is
+  the plain-cwd fallback. See `ys/workspace.py`'s module docstring and
+  `tests/test_workspace.py`'s "safety rule" tests, including one that
+  constructs a mislabeled `Workspace` directly to prove the path check is
+  independent of the flag.
+- **No shell string is ever built by interpolating a yardstick-constructed
+  value into it.** `task.setup`/`task.teardown` (and, from feature 1,
+  `success_check` via `ys/runs.py`'s new `cwd` parameter) run with the
+  workspace path passed via `cwd` and a `$YS_WORKDIR` env var — never
+  string-formatted into the command. `git clone`/`git checkout` go further
+  still: `task.repo`/`task.ref` are passed as argv list elements with no
+  `shell=True` at all, so they're never exposed to a shell in the first
+  place. `shell=True` for `setup`/`teardown` itself isn't new exposure —
+  it was already true of `success_check` before this feature; running it
+  per repeat in a fresh workspace multiplies how often it runs, not what a
+  config file is trusted to do.
+  `tests/test_workspace.py::test_run_setup_does_not_interpolate_the_path_into_the_command_string`
+  pins this directly, using a workspace path containing a shell
+  metacharacter that would execute something if it were ever
+  string-interpolated.
+- `validate_task_paths` (`ys/experiment.py`, findings 15-18's hook) now
+  also flags a `task.workdir` that doesn't exist on disk when no
+  `task.repo` is set to create it from — the same "fail loudly before the
+  run starts" treatment `prompt_file`/local-path `repo` already got.
+- **Verification.** 23 new tests in `tests/test_workspace.py` cover: all
+  three `prepare_workspace` modes (including `repo`+`workdir` together and
+  a bad ref/repo raising); that `cleanup_workspace` actually removes a
+  managed clone; that it never removes an unmanaged `task.workdir`, the cwd
+  fallback, or (via a directly-constructed mislabeled `Workspace`) a
+  managed-but-outside-the-root path; and that `setup`/`teardown` run in the
+  right `cwd`, expose `$YS_WORKDIR`, and are bounded by `task.timeout_s`.
+  Cloning uses a real local-filesystem `git init`/`clone` in `tmp_path` —
+  exercising the real `git` subprocess calls without ever touching the
+  network. `tests/test_runs.py` adds two regression tests for
+  `finish_run`'s new `cwd` parameter (honoured when given, unchanged
+  default behaviour when not).
 
 ### 3. Statistics worth the name -- fixed
 

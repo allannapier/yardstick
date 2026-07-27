@@ -336,3 +336,66 @@ def test_validate_task_paths_skips_remote_looking_repo_urls():
 def test_validate_task_paths_empty_when_nothing_declared():
     exp = Experiment.model_validate(_base_kwargs())
     assert validate_task_paths(exp.task) == []
+
+
+# --- feature 2: task.workdir/setup/teardown ---------------------------------
+
+
+def test_task_accepts_workdir_setup_teardown():
+    exp = Experiment.model_validate(
+        _base_kwargs(
+            task={
+                "id": "t0",
+                "success_check": "true",
+                "workdir": "some/dir",
+                "setup": "npm install",
+                "teardown": "rm -rf node_modules",
+            }
+        )
+    )
+    assert exp.task.workdir == "some/dir"
+    assert exp.task.setup == "npm install"
+    assert exp.task.teardown == "rm -rf node_modules"
+
+
+def test_task_workdir_setup_teardown_default_to_none():
+    exp = Experiment.model_validate(_base_kwargs())
+    assert exp.task.workdir is None
+    assert exp.task.setup is None
+    assert exp.task.teardown is None
+
+
+def test_validate_task_paths_flags_missing_workdir_without_repo(tmp_path):
+    missing = str(tmp_path / "no-such-workdir")
+    exp = Experiment.model_validate(
+        _base_kwargs(task={"id": "t0", "success_check": "true", "workdir": missing})
+    )
+    problems = validate_task_paths(exp.task)
+    assert len(problems) == 1
+    assert "does not exist" in problems[0]
+
+
+def test_validate_task_paths_accepts_existing_workdir(tmp_path):
+    d = tmp_path / "existing"
+    d.mkdir()
+    exp = Experiment.model_validate(
+        _base_kwargs(task={"id": "t0", "success_check": "true", "workdir": str(d)})
+    )
+    assert validate_task_paths(exp.task) == []
+
+
+def test_validate_task_paths_skips_workdir_check_when_repo_is_set(tmp_path):
+    """With `repo` set, `workdir` names a subdirectory inside a clone that
+    doesn't exist yet -- nothing to check on disk until ys/workspace.py
+    actually clones it."""
+    exp = Experiment.model_validate(
+        _base_kwargs(
+            task={
+                "id": "t0",
+                "success_check": "true",
+                "repo": "https://example.com/repo.git",
+                "workdir": "packages/app",
+            }
+        )
+    )
+    assert validate_task_paths(exp.task) == []

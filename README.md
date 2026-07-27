@@ -99,6 +99,82 @@ Optional dashboard for setting up experiments and browsing runs in a browser:
 ys web up
 ```
 
+## Unattended runs
+
+Steps 2-4 above are hand-driven: point the harness, start, drive the agent
+yourself, end -- so a human is an uncontrolled variable across repeats and
+arms, and `repeats: 3` means doing it three times by hand. `ys run` instead
+invokes the agent non-interactively and loops the repeats itself:
+
+```bash
+export LITELLM_MASTER_KEY=sk-...
+ys proxy up --exp experiments/unattended-example.yaml
+ys run --exp experiments/unattended-example.yaml --arm arm-a --repeats 3
+```
+
+It requires `task.prompt_file` (there's no human to type a prompt) and an
+`--agent` (or the arm's own `factors.agent`) whose CLI is on `PATH` --
+`claude -p`, `opencode run`, and `codex exec` are invoked as named in
+IMPROVEMENTS.md's feature 1; `aider --message ... --yes-always
+--no-auto-commits` is a best-effort fourth, reconstructed from its docs and
+not verified against a live install (see `ys/runner.py`'s
+`build_agent_command` -- the one place all four are constructed, so a wrong
+invocation form is a one-line fix). Every one of these checks, plus the
+proxy being up and `LITELLM_MASTER_KEY` being set, is verified *before* the
+first repeat starts, not discovered mid-loop.
+
+Two protections against an unattended loop burning real money: each agent
+invocation is bounded by `task.timeout_s`, and the whole run hard-stops
+after `--max-consecutive-failures` (default 3) agent invocations fail in a
+row -- a repeat that ran fine but simply failed its own `success_check`
+doesn't count, only the sign something upstream is broken (the proxy went
+down, the agent can't authenticate, ...) does. `--settle-s` (default 2s)
+pauses briefly between repeats: `ys end` starts a short window (see
+"Attribution" below) during which a header-less straggling response is
+still credited to the run that just ended, and a fast automated loop
+starting the next repeat immediately would flip that attribution target
+before the window closes.
+
+Pointing prefers `--env-only` (see "Harness config safety" below): the
+agent subprocess gets its own environment directly and your real config
+file is never touched. It falls back to `ys harness point`/`reset` (once,
+around the whole loop) only for an agent `--env-only` doesn't support yet
+(opencode, codex-cli).
+
+## Workspace isolation
+
+`task.success_check` used to run via `shell=True` wherever `ys end` was
+invoked from -- no working directory, no setup, no teardown, no reset
+between repeats, so repeat 2 started from whatever repeat 1's agent left on
+disk. `ys run` now gives every repeat its own workspace:
+
+- `task.repo` + `task.ref`: a fresh `git clone` + `git checkout` per repeat,
+  so every repeat starts from an identical tree. `task.workdir` alongside
+  `repo` names a subdirectory within that clone to actually run in (e.g. a
+  monorepo package).
+- `task.workdir` alone (no `repo`): an existing directory you manage --
+  typically a real project checkout -- used as-is. Repeats are *not*
+  isolated in this mode; there's no ref to reset to.
+- Neither set: falls back to the invoking process's own directory, matching
+  pre-feature-2 behaviour exactly.
+- `task.setup` / `task.teardown`: shell strings run once per repeat, before/
+  after the agent, in that workspace -- the same trust model
+  `success_check` already had (`shell=True` isn't new exposure). The
+  workspace path is only ever passed via `cwd`/the `$YS_WORKDIR` env var,
+  never interpolated into the command string itself.
+
+**Safety rule:** only a directory yardstick itself created (a `repo` clone
+under `~/.yardstick/workspaces/<run_id>/`) is ever deleted between/after
+repeats. A `task.workdir` pointing at your real project -- or the
+cwd fallback -- is never created or removed by yardstick, no matter what.
+See `ys/workspace.py`'s module docstring for the two independent checks
+`cleanup_workspace` makes before removing anything.
+
+[`experiments/unattended-example.yaml`](experiments/unattended-example.yaml)
+demonstrates both features together against a mocked model (free to run,
+though `ys run` itself still needs a real agent CLI installed to actually
+invoke).
+
 ## Experiment YAML
 
 An experiment defines a task, one or more models, and a set of arms
@@ -106,9 +182,11 @@ An experiment defines a task, one or more models, and a set of arms
 [`experiments/example.yaml`](experiments/example.yaml) for a minimal
 end-to-end example using a mocked model response,
 [`experiments/interactive-sonnet.yaml`](experiments/interactive-sonnet.yaml)
-for a real-model interactive run, and
+for a real-model interactive run,
 [`experiments/cross-provider-example.yaml`](experiments/cross-provider-example.yaml)
-for an Anthropic-vs-OpenAI comparison (mocked, so it costs nothing to run).
+for an Anthropic-vs-OpenAI comparison (mocked, so it costs nothing to run),
+and [`experiments/unattended-example.yaml`](experiments/unattended-example.yaml)
+for `ys run` plus workspace isolation (also mocked).
 
 ## Models and providers
 
@@ -171,7 +249,9 @@ matters to you.
 Requests are attributed to the active run via the `x-ys-run` header when the
 harness supports custom headers, or otherwise via the active-run state file
 `ys start` writes — which is correct as long as only one run is active at a
-time.
+time. A response landing just after `ys end` still attributes to the run
+that just finished for a short drain window (60s), so the tail of a run
+isn't dropped into `unattributed` just because it arrived a moment late.
 
 ## Development
 
