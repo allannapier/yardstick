@@ -386,3 +386,108 @@ def unattributed_summary() -> UnattributedSummary:
     count = row["c"] or 0
     since = row["earliest"][11:16] if count and row["earliest"] else None
     return UnattributedSummary(count=count, since=since)
+
+
+@dataclass
+class RunListRow:
+    run_id: str
+    experiment_id: str
+    arm_id: str
+    repeat_idx: int
+    started_at: str
+    status: str  # "finished" | "unfinished" | "abandoned" -- see finding 13
+    success: Optional[bool]  # None if the run has no verdict yet
+    config_current: Optional[bool]  # None if not checked (no experiment_obj given)
+
+
+def list_runs(
+    experiment: Optional[str] = None,
+    arm: Optional[str] = None,
+    limit: Optional[int] = None,
+    experiment_obj: Optional[Experiment] = None,
+) -> list:
+    """P2 (IMPROVEMENTS.md): "there is no `ys runs list`. Runs can be
+    deleted by id but never enumerated, so the only way to find an id is the
+    dashboard or raw SQL." Joins `arms` to report the bare arm id
+    (`arms.label`, e.g. `arm-a`) instead of the internal `experiment::arm`
+    row id `runs.arm_id` is actually stored as.
+
+    `status` surfaces finding 13's `abandoned` column and plain
+    never-`ys end`-ed runs (`ended_at IS NULL`) as distinct from a normally
+    `finished` run -- the same three-way split `aggregate_run_metrics`
+    already uses to decide what counts toward `n_runs`/`n_unfinished`,
+    just named per-row instead of only summarized in `ys compare`.
+
+    `config_current` answers finding 14's "which of these runs still count"
+    question, the one the P2 section says sends people to raw SQL in the
+    first place: given `experiment_obj` (the experiment's *current* parsed
+    YAML), each row's stored `config_hash` (see `config_hash_for_arm`) is
+    compared against what that arm's config hashes to today. A NULL stored
+    hash (a run recorded before finding 14 shipped) is never treated as
+    current, same as `render.compare_experiment`'s rule -- silently trusting
+    unverifiable old data is exactly the failure mode finding 14 is about.
+    An arm the current YAML no longer declares at all is also reported as
+    stale rather than raising, since "the arm was renamed/removed" is itself
+    exactly the kind of drift this is meant to surface. Left `None`
+    (not computed) when `experiment_obj` isn't given, e.g. an unscoped
+    `ys runs list` with no `--exp`.
+    """
+    query = (
+        "SELECT r.id, r.experiment_id, a.label AS arm_label, r.repeat_idx, "
+        "r.started_at, r.ended_at, r.task_success, r.abandoned, r.config_hash "
+        "FROM runs r JOIN arms a ON a.id = r.arm_id "
+        "WHERE (? IS NULL OR r.experiment_id = ?) AND (? IS NULL OR a.label = ?) "
+        # started_at has only second resolution, so two runs begun within the
+        # same second (routine in a fast test suite, and not impossible for a
+        # human either) would otherwise tie -- runs.id is a UUID, not an
+        # insertion-ordered key, so the tiebreaker is SQLite's implicit
+        # `rowid` (monotonically increasing on insert for an ordinary
+        # rowid table, which this is -- no WITHOUT ROWID), breaking the tie
+        # in favour of "most recent first" instead of SQLite's unspecified
+        # order among ties.
+        "ORDER BY r.started_at DESC, r.rowid DESC"
+    )
+    params: tuple = (experiment, experiment, arm, arm)
+    if limit is not None:
+        query += " LIMIT ?"
+        params = params + (limit,)
+
+    with db.cursor() as cur:
+        rows = cur.execute(query, params).fetchall()
+
+    result = []
+    for row in rows:
+        if row["abandoned"]:
+            status = "abandoned"
+        elif row["ended_at"] is None:
+            status = "unfinished"
+        else:
+            status = "finished"
+
+        success = bool(row["task_success"]) if row["task_success"] is not None else None
+
+        config_current = None
+        if experiment_obj is not None:
+            try:
+                arm_obj = experiment_obj.get_arm(row["arm_label"])
+            except KeyError:
+                config_current = False
+            else:
+                if row["config_hash"] is None:
+                    config_current = False
+                else:
+                    config_current = row["config_hash"] == config_hash_for_arm(experiment_obj, arm_obj)
+
+        result.append(
+            RunListRow(
+                run_id=row["id"],
+                experiment_id=row["experiment_id"],
+                arm_id=row["arm_label"],
+                repeat_idx=row["repeat_idx"],
+                started_at=row["started_at"],
+                status=status,
+                success=success,
+                config_current=config_current,
+            )
+        )
+    return result
