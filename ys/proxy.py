@@ -14,11 +14,28 @@ DEFAULT_PORT = 4000
 # `factors.model` convention still needs somewhere to go -- Claude Code's
 # background/title-generation traffic in particular carries model ids the
 # experiment never declared. Without a catch-all, LiteLLM 400s those
-# requests and the whole run fails. This passes them straight through to
-# Anthropic (LiteLLM's provider-wildcard routing: `model_name: "*"` +
-# `litellm_params.model: "anthropic/*"`) and the collector still records
-# them -- unmeasured against a declared arm, but not a broken run.
+# requests and the whole run fails. This passes them straight through to a
+# real provider (LiteLLM's provider-wildcard routing: `model_name: "*"` +
+# `litellm_params.model: "<provider>/*"`) and the collector still records
+# them -- unmeasured against a declared arm, but not a broken run. Which
+# provider the catch-all targets is decided by `_catch_all_params` below
+# (feature 5 in IMPROVEMENTS.md) -- it used to be hardcoded to Anthropic.
 CATCH_ALL_MODEL_NAME = "*"
+
+# Providers with a single bearer-token-shaped credential that LiteLLM reads
+# via a plain `api_key` field pointed at one conventional env var name.
+# Providers with fundamentally different auth (Bedrock's AWS SigV4
+# credentials, Vertex's GCP service-account file, ...) are deliberately not
+# listed here: LiteLLM already reads their own standard env vars
+# (AWS_ACCESS_KEY_ID/GOOGLE_APPLICATION_CREDENTIALS/...) on its own, without
+# needing an explicit `api_key` field in litellm_params -- guessing a
+# plausible-but-wrong field name for them would be worse than leaving it out
+# (same reasoning ys/harness.py applies to which coding tools it supports).
+_SIMPLE_API_KEY_ENV_VAR = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
 
 # LiteLLM resolves `litellm_settings.callbacks` as a file path relative to the
 # config's own directory, not as a Python import. So the callback must be named
@@ -37,10 +54,61 @@ class ProxyError(Exception):
 
 
 def _fallback_params(model_value: str) -> dict:
+    """Convention for a `factors.model` value with no explicit `models:`
+    entry. An unprefixed value (no `/`) keeps the original, unchanged
+    default of assuming Anthropic (`anthropic/<value>` +
+    `ANTHROPIC_API_KEY`) -- every experiment written before feature 5 relies
+    on exactly this. A value that's already provider-prefixed LiteLLM-style
+    (`openai/gpt-4o`, `gemini/gemini-1.5-pro`, `bedrock/anthropic.claude-...`)
+    is used as-is instead of being blindly prefixed again -- the pre-feature-5
+    code always prepended `anthropic/` regardless, which double-prefixed an
+    already-prefixed value into nonsense like `anthropic/openai/gpt-4o`. The
+    provider is read straight off that prefix (LiteLLM's own routing
+    convention, which the experiment author already had to get right for
+    LiteLLM to reach the right backend at all -- not a second, independently-
+    maintained "provider:" field that could drift out of sync with it)."""
+    if "/" in model_value:
+        provider = model_value.split("/", 1)[0]
+        params = {"model": model_value}
+        env_var = _SIMPLE_API_KEY_ENV_VAR.get(provider)
+        if env_var:
+            params["api_key"] = f"os.environ/{env_var}"
+        return params
     return {
         "model": f"anthropic/{model_value}",
         "api_key": "os.environ/ANTHROPIC_API_KEY",
     }
+
+
+def _catch_all_params(model_params: dict) -> dict:
+    """The catch-all's own provider (see CATCH_ALL_MODEL_NAME's comment for
+    why it exists at all). Anthropic was hardcoded here originally because
+    every harness this rig drove (Claude Code) only ever sent Anthropic-
+    shaped background model ids. Feature 5 adds harnesses that speak other
+    protocols (Codex CLI, Aider -- OpenAI-shaped), whose own unregistered/
+    background traffic would carry an OpenAI-shaped model id instead --
+    routing that through an `anthropic/*` catch-all would send an OpenAI
+    model id to the Anthropic API, which is nonsensical.
+
+    LiteLLM only supports one true wildcard `model_name`, so this can't
+    branch per request; instead it infers a single provider from the
+    experiment's own declared/resolved models -- if every one of them
+    agrees, the catch-all matches it. If they don't (a genuinely
+    mixed-provider comparison) or none of them are prefixed at all, it falls
+    back to the original `anthropic/*` default, unchanged -- still the best
+    single guess absent a clearer signal, and exactly today's behavior for
+    every experiment that predates this."""
+    providers = {
+        params["model"].split("/", 1)[0]
+        for params in model_params.values()
+        if "/" in params.get("model", "")
+    }
+    provider = providers.pop() if len(providers) == 1 else "anthropic"
+    params = {"model": f"{provider}/*"}
+    env_var = _SIMPLE_API_KEY_ENV_VAR.get(provider)
+    if env_var:
+        params["api_key"] = f"os.environ/{env_var}"
+    return params
 
 
 def generate_config(experiment_paths: list[str]) -> str:
@@ -70,10 +138,7 @@ def generate_config(experiment_paths: list[str]) -> str:
         + [
             {
                 "model_name": CATCH_ALL_MODEL_NAME,
-                "litellm_params": {
-                    "model": "anthropic/*",
-                    "api_key": "os.environ/ANTHROPIC_API_KEY",
-                },
+                "litellm_params": _catch_all_params(model_params),
             }
         ],
         "litellm_settings": {

@@ -39,6 +39,37 @@ def _print_unattributed_notice():
         )
 
 
+def _auto_reset_pointed_harnesses():
+    """Feature 5 in IMPROVEMENTS.md: `harness.point()` writes an API key in
+    plaintext into a real config file, and before this nothing ever reset it
+    automatically -- a crash between `ys start` and a manual `ys harness
+    reset`, or simply forgetting that last step, left it there indefinitely.
+    `ys end` now closes that window itself: for every agent with a config
+    file at all (env-only agents like aider never wrote one), check every
+    scope it could plausibly have been pointed at
+    (`harness.scopes_for_agent`) and reset whichever ones currently look
+    pointed at the proxy (`harness.status(...).pointed_at_proxy`) -- rather
+    than requiring the caller to track which agent/scope combination it
+    used. `end --keep-harness-pointed` opts out for a multi-repeat workflow
+    that wants to stay pointed across several `ys start`/`ys end` cycles
+    without re-running `ys harness point` before each one."""
+    for name, spec in harness.AGENTS.items():
+        if spec.env_only:
+            continue
+        for scope in harness.scopes_for_agent(name):
+            try:
+                s = harness.status(name, scope=scope)
+            except harness.HarnessError:
+                continue
+            if not s.pointed_at_proxy:
+                continue
+            try:
+                path = harness.reset(name, scope=scope)
+            except harness.HarnessError:
+                continue
+            console.print(f"[dim]harness: reset {name} ({scope}) -- {path}[/dim]")
+
+
 def _report_write_failed(e: Exception):
     """`runs.begin_run`/`finish_run`/`delete_run` write through
     `db.call_with_retry` (finding 28), which already retries a locked
@@ -100,9 +131,19 @@ def proxy_status_cmd():
         console.print("proxy not running")
 
 
-def _agent_names(agent: str) -> list:
+def _agent_names(agent: str, skip_env_only: bool = False) -> list:
     if agent == "all":
-        return list(harness.AGENTS)
+        names = list(harness.AGENTS)
+        if skip_env_only:
+            for name in names:
+                if harness.AGENTS[name].env_only:
+                    console.print(
+                        f"[yellow]{name}: skipped (env-only agent, no config file to "
+                        f"point/reset -- run `ys harness point {name} --env-only` "
+                        "directly)[/yellow]"
+                    )
+            names = [n for n in names if not harness.AGENTS[n].env_only]
+        return names
     if agent not in harness.AGENTS:
         console.print(f"[red]unknown agent '{agent}'. Choose from: {', '.join(harness.AGENTS)}, all[/red]")
         raise typer.Exit(1)
@@ -111,7 +152,7 @@ def _agent_names(agent: str) -> list:
 
 @harness_app.command("point")
 def harness_point_cmd(
-    agent: str = typer.Argument(..., help="claude-code | opencode | all"),
+    agent: str = typer.Argument(..., help="claude-code | opencode | codex-cli | aider | all"),
     port: int = typer.Option(proxy.DEFAULT_PORT, "--port"),
     exp: Optional[str] = typer.Option(
         None, "--exp", help="experiment YAML -- combine with --arm to pin the agent's model"
@@ -129,6 +170,26 @@ def harness_point_cmd(
             "unmeasured session -- pass --no-pin-background for a real cost comparison "
             "once the arm's model doesn't need mock_response to stay safe. See finding "
             "27 in IMPROVEMENTS.md."
+        ),
+    ),
+    scope: str = typer.Option(
+        "user",
+        "--scope",
+        help=(
+            "'user' (default, e.g. ~/.claude/settings.json) or 'project' (e.g. "
+            "./.claude/settings.json) -- project scope is only verified for claude-code; "
+            "other agents raise an error rather than guess a path (feature 5 in "
+            "IMPROVEMENTS.md)."
+        ),
+    ),
+    env_only: bool = typer.Option(
+        False,
+        "--env-only",
+        help=(
+            "print `export` statements for the environment variables that would point "
+            "this agent at the proxy, and never touch any config file at all -- safer "
+            "than point()'s file-editing default, and the only way to point an agent "
+            "with no config file (aider). See IMPROVEMENTS.md feature 5."
         ),
     ),
 ):
@@ -175,9 +236,26 @@ def harness_point_cmd(
             "(finding 27 in IMPROVEMENTS.md).[/yellow]"
         )
 
-    for name in _agent_names(agent):
+    for name in _agent_names(agent, skip_env_only=not env_only):
+        if env_only:
+            try:
+                exports = harness.env_exports(name, port, api_key, model=model, pin_background=pin_background)
+            except harness.HarnessError as e:
+                if agent == "all":
+                    # Don't let one agent with no verified env-only mechanism
+                    # (opencode, codex-cli) abort the whole sweep -- report
+                    # and move on, same as the skip_env_only note above does
+                    # for point/reset.
+                    console.print(f"[yellow]{name}: skipped ({e})[/yellow]")
+                    continue
+                console.print(f"[red]{name}: {e}[/red]")
+                raise typer.Exit(1)
+            console.print(f"# {name}: nothing written to disk -- export these yourself")
+            for key, value in exports.items():
+                console.print(f"export {key}={value}", highlight=False)
+            continue
         try:
-            path = harness.point(name, port, api_key, model=model, pin_background=pin_background)
+            path = harness.point(name, port, api_key, model=model, pin_background=pin_background, scope=scope)
         except harness.HarnessError as e:
             console.print(f"[red]{name}: {e}[/red]")
             raise typer.Exit(1)
@@ -187,12 +265,13 @@ def harness_point_cmd(
 
 @harness_app.command("reset")
 def harness_reset_cmd(
-    agent: str = typer.Argument(..., help="claude-code | opencode | all"),
+    agent: str = typer.Argument(..., help="claude-code | opencode | codex-cli | aider | all"),
+    scope: str = typer.Option("user", "--scope", help="'user' or 'project' -- see `harness point --help`"),
 ):
     """Restore an agent's config to what it was before `ys harness point`."""
-    for name in _agent_names(agent):
+    for name in _agent_names(agent, skip_env_only=True):
         try:
-            path = harness.reset(name)
+            path = harness.reset(name, scope=scope)
         except harness.HarnessError as e:
             console.print(f"[red]{name}: {e}[/red]")
             raise typer.Exit(1)
@@ -201,15 +280,22 @@ def harness_reset_cmd(
 
 @harness_app.command("status")
 def harness_status_cmd(
-    agent: str = typer.Argument("all", help="claude-code | opencode | all"),
+    agent: str = typer.Argument("all", help="claude-code | opencode | codex-cli | aider | all"),
+    scope: str = typer.Option("user", "--scope", help="'user' or 'project' -- see `harness point --help`"),
 ):
     """Show whether each agent is currently pointed at the proxy."""
     for name in _agent_names(agent):
-        s = harness.status(name)
+        if harness.AGENTS[name].env_only:
+            console.print(
+                f"{name}: env-only agent, nothing persisted -- run "
+                f"`ys harness point {name} --env-only` for the export statements"
+            )
+            continue
+        s = harness.status(name, scope=scope)
         state_str = "[green]pointed at proxy[/green]" if s.pointed_at_proxy else "not pointed"
         exists_str = "" if s.config_exists else " [yellow](config file doesn't exist)[/yellow]"
         backup_str = "backup available" if s.has_backup else "no backup yet"
-        console.print(f"{s.agent}: {state_str}{exists_str}  ({backup_str})  -- {s.config_path}")
+        console.print(f"{s.agent} ({s.scope}): {state_str}{exists_str}  ({backup_str})  -- {s.config_path}")
 
 
 @web_app.command("up")
@@ -350,6 +436,23 @@ def end(
     manual_score: Optional[float] = typer.Option(
         None, "--manual-score", help="record a score instead of running success_check"
     ),
+    reset_harness: bool = typer.Option(
+        True,
+        "--reset-harness/--keep-harness-pointed",
+        help=(
+            "restore any agent config `ys harness point` touched, right after this run "
+            "ends (default: on). This is what stops point()'s plaintext API key from "
+            "lingering in a real ~/.claude/settings.json (or its project-level "
+            "equivalent) any longer than one run, closing the gap finding 5's original "
+            "harness-safety concern named: previously nothing reset it automatically at "
+            "all, so a crash between `ys start` and a manual `ys harness reset` left it "
+            "there indefinitely. Pass --keep-harness-pointed to stay pointed across "
+            "repeat runs of the same arm without re-running `ys harness point` before "
+            "each one -- the trade-off is the same plaintext-key exposure this flag "
+            "otherwise closes (feature 5 in IMPROVEMENTS.md). --env-only agents have "
+            "nothing to reset either way, since nothing was ever written to disk."
+        ),
+    ),
 ):
     """Finish the active run, score it, and print a summary."""
     try:
@@ -401,6 +504,15 @@ def end(
             f"{paths.DROPPED_LOG_PATH}, not just this one)[/red]"
         )
     _print_unattributed_notice()
+
+    if reset_harness:
+        _auto_reset_pointed_harnesses()
+    else:
+        console.print(
+            "\n[yellow]--keep-harness-pointed: any agent config `ys harness point` "
+            "touched is left as-is -- remember `ys harness reset` before the plaintext "
+            "key in it goes stale or gets left behind.[/yellow]"
+        )
 
 
 @app.command()

@@ -999,10 +999,10 @@ verifies the running proxy serves the current experiment's models, and reports
 unattributed request counts would prevent most of the wasted runs this review
 found paths to.
 
-### 5. Provider and harness breadth
+### 5. Provider and harness breadth — fixed
 
-**Models.** Everything assumes Anthropic: the fallback is `anthropic/<value>`, the
-harness writes `ANTHROPIC_*` variables, the web form defaults to a Claude id, and
+**Models.** Everything assumed Anthropic: the fallback was `anthropic/<value>`, the
+harness wrote `ANTHROPIC_*` variables, the web form defaulted to a Claude id, and
 `billable_tokens` bakes in Anthropic cache weights. LiteLLM already brokers
 OpenAI, Gemini, Bedrock, Vertex and local models — and cross-model comparison is
 the tool's entire premise. Make the model config provider-agnostic and map harness
@@ -1019,6 +1019,147 @@ the user's config — safer, and it works for agents with no config file at all.
 Also register an automatic reset on `ys end`. The known `.jsonc` comment-stripping
 loss on opencode configs is documented but is still destructive to a real user
 file; the `--env-only` path sidesteps it entirely.
+
+**Fix:**
+
+- **Models are provider-agnostic.** `ys/proxy.py`'s `_fallback_params` (the
+  convention used when a `factors.model` value has no explicit `models:` entry)
+  used to always prepend `anthropic/`, which double-prefixed an
+  already-provider-prefixed value (`openai/gpt-4o` → `anthropic/openai/gpt-4o`,
+  nonsense). It now uses an already-prefixed value as-is and only falls back to
+  the `anthropic/<value>` convention for an unprefixed one, unchanged for every
+  experiment written before this. The provider is read straight off that
+  `<provider>/<id>` prefix — LiteLLM's own routing convention, which the
+  experiment author already has to get right for LiteLLM to reach the intended
+  backend at all — rather than sniffed from the model name's text, or declared
+  in a second, independently-maintained `provider:` field that could drift out
+  of sync with it. A small `_SIMPLE_API_KEY_ENV_VAR` map (anthropic/openai/gemini)
+  supplies the right `api_key` env var for providers with a plain bearer-token
+  credential; providers with fundamentally different auth (Bedrock's AWS SigV4,
+  Vertex's GCP service account) deliberately get no fabricated `api_key` field —
+  LiteLLM already reads their own standard env vars on its own. The catch-all
+  entry (finding 3) is no longer hardcoded to `anthropic/*` either: a new
+  `_catch_all_params` infers a single provider from the experiment's declared
+  models when they all agree, and only falls back to the original
+  `anthropic/*` default when they don't (a genuine cross-provider comparison) —
+  otherwise a Codex CLI/Aider run's own OpenAI-shaped background traffic would
+  route through an Anthropic catch-all and hit the wrong API entirely.
+  `experiments/cross-provider-example.yaml` is a new, mocked (free to run)
+  experiment demonstrating an Anthropic arm and an OpenAI arm side by side.
+- **Where "provider" is determined from, and why per-tool, not per-model.**
+  Every coding tool this rig drives speaks exactly one wire protocol to
+  whatever endpoint it's pointed at: Claude Code and opencode speak
+  Anthropic's Messages format; Codex CLI and Aider speak OpenAI's Chat
+  Completions format. That's independent of which real backend the arm's
+  model resolves to — LiteLLM's proxy is what bridges any backend to
+  whichever of those endpoints the client calls. So "map harness
+  environment variables per provider" turned out to mean *per coding tool*
+  (which of those wire protocols it natively expects), not per the
+  experiment's declared backend model — the model's own provider prefix
+  already routes correctly through `ys/proxy.py` regardless of which agent
+  is asking. `ys/harness.py`'s module docstring states this explicitly, since
+  it's the one design decision in this feature most likely to look wrong at a
+  glance.
+- **Coding tools added:** Codex CLI and Aider, on top of the existing Claude
+  Code and opencode. Both are **best-effort / unverified against a live
+  install** — implemented from public documentation, not from running the
+  tool, and flagged as such in `ys/harness.py`'s own docstrings:
+  - **Codex CLI** writes `~/.codex/config.toml` (`model_provider`/`model` plus
+    a `[model_providers.yardstick]` table with `base_url`/`env_key`/
+    `wire_api`). This repo has no TOML parser/writer dependency (adding one
+    is out of scope: `pyproject.toml` isn't in this change's file set), so
+    unlike the JSON agents, it **only ever creates a fresh file** — any
+    existing config.toml with real content is refused outright rather than
+    risk silently mangling it via a hand-rolled parser. `--env-only` isn't
+    supported for it: Codex's `env_key` only names which env var holds the
+    API key, the base URL itself is config.toml-only.
+  - **Aider** embeds LiteLLM directly and takes its provider config purely as
+    environment variables (`OPENAI_API_KEY`, `AIDER_MODEL=openai/<value>`),
+    so it's naturally `--env-only`-*only* (`AgentSpec.env_only = True` — there
+    is no config file for `point`/`reset` to manage at all). Its base-URL
+    variable name has two real candidates in the wild (`OPENAI_API_BASE`,
+    Aider's own docs; `OPENAI_BASE_URL`, current openai-python) and we could
+    not verify which its installed version reads without running it, so both
+    are exported — an unused extra env var, not a wrong value that routes
+    anywhere, and not a fabricated name (both are real, documented names).
+  - **Deliberately left out**, each for a stated reason rather than a guess
+    (`ys/harness.py`'s `EXCLUDED_TOOLS` comment): **Gemini CLI** (no
+    environment-variable-only mechanism for a custom endpoint could be
+    confirmed), **Cursor CLI** (its agent traffic is proxied through Cursor's
+    own backend by design, no confirmed custom-endpoint override at all),
+    **GitHub Copilot CLI** (structurally out of scope, not just unverified —
+    bound to GitHub's own backend), **Cline/Roo** (config lives in a VS Code
+    extension's own settings storage, not a stable on-disk path+schema).
+  - **Project-level Claude Code settings**: `ys harness point claude-code
+    --scope project` (and `harness reset`/`harness status --scope project`)
+    write `./.claude/settings.json` instead of `~/.claude/settings.json`.
+    Only claude-code's project path is implemented — `AgentSpec.resolve_path`
+    raises for any other agent rather than guess at one. Each scope gets its
+    own backup manifest (`{agent}.json` for user, `{agent}-project.json` for
+    project), so pointing both scopes for the same agent can't clobber each
+    other's backup.
+- **Harness config safety — the priority half of this feature:**
+  - `ys harness point <agent> --env-only` (`harness.env_exports`) prints
+    `export` statements for exactly the env vars `point()` would otherwise
+    write into a config file, and never reads or writes that file at all —
+    verified directly:
+    `test_env_only_leaves_the_config_file_completely_untouched` and
+    `test_env_only_does_not_touch_a_preexisting_config_either`
+    (`tests/test_harness.py`) plus the CLI-level
+    `test_harness_point_env_only_never_writes_the_config_file`
+    (`tests/test_cli.py`). Supported for claude-code (its `ANTHROPIC_*`
+    variables are exactly what Claude Code itself documents reading) and
+    aider (its only mechanism); raises `HarnessError` for opencode and
+    codex-cli, whose base URL is only confirmed to work via their config
+    file, rather than guess at an env var for them too.
+  - `ys end` now calls a new `cli._auto_reset_pointed_harnesses()` by
+    default: it checks every agent (skipping env-only ones, which never
+    wrote a file) across every scope it could plausibly have been pointed at
+    (`harness.scopes_for_agent`), and resets whichever ones
+    `harness.status(...).pointed_at_proxy` reports as still pointed at the
+    proxy. This closes the exact gap the finding named — nothing used to
+    reset `point()`'s plaintext key automatically at all, so a crash between
+    `ys start` and a manual `ys harness reset`, or simply forgetting that
+    step, left it there indefinitely. `ys end --keep-harness-pointed` opts
+    out for a multi-repeat workflow that wants to stay pointed across
+    several `ys start`/`ys end` cycles without re-pointing before each one —
+    the same plaintext-exposure trade-off the flag otherwise closes, made
+    explicit rather than silently reintroduced.
+  - The `.jsonc` comment-stripping loss on opencode configs is unchanged and
+    still real (`--env-only` isn't supported for opencode, so it doesn't
+    sidestep it there) — documented in both `ys/harness.py`'s module
+    docstring and the README's "Harness config safety" section.
+- **Verification.** New regression tests in `tests/test_harness.py`,
+  `tests/test_proxy.py` and `tests/test_cli.py` (21, 4, and 6 new tests
+  respectively — 316 passed overall, up from this branch's 286-test baseline
+  after rebasing onto the findings-13/14 and 15-18 PRs that merged to `main`
+  in the meantime) cover: the fallback double-prefix fix and catch-all provider
+  inference; `--env-only` for every agent that supports it and the explicit
+  refusal for the two that don't; codex-cli's create-fresh-only behavior
+  (including refusing to touch a populated file, and treating a
+  whitespace-only file as absent); project-vs-user scope isolation
+  (independent backups, `--scope project` unsupported for opencode); aider
+  being env-only end to end; and, at the CLI layer, `--env-only` never
+  touching the fake claude-code settings file and `ys end` actually
+  resetting (and, with `--keep-harness-pointed`, actually *not* resetting) a
+  pointed harness. Five of these — the auto-reset on `ys end`, `--env-only`
+  never writing the file, the fallback double-prefix fix, the catch-all
+  provider inference, and codex-cli's refuse-on-existing-content guard — were
+  each explicitly reverted and confirmed to fail before restoring the fix, as
+  the most safety-critical and/or novel mechanisms in this change; the
+  remainder follow the same patterns and pass as part of the same 316-test
+  suite. `tests/conftest.py` gained a second autouse fixture,
+  `isolated_harness_agents`, isolating claude-code/opencode/codex-cli to fake
+  per-test paths for *every* test in the suite (not just this file's) — `ys
+  end`'s new auto-reset walks every entry in `harness.AGENTS` on every `ys
+  end` call, so without this, any existing test anywhere that invokes `ys
+  end` would have silently read (and, if it ever looked pointed, overwritten)
+  the real files on whichever machine runs the suite.
+- **Left for later:** the web dashboard's new-experiment form still only
+  offers a bare model id field (`ys/web/**` was off-limits for this change);
+  Gemini CLI/Cursor CLI/Copilot CLI/Cline/Roo remain unimplemented for the
+  stated reasons above, pending someone who can verify the real mechanism
+  against a live install.
 
 ### 6. Smaller additions
 

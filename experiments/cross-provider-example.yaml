@@ -1,0 +1,47 @@
+experiment: cross-provider-mock-01
+question: >
+  Does yardstick's model config stay provider-agnostic end to end -- one arm
+  routed through Anthropic, the other through OpenAI, both via mock_response
+  so this costs nothing to run? (Feature 5 in IMPROVEMENTS.md.)
+
+task:
+  id: cross-provider-000
+  success_check: "true"
+  timeout_s: 60
+
+factors:
+  agent: [claude-code]
+  model: [probe-anthropic-mock, probe-openai-mock]
+
+# Both models are declared explicitly here (rather than relying on the
+# fallback convention) so the provider is visible at a glance: the prefix on
+# `model` (`anthropic/...` vs `openai/...`) is what ys/proxy.py's
+# _fallback_params/_catch_all_params read to stay provider-agnostic -- see
+# their docstrings. A factors.model value with *no* models: entry at all
+# would work too, as long as it's already prefixed this way (e.g.
+# `openai/gpt-4o-mini` directly as the factor value) -- that's the fallback
+# path these entries just happen to make explicit.
+models:
+  probe-anthropic-mock:
+    model: anthropic/claude-3-5-sonnet-20241022
+    mock_response: "This is a mock Anthropic response used for yardstick's cross-provider smoke test."
+  probe-openai-mock:
+    model: openai/gpt-4o-mini
+    mock_response: "This is a mock OpenAI response used for yardstick's cross-provider smoke test."
+
+arms:
+  - id: arm-anthropic
+    factors: {agent: claude-code, model: probe-anthropic-mock}
+    notes: "baseline: Anthropic-backed arm"
+    baseline: true
+  - id: arm-openai
+    factors: {agent: claude-code, model: probe-openai-mock}
+    notes: "comparison: OpenAI-backed arm, same task and harness"
+
+repeats: 2
+
+metrics:
+  gate: task_success
+  primary: [cost_usd, billable_tokens, turns, wall_clock_s]
+  secondary: [tool_calls, redundant_tool_calls, tool_error_rate, cache_read_ratio, fixed_overhead_tokens, context_high_water, compaction_events]
+  derived: [cost_per_success, tokens_per_turn]
