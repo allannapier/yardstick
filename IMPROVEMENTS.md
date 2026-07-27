@@ -1130,10 +1130,15 @@ found paths to.
   - **task paths** — with `--exp`, reuses `experiment.validate_task_paths`
     (findings 15-18) verbatim, so a `task.prompt_file`/`task.repo` typo shows
     up in `ys doctor` before you even get to `ys start`.
-  - **harness config**, one row per agent — reuses `harness.status` to report
-    whether each agent's config is currently pointed at a proxy, and, if so,
-    whether a proxy is actually running there (fail if not: real requests
-    would fail until `ys proxy up` again or `ys harness reset`).
+  - **harness config**, one row per agent per scope — reuses `harness.status`
+    to report whether each agent's config is currently pointed at a proxy,
+    and, if so, whether a proxy is actually running there (fail if not: real
+    requests would fail until `ys proxy up` again or `ys harness reset`).
+    Driven by `harness.scopes_for_agent` (the same list feature 5's `ys end`
+    auto-reset loop uses), so claude-code gets a row for both `user` and
+    `project` scope rather than only ever checking the default; an
+    `env_only` agent (aider) gets a single, dedicated "env-only" row instead
+    of a misleading "config doesn't exist" one.
   - **API keys** — `LITELLM_MASTER_KEY` and `ANTHROPIC_API_KEY` presence in
     this shell's environment (the two the plan calls out by name).
   - **active-run state** — cross-checks `active.json` against the `runs`
@@ -1155,7 +1160,24 @@ found paths to.
   around it — a plain `sqlite3.connect` guarded by an existence check —
   rather than accepting the side effect as a shortcut. A user running `ys
   doctor` to find out why something is broken must never have the act of
-  asking change the answer.
+  asking change the answer. This rule caught a real leak from feature 5,
+  merged mid-review: `harness.status()` (called once per agent/scope by the
+  harness-config check above) went through `_load_manifest`/`_manifest_path`
+  to `harness._backup_dir()`, which called `paths.ensure_home()`
+  unconditionally just to compute where a backup manifest *would* live —
+  so running `ys doctor` on a machine that had never run any other
+  yardstick command silently created `~/.yardstick` (and its `experiments`/
+  `harness_backups` subdirectories) as a side effect of merely asking.
+  `_backup_dir()` gained a `create: bool = False` default (`ys/harness.py`):
+  every read path (`_load_manifest`, hence `status()`/`reset()`'s existence
+  check) computes the path without creating anything; only
+  `_snapshot_if_absent` — which is only ever reached from `point()`, a
+  command whose entire job is to write files — passes `create=True`.
+  `tests/test_doctor.py` pins this directly: it points `YARDSTICK_HOME` at a
+  directory that has deliberately never been created and asserts
+  `run_checks`/`check_harness_config` leave it that way, with and without
+  `--exp`/`--arm` (both reach the harness-config loop) — reverting
+  `_backup_dir`'s `create` split makes those fail.
 - `ys doctor` exits non-zero if any check fails (not on warnings), so it's
   usable as a script gate.
 - `ys runs list` (below) reuses the same instinct — surface a diagnostic

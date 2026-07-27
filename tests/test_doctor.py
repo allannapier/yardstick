@@ -18,10 +18,20 @@ from ys.experiment import Experiment
 @pytest.fixture(autouse=True)
 def fake_agents(monkeypatch, tmp_path):
     """Never touch the real ~/.claude or ~/.config/opencode while testing
-    doctor's harness-config check (same fixture shape as tests/test_harness.py)."""
+    doctor's harness-config check (same fixture shape as tests/test_harness.py).
+    claude-code keeps a `project_relpath` like the real AgentSpec (and like
+    tests/test_harness.py's own fixture) so `check_harness_config`'s
+    project-scope branch exercises the real `scopes_for_agent`/`resolve_path`
+    logic instead of silently only ever seeing "user" scope -- safe without a
+    `monkeypatch.chdir` here because it's read-only and this worktree has no
+    `.claude/settings.json` at its root to accidentally read."""
     claude_path = str(tmp_path / "claude_settings.json")
     opencode_path = str(tmp_path / "opencode.jsonc")
-    monkeypatch.setitem(harness.AGENTS, "claude-code", harness.AgentSpec("claude-code", [claude_path]))
+    monkeypatch.setitem(
+        harness.AGENTS,
+        "claude-code",
+        harness.AgentSpec("claude-code", [claude_path], project_relpath=os.path.join(".claude", "settings.json")),
+    )
     monkeypatch.setitem(harness.AGENTS, "opencode", harness.AgentSpec("opencode", [opencode_path]))
     return {"claude-code": claude_path, "opencode": opencode_path}
 
@@ -322,6 +332,53 @@ def test_check_harness_config_passes_for_env_only_agent():
     assert "env-only" in result.message
 
 
+# --- project scope (feature 5) ----------------------------------------------
+
+
+def test_check_harness_config_default_scope_name_omits_scope_suffix():
+    """A single-scope agent's (or the default "user" scope's) check name is
+    unchanged from before project scope existed."""
+    result = doctor.check_harness_config("opencode")
+    assert result.name == "harness config (opencode)"
+
+
+def test_check_harness_config_project_scope_name_includes_scope():
+    result = doctor.check_harness_config("claude-code", "project")
+    assert result.name == "harness config (claude-code, project)"
+    # this worktree has no .claude/settings.json at its root, so the
+    # project-scope config simply doesn't exist -- still a PASS, not a FAIL.
+    assert result.status == doctor.PASS
+
+
+def test_check_harness_config_project_scope_fails_when_pointed_and_proxy_down(
+    fake_agents, monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "some-project"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+    harness.point("claude-code", 4000, "sk-test", scope="project")
+    monkeypatch.setattr(proxy, "proxy_status", lambda: (False, None))
+
+    result = doctor.check_harness_config("claude-code", "project")
+    assert result.status == doctor.FAIL
+    assert "--scope project" in result.message
+
+
+def test_run_checks_covers_both_scopes_for_claude_code_and_one_for_opencode():
+    """Regression test: `run_checks` must drive `check_harness_config` from
+    `harness.scopes_for_agent` (["user", "project"] for claude-code,
+    ["user"] for opencode, [] -- checked once, scope-less -- for an
+    env_only agent like aider), not hardcode a single "user" check per
+    agent and silently miss project-scope drift."""
+    results = doctor.run_checks()
+    names = {r.name for r in results}
+    assert "harness config (claude-code)" in names
+    assert "harness config (claude-code, project)" in names
+    assert "harness config (opencode)" in names
+    assert "harness config (opencode, project)" not in names
+    assert "harness config (aider)" in names
+
+
 # --- check_api_keys ----------------------------------------------------------
 
 
@@ -488,3 +545,77 @@ def test_run_checks_reports_bad_experiment_yaml():
 def test_run_checks_all_pass_on_a_clean_slate_yields_zero_failures():
     results = doctor.run_checks()
     assert all(r.status != doctor.FAIL for r in results)
+
+
+# --- read-only guarantee: ys doctor must never create YARDSTICK_HOME -------
+#
+# The module docstring's hard rule: "A user running `ys doctor` to find out
+# *why* something is broken must never have the act of asking change the
+# answer." tests/conftest.py's autouse isolated_yardstick_home fixture always
+# calls db.init_db() before a test body runs, so YARDSTICK_HOME already
+# exists by the time any other test starts -- these two point YARDSTICK_HOME
+# at a directory that has deliberately never been created, so the assertion
+# is meaningful. Before ys/harness.py's `_backup_dir()` gained its
+# `create: bool = False` default, `check_harness_config` -> `harness.status`
+# -> `_load_manifest` -> `_manifest_path` -> `_backup_dir` called
+# `paths.ensure_home()` unconditionally on every call, so these fail against
+# that code (asserting the directory is absent, when it would in fact have
+# been created) and pass with the fix.
+
+
+def _point_paths_at_a_never_created_home(monkeypatch, fresh_home):
+    monkeypatch.setattr(paths, "YARDSTICK_HOME", str(fresh_home))
+    monkeypatch.setattr(paths, "DB_PATH", str(fresh_home / "yardstick.db"))
+    monkeypatch.setattr(paths, "DROPPED_LOG_PATH", str(fresh_home / "dropped_requests.jsonl"))
+    monkeypatch.setattr(paths, "ACTIVE_RUN_PATH", str(fresh_home / "active.json"))
+    monkeypatch.setattr(paths, "LAST_ENDED_RUN_PATH", str(fresh_home / "last_ended.json"))
+    monkeypatch.setattr(paths, "PROXY_CONFIG_PATH", str(fresh_home / "proxy_config.yaml"))
+    monkeypatch.setattr(paths, "PROXY_PID_PATH", str(fresh_home / "proxy.pid"))
+    monkeypatch.setattr(paths, "PROXY_PORT_PATH", str(fresh_home / "proxy.port"))
+    monkeypatch.setattr(paths, "PROXY_LOG_PATH", str(fresh_home / "proxy.log"))
+    monkeypatch.setattr(paths, "EXPERIMENTS_DIR", str(fresh_home / "experiments"))
+
+
+def test_run_checks_never_creates_yardstick_home_without_exp_arm(monkeypatch, tmp_path):
+    fresh_home = tmp_path / "never-created-yardstick-home"
+    assert not fresh_home.exists()
+    _point_paths_at_a_never_created_home(monkeypatch, fresh_home)
+
+    doctor.run_checks()
+
+    assert not fresh_home.exists(), (
+        "ys doctor created YARDSTICK_HOME just by running -- the diagnostic "
+        "altered the thing it diagnoses"
+    )
+
+
+def test_run_checks_never_creates_yardstick_home_with_exp_arm(monkeypatch, tmp_path):
+    """The harness-config loop (the leaky call path) runs regardless of
+    whether --exp/--arm are given, so this pins the --exp/--arm branch too."""
+    fresh_home = tmp_path / "never-created-yardstick-home"
+    assert not fresh_home.exists()
+    _point_paths_at_a_never_created_home(monkeypatch, fresh_home)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-test")
+    monkeypatch.setattr(proxy, "model_available", lambda model, port, key: True)
+
+    doctor.run_checks(exp="experiments/example.yaml", arm="arm-a")
+
+    assert not fresh_home.exists(), (
+        "ys doctor --exp/--arm created YARDSTICK_HOME just by running -- the "
+        "diagnostic altered the thing it diagnoses"
+    )
+
+
+def test_check_harness_config_alone_never_creates_yardstick_home(monkeypatch, tmp_path):
+    """Narrower unit-level pin of the exact leak reported: harness.status()
+    (called in a loop by check_harness_config, once per agent) used to
+    create ~/.yardstick/harness_backups as a side effect of only checking
+    whether a backup manifest existed."""
+    fresh_home = tmp_path / "never-created-yardstick-home"
+    assert not fresh_home.exists()
+    _point_paths_at_a_never_created_home(monkeypatch, fresh_home)
+
+    doctor.check_harness_config("claude-code")
+    doctor.check_harness_config("opencode")
+
+    assert not fresh_home.exists()

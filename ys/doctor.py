@@ -265,20 +265,30 @@ def check_model_available(model: str, port: int, master_key: Optional[str]) -> C
     )
 
 
-def check_harness_config(agent_name: str) -> CheckResult:
+def check_harness_config(agent_name: str, scope: str = "user") -> CheckResult:
     """The other half of finding 5's process concern: not just "is the
     proxy up", but "does this agent's config still point at one". Reuses
     `harness.status` instead of re-reading/re-parsing the agent's config
     file a second way.
+
+    `scope` covers feature 5's project-level config (claude-code's
+    `./.claude/settings.json`, `--scope project`) as well as the default
+    "user" scope -- `run_checks` below drives this from
+    `harness.scopes_for_agent`, the same list `ys end`'s automatic-reset
+    loop already uses to know every scope an agent might have been pointed
+    under, rather than hardcoding "user" and missing project-scope drift.
+    The scope is only appended to the check name when it isn't the default,
+    so a single-scope agent's name is unchanged from before project scope
+    existed.
 
     Feature 5 added agents with no config file at all (`env_only=True`,
     e.g. aider) -- `harness.status` already reports those with
     `config_exists=False`/`config_path=""` rather than raising, so this
     only needs a nicer message for that specific case instead of new
     branching logic."""
-    name = f"harness config ({agent_name})"
+    name = f"harness config ({agent_name})" if scope == "user" else f"harness config ({agent_name}, {scope})"
     try:
-        s = harness.status(agent_name)
+        s = harness.status(agent_name, scope)
     except harness.HarnessError as e:
         return CheckResult(name, FAIL, str(e))
     if s.env_only:
@@ -299,7 +309,8 @@ def check_harness_config(agent_name: str) -> CheckResult:
         FAIL,
         f"{s.config_path} points at a proxy on localhost, but no proxy is running -- "
         f"real requests will fail until `ys proxy up` again, or run `ys harness reset "
-        f"{agent_name}` to restore the backed-up config.",
+        f"{agent_name}{'' if scope == 'user' else f' --scope {scope}'}` to restore the "
+        "backed-up config.",
     )
 
 
@@ -440,7 +451,18 @@ def run_checks(
     results.append(check_task_paths(experiment))
 
     for agent_name in harness.AGENTS:
-        results.append(check_harness_config(agent_name))
+        # harness.scopes_for_agent is the same list ys end's automatic-reset
+        # loop (cli.py's _auto_reset_pointed_harnesses) already drives from,
+        # so doctor and the thing it's diagnosing agree on which scopes
+        # exist for a given agent: [] for an env_only agent (checked once,
+        # scope-less, below), ["user"] for most, ["user", "project"] for
+        # claude-code.
+        scopes = harness.scopes_for_agent(agent_name)
+        if not scopes:
+            results.append(check_harness_config(agent_name))
+        else:
+            for scope in scopes:
+                results.append(check_harness_config(agent_name, scope))
 
     results.extend(check_api_keys())
     results.append(check_active_run())
