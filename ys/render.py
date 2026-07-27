@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ys import metrics
+from ys import statistics as stats
 from ys.experiment import Experiment
 from ys.runs import config_hash_for_arm
 
@@ -356,6 +357,151 @@ def repeat_count_warnings(comparison: Comparison) -> list:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Feature 3 -- statistics worth the name. `ys/statistics.py` does the actual
+# math (bootstrap CIs, Wilson intervals, the exact permutation test, the
+# minimum-detectable-effect helper); everything here is presentation only --
+# turning those numbers into the sentence a user actually reads.
+# ---------------------------------------------------------------------------
+
+# Metric-specific direction words for the verdict line ("18% cheaper", not
+# "18% lower", when the metric is a cost). The sentence always ends with
+# "on {metric}" (e.g. "...on cost_usd"), so these are deliberately relational
+# words rather than nouns that would repeat the metric name in the same
+# sentence ("fewer turns ... on turns" reads worse than "fewer ... on
+# turns"). Falls back to generic lower/higher for anything not listed --
+# most of _EFFICIENCY_METRICS (redundancy rates, context high-water, etc.)
+# reads fine that way and isn't worth a bespoke word.
+_METRIC_DIRECTION_WORDS = {
+    "cost_usd": ("cheaper", "more expensive"),
+    "cost_per_success": ("cheaper", "more expensive"),
+    "wall_clock_s": ("faster", "slower"),
+    "active_s": ("faster", "slower"),
+    "billable_tokens": ("fewer", "more"),
+    "tokens_per_turn": ("fewer", "more"),
+    "turns": ("fewer", "more"),
+    "tool_calls": ("fewer", "more"),
+}
+_DEFAULT_DIRECTION_WORDS = ("lower", "higher")
+
+# "fewer"/"more" are quantity words that need the thing being counted next to
+# them -- "arm-b is 30% fewer than arm-a on turns" isn't a sentence. So the
+# count metrics take a different clause shape ("arm-b uses 30% fewer turns
+# than arm-a") that names the metric inline instead of trailing it with
+# "on {metric}". Everything else reads correctly in the relational form
+# ("18% cheaper than ... on cost_usd") and keeps it.
+_COUNT_METRICS = frozenset({"billable_tokens", "tokens_per_turn", "turns", "tool_calls"})
+
+
+def _direction_word(metric: str, relative_effect: Optional[float]) -> str:
+    lower_word, higher_word = _METRIC_DIRECTION_WORDS.get(metric, _DEFAULT_DIRECTION_WORDS)
+    if relative_effect is None or relative_effect >= 0:
+        return higher_word
+    return lower_word
+
+
+def _effect_clause(metric: str, arm_label: str, baseline_label: str, direction: str, pct_str: str) -> str:
+    """The "arm-b is 18% cheaper than arm-a on cost_usd" opening of a verdict
+    line, in whichever of the two shapes the metric's direction word needs."""
+    if metric in _COUNT_METRICS:
+        return f"{arm_label} uses {pct_str} {direction} {metric} than {baseline_label}"
+    return f"{arm_label} is {pct_str} {direction} than {baseline_label} on {metric}"
+
+
+def _format_metric_verdict(metric: str, arm_label: str, baseline_label: str, v: stats.MetricVerdict) -> str:
+    """The plan's own example, in the plan's own words: "arm-b is 18%
+    cheaper, but with n=3 the difference is not distinguishable from noise;
+    ~12 repeats needed." Always names direction, effect size, whether it's
+    distinguishable from noise, and (when not) how many repeats would be
+    needed -- never a bare p-value standing in for that judgment, and never
+    silent about *why* a difference this size isn't claimed as real."""
+    if v.relative_effect is None:
+        pct_str = "an unmeasured amount (baseline mean is 0)"
+    else:
+        pct_str = f"{abs(v.relative_effect) * 100:.0f}%"
+    direction = _direction_word(metric, v.relative_effect)
+    n_desc = f"n={v.n_baseline}" if v.n_baseline == v.n_arm else f"n={v.n_baseline} vs {v.n_arm}"
+    perm = v.permutation
+
+    effect = _effect_clause(metric, arm_label, baseline_label, direction, pct_str)
+
+    if v.significant:
+        return (
+            f"{effect} ({n_desc}, permutation p={perm.p_value:.3g}) "
+            "-- distinguishable from noise."
+        )
+
+    if perm.exact and perm.min_possible_p is not None and perm.min_possible_p >= stats.DEFAULT_ALPHA:
+        # The enclosing sentence already opens with "but with {n_desc}", so
+        # this clause deliberately doesn't repeat the n ("but with n=3 the
+        # smallest p-value ... at n=3 is 0.1" said it twice).
+        noise_clause = (
+            f"the smallest possible p-value an exact test could report is "
+            f"{perm.min_possible_p:.2g}, so no result here could reach significance"
+        )
+    else:
+        noise_clause = f"the difference is not distinguishable from noise (permutation p={perm.p_value:.3g})"
+
+    if v.required_repeats is not None:
+        repeats_clause = f"~{v.required_repeats} repeats needed to tell a difference this size from noise"
+    else:
+        repeats_clause = "not enough repeats yet to estimate how many would be needed"
+
+    return f"{effect}, but with {n_desc} {noise_clause}; {repeats_clause}."
+
+
+def significance_verdicts(comparison: Comparison) -> list:
+    """One verdict sentence per (non-baseline arm, primary metric) pair --
+    the feature-3 deliverable. Uses `comparison.primary_metrics`
+    (`metrics.primary` in the YAML, see finding 15-18) to decide which
+    metric(s) to run the significance test on, exactly as the plan
+    specifies, rather than inventing a separate mechanism. Empty when there
+    is no baseline arm to compare against, or the experiment declares no
+    primary metrics at all."""
+    baseline = next((a for a in comparison.arms if a.is_baseline), None)
+    if baseline is None or not comparison.primary_metrics:
+        return []
+    lines = []
+    for metric in comparison.primary_metrics:
+        baseline_values = baseline.aggregate["metrics"].get(metric, {}).get("values") or []
+        for arm in comparison.arms:
+            if arm.is_baseline:
+                continue
+            arm_values = arm.aggregate["metrics"].get(metric, {}).get("values") or []
+            verdict = stats.metric_verdict(baseline_values, arm_values)
+            if verdict is None:
+                continue
+            lines.append(_format_metric_verdict(metric, arm.label, baseline.label, verdict))
+    return lines
+
+
+def _success_rate_cell(n_success: int, n_runs: int) -> str:
+    """success rate cell text with a Wilson 95% CI appended once there's at
+    least one run to bound -- the plan's third deliverable. Wilson, not the
+    normal approximation, specifically because a 3/3 or 0/3 run (entirely
+    unremarkable at n=3) would otherwise report a zero-width interval that
+    reads as far more certain than three observations can support."""
+    base = f"{n_success}/{n_runs}"
+    if n_runs <= 0:
+        return base
+    w = stats.wilson_interval(n_success, n_runs)
+    if w is None:
+        return base
+    return f"{base} (95% CI {w.low * 100:.0f}-{w.high * 100:.0f}%)"
+
+
+def _ci_suffix(values: list, fmt_spec: str = "") -> str:
+    """`ys.statistics.bootstrap_ci`'s interval, formatted to append after a
+    metric cell's mean/spread -- the plan's first deliverable. Empty string
+    (not "-") when there aren't enough observations to bootstrap, so it
+    silently doesn't clutter a `repeats: 1` cell instead of printing a
+    degenerate interval."""
+    ci = stats.bootstrap_ci(values)
+    if ci is None:
+        return ""
+    return f" CI95[{_fmt(ci.low, fmt_spec)}, {_fmt(ci.high, fmt_spec)}]"
+
+
 def build_table(comparison: Comparison):
     from rich.table import Table
 
@@ -375,7 +521,7 @@ def build_table(comparison: Comparison):
     n_unfinished = {a.label: a.aggregate.get("n_unfinished", 0) for a in comparison.arms}
     table.add_row(
         "success rate",
-        *[f"{n_success[a.label]}/{n_runs[a.label]}" for a in comparison.arms],
+        *[_success_rate_cell(n_success[a.label], n_runs[a.label]) for a in comparison.arms],
     )
     if any(n_unfinished.values()):
         # finding 13: runs displaced by `--force` (or otherwise never
@@ -493,6 +639,9 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
             cell = _fmt(mean, fmt_spec)
             if spread is not None and n and n > 1:
                 cell += f' <span class="spread">± {_fmt(spread, fmt_spec)} (n={n})</span>'
+            ci_suffix = _ci_suffix(stat.get("values") or [], fmt_spec)
+            if ci_suffix:
+                cell += f' <span class="spread">{ci_suffix.strip()}</span>'
             if key in _COST_DERIVED_METRICS and a.unpriced_models:
                 cell += ' <span class="warn">?</span>'
             if not a.is_baseline:
@@ -505,7 +654,8 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
     rows_html.append(
         "<tr><th>success rate</th>"
         + "".join(
-            f"<td>{a.aggregate['n_success']}/{a.aggregate['n_runs']}</td>" for a in comparison.arms
+            f"<td>{html.escape(_success_rate_cell(a.aggregate['n_success'], a.aggregate['n_runs']))}</td>"
+            for a in comparison.arms
         )
         + "</tr>"
     )
@@ -555,6 +705,14 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
             f'<div class="repeat-warning"><strong>Unequal repeats</strong><ul>{items}</ul></div>'
         )
 
+    verdicts = significance_verdicts(comparison)
+    verdicts_html = ""
+    if verdicts:
+        items = "".join(f"<li>{html.escape(v)}</li>" for v in verdicts)
+        verdicts_html = (
+            f'<div class="verdict-banner"><strong>Is the difference real?</strong><ul>{items}</ul></div>'
+        )
+
     charts_html = []
     for a in comparison.arms:
         for run_id in a.run_ids:
@@ -572,6 +730,7 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
 {warnings_html}
 {config_warnings_html}
 {repeat_warnings_html}
+{verdicts_html}
 <table><tr><th></th>{header_cells}</tr>{''.join(rows_html)}</table>
 <h2>per-run detail</h2>
 <div class="chart-grid">{''.join(charts_html)}</div>
@@ -597,5 +756,7 @@ def render_html(comparison: Comparison, cur, *, standalone: bool = True) -> str:
   .cost-warning ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
   .repeat-warning {{ border: 2px solid #d9922a; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; color: #d9922a; }}
   .repeat-warning ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
+  .verdict-banner {{ border: 2px solid #4f7cff; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; color: #4f7cff; }}
+  .verdict-banner ul {{ margin: 0.4rem 0 0; padding-left: 1.2rem; }}
 </style>
 {body}"""

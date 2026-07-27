@@ -579,6 +579,14 @@ def aggregate_run_metrics(
 
     Spread is population stdev (statistics.pstdev): 0.0 for a single
     observation rather than undefined, which keeps `repeats: 1` arms usable.
+
+    Each metric's entry also carries the raw per-run `values` list that
+    `mean`/`spread` were computed from (same gate-passing population, same
+    order as `run_ids`) -- feature 3's bootstrap/permutation statistics
+    (`ys/statistics.py`) need the actual observations, not just their
+    summary, and this is the one place that already assembles them per
+    metric. `render.py` is the only consumer; nothing here changes for
+    existing callers that only read `mean`/`n`/`spread`.
     """
     if gate is None:
 
@@ -601,7 +609,7 @@ def aggregate_run_metrics(
         else:
             mean = None
             spread = None
-        metrics_out[key] = {"mean": mean, "n": len(values), "spread": spread}
+        metrics_out[key] = {"mean": mean, "n": len(values), "spread": spread, "values": values}
 
     total_cost = sum(m["cost_usd"] for m in per_run.values())
     cost_per_success = (total_cost / n_success) if n_success else None

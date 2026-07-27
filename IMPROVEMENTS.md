@@ -978,7 +978,7 @@ worktree/clone from `repo`@`ref` so every repeat starts from an identical tree.
 Without this, repeats measure a moving target and the error bars are not what they
 appear to be.
 
-### 3. Statistics worth the name
+### 3. Statistics worth the name -- fixed
 
 `aggregate_run_metrics` reports a mean and a population standard deviation over
 n=3. `render` shows `± spread` and a percentage delta. Nothing indicates whether a
@@ -989,6 +989,106 @@ test on the primary metric, a Wilson interval on success rate, and an explicit
 verdict line: *"arm-b is 18% cheaper, but with n=3 the difference is not
 distinguishable from noise; ~12 repeats needed."* Also add a minimum-detectable-
 effect helper so users can choose `repeats` deliberately.
+
+**Fix:**
+
+- New `ys/statistics.py`, kept deliberately pure -- plain lists of floats in,
+  dataclasses out, no sqlite/`Experiment`/rich/HTML in sight, so it's testable
+  against hand-computed known-answer cases without a database or a
+  `Comparison` in the loop. `ys/render.py` is the only consumer and owns all
+  the wording (arm labels, "cheaper" vs "higher", banner styling).
+- **No new dependency.** `scipy` is not declared in `pyproject.toml` and
+  still isn't: `bootstrap_ci` is a resampling loop over `random.Random`,
+  `wilson_interval` is closed-form `math`, and the significance test is an
+  **exact two-sided permutation test** (`itertools.combinations` enumerates
+  every relabeling when `C(n_a+n_b, n_a)` is small enough -- always true at
+  this rig's default `repeats: 3`, where it's a mere 20), falling back to a
+  seeded Monte Carlo sample only past a size no default-`repeats` run would
+  reach. Chosen over Mann-Whitney specifically because exact enumeration at
+  tiny n needs no distributional assumption and, unlike a U-statistic's
+  asymptotic p-value, is exact by construction rather than approximate.
+  `_norm_ppf` (Peter Acklam's rational approximation to the normal quantile
+  function, public domain) is the one piece of "real" numerics, needed only
+  by the minimum-detectable-effect helper's z-score lookup.
+- **Deterministic by construction.** Every source of randomness (the
+  bootstrap resampler, the permutation test's Monte Carlo fallback) is
+  driven by a `random.Random(seed)` instance built fresh inside the call
+  from a fixed module-level `DEFAULT_SEED`, never the global `random`
+  module -- so `ys compare` on unchanged data prints the exact same verdict
+  every time, not just a statistically-similar one. `tests/test_statistics.py`
+  pins this directly (`test_permutation_test_is_deterministic_across_repeated_calls`,
+  `test_bootstrap_ci_is_deterministic_across_repeated_calls`,
+  `test_metric_verdict_is_deterministic_across_repeated_calls`), and
+  `tests/test_render.py::test_significance_verdicts_is_deterministic_across_repeated_calls`
+  covers the same property through `compare_experiment`/`significance_verdicts`.
+- **The n=3 problem is answered head-on, not hidden.** `min_two_sided_p(3, 3)
+  == 0.1`: with the schema's own default `repeats: 3`, no possible dataset
+  can produce a two-sided exact permutation p-value below 0.05 (`C(6,3) = 20`
+  relabelings; only 2 -- the true split and its mirror -- can ever be the
+  most extreme). `min_n_for_exact_significance()` computes the first n where
+  that stops being true (4, per side). The verdict line leads with this fact
+  in plain language ("the smallest possible p-value an exact test could
+  report at this n is 0.1, so no result here could reach significance")
+  rather than printing `p=0.1` and leaving the user to know what that means
+  at n=3 -- exactly the "don't imply more precision than exists" instruction
+  this feature was built under. `tests/test_statistics.py::test_metric_verdict_at_n3_never_claims_significance`
+  and `tests/test_render.py::test_significance_verdicts_names_direction_effect_size_and_repeats_needed`
+  pin the n=3 case end to end.
+- **`metrics.primary` drives the significance test**, per the plan's own
+  instruction and finding 15-18's precedent -- no separate mechanism.
+  `render.significance_verdicts(comparison)` runs `stats.metric_verdict`
+  once per (non-baseline arm, `comparison.primary_metrics` entry) using the
+  *exact same gate-passing, config-hash-matched run population*
+  `aggregate_run_metrics` already computes `mean`/`n`/`spread` from (finding
+  13/14) -- `aggregate_run_metrics`'s per-metric dict now also carries the
+  raw `values` list the mean/spread were computed from, so the significance
+  test can never silently operate over a different n than the table beside
+  it claims.
+- **The verdict line**, matching the plan's own wording: e.g. *"arm-b is 18%
+  cheaper than arm-a on cost_usd, but with n=3 the smallest possible p-value
+  an exact test could report at n=3 is 0.1, so no result here could reach
+  significance; ~4 repeats needed to tell a difference this size from
+  noise."* Always states direction (a small per-metric word table gives
+  `cost_usd`/`cost_per_success` "cheaper"/"more expensive", `wall_clock_s`/
+  `active_s` "faster"/"slower", count-like metrics "fewer"/"more", and
+  anything else falls back to generic "lower"/"higher"), effect size,
+  whether it's distinguishable from noise, and -- when it isn't -- a
+  required-repeats estimate from `required_repeats_per_arm` (a standard
+  two-sample z-test sample-size formula, floored at
+  `min_n_for_exact_significance` so a very large effect with very low noise
+  can never suggest fewer repeats than the permutation test could ever act
+  on). When the test *is* significant, the line says so plainly instead
+  (`"... (n=8, permutation p=0.000155) -- distinguishable from noise."`).
+- **Surfaced the same way the three existing warning families are** (`cost_
+  warnings`/`config_warnings`/`repeat_count_warnings`), not a fourth
+  invented style: `render.significance_verdicts(comparison) -> list[str]`,
+  printed by `ys compare` under an "is the difference real?" heading and
+  rendered as a bordered banner (blue, distinct from the red/amber warning
+  banners since this is the answer, not a caveat) right above the table in
+  the HTML report.
+- **Bootstrap CIs on every displayed metric** (`stats.bootstrap_ci`, a
+  percentile bootstrap over the same raw `values`), shown in the HTML report
+  next to each metric's existing `± spread` cell (`CI95[low, high]`) -- the
+  CLI table stays terse, matching the existing precedent that spread itself
+  is HTML-only. Omitted (not a degenerate `CI95[x, x]`) when a metric has
+  fewer than 2 observations to resample.
+- **Wilson interval on success rate**: `stats.wilson_interval`, appended to
+  the existing `n_success/n_runs` cell in both `ys compare` and the HTML
+  report (`3/3 (95% CI 44-100%)`) -- chosen over the normal approximation
+  specifically because the latter collapses to a zero-width interval at 0%
+  or 100% observed, which is the unremarkable common case at n=3.
+- Tests: `tests/test_statistics.py` (new) has 29 known-answer cases --
+  hand-computed Wilson intervals, a permutation test on datasets small
+  enough to enumerate by hand (n=2 vs n=2, n=3 vs n=3), a bootstrap CI
+  pinned against values traced directly from the seeded RNG, and the
+  determinism/n=3-never-significant properties above.
+  `tests/test_metrics.py::test_aggregate_run_metrics_carries_raw_values_for_bootstrap_and_permutation_tests`
+  pins that the new `values` list matches exactly the gate-passing
+  population `mean`/`n` already describe. `tests/test_render.py` and
+  `tests/test_cli.py::test_compare_prints_significance_verdict_for_primary_metric`
+  cover the verdict banner end to end through `compare_experiment`/
+  `ys compare`/`ys report --html`, including the no-baseline and
+  no-primary-metrics empty cases.
 
 ### 4. `ys doctor`
 

@@ -477,3 +477,196 @@ def test_render_html_no_repeat_warning_banner_when_equal():
         content = render.render_html(comparison, cur)
 
     assert "Unequal repeats" not in content
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: statistics worth the name. `_seed_run`'s `cost` argument is the
+# run's *total* cost_usd (spread evenly across `turns` requests), so seeding
+# three runs per arm with distinct costs gives exact control over the raw
+# per-run `values` the significance test operates on.
+# ---------------------------------------------------------------------------
+
+
+def _seed_three_runs(cur, exp, arm_id, costs, turns=2):
+    for i, cost in enumerate(costs, start=1):
+        _seed_run(cur, exp, arm_id, f"r{arm_id}{i}", i, cost, turns)
+
+
+def test_significance_verdicts_names_direction_effect_size_and_repeats_needed():
+    """The plan's own example, end to end: at n=3 the exact test cannot
+    claim significance, and the verdict line must say so plainly plus name
+    a repeats estimate -- not just print a bare p-value."""
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [
+            {"id": "a", "factors": {}, "baseline": True},
+            {"id": "b", "factors": {}},
+        ],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.02, 0.98, 1.00])
+        _seed_three_runs(cur, exp, "b", [0.80, 0.85, 0.81])  # ~18% cheaper
+        comparison = render.compare_experiment(cur, exp)
+
+    verdicts = render.significance_verdicts(comparison)
+    assert len(verdicts) == 1
+    line = verdicts[0]
+    assert "b is" in line
+    assert "cheaper" in line
+    assert "than a" in line
+    assert "cost_usd" in line
+    assert "not distinguishable" not in line  # the structural framing is used instead, see below
+    assert "no result here could reach significance" in line
+    assert "repeats needed" in line
+
+
+def test_significance_verdicts_empty_without_a_baseline_arm():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.0, 1.0, 1.0])
+        _seed_three_runs(cur, exp, "b", [0.8, 0.8, 0.8])
+        comparison = render.compare_experiment(cur, exp)
+
+    assert render.significance_verdicts(comparison) == []
+
+
+def test_significance_verdicts_empty_when_no_primary_metrics_declared():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [
+            {"id": "a", "factors": {}, "baseline": True},
+            {"id": "b", "factors": {}},
+        ],
+        {"primary": []},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.0, 1.0, 1.0])
+        _seed_three_runs(cur, exp, "b", [0.8, 0.8, 0.8])
+        comparison = render.compare_experiment(cur, exp)
+
+    assert render.significance_verdicts(comparison) == []
+
+
+def test_significance_verdicts_is_deterministic_across_repeated_calls():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [
+            {"id": "a", "factors": {}, "baseline": True},
+            {"id": "b", "factors": {}},
+        ],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.1, 0.9, 1.03])
+        _seed_three_runs(cur, exp, "b", [0.7, 0.95, 0.77])
+        comparison = render.compare_experiment(cur, exp)
+
+    first = render.significance_verdicts(comparison)
+    second = render.significance_verdicts(comparison)
+    assert first == second
+
+
+def test_render_html_shows_significance_verdict_banner():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [
+            {"id": "a", "factors": {}, "baseline": True},
+            {"id": "b", "factors": {}},
+        ],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.02, 0.98, 1.00])
+        _seed_three_runs(cur, exp, "b", [0.80, 0.85, 0.81])
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert "Is the difference real?" in content
+    assert "cost_usd" in content
+    assert content.count("<tr>") == content.count("</tr>")
+
+
+def test_render_html_no_verdict_banner_without_baseline():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}}, {"id": "b", "factors": {}}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.0, 1.0, 1.0])
+        _seed_three_runs(cur, exp, "b", [0.8, 0.8, 0.8])
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert "Is the difference real?" not in content
+
+
+def test_build_table_success_rate_includes_wilson_interval():
+    db.init_db()
+    exp = _make_experiment([{"id": "a", "factors": {}, "baseline": True}])
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 2, task_success=1)
+        _seed_run(cur, exp, "a", "ra2", 2, 0.01, 2, task_success=1)
+        _seed_run(cur, exp, "a", "ra3", 3, 0.01, 2, task_success=1)
+        comparison = render.compare_experiment(cur, exp)
+
+    table = render.build_table(comparison)
+    from io import StringIO
+
+    from rich.console import Console
+
+    buf = StringIO()
+    Console(file=buf, width=200).print(table)
+    rendered = buf.getvalue()
+
+    assert "3/3" in rendered
+    assert "95% CI" in rendered
+
+
+def test_render_html_success_rate_includes_wilson_interval():
+    db.init_db()
+    exp = _make_experiment([{"id": "a", "factors": {}, "baseline": True}])
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 0.01, 2, task_success=1)
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert "95% CI" in content
+    assert content.count("<tr>") == content.count("</tr>")
+
+
+def test_render_html_metric_rows_include_bootstrap_ci():
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_three_runs(cur, exp, "a", [1.02, 0.98, 1.00])
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert "CI95[" in content
+    assert content.count("<tr>") == content.count("</tr>")
+
+
+def test_render_html_no_bootstrap_ci_with_a_single_run():
+    """A single run has one observation per metric -- nothing to resample,
+    so bootstrap_ci returns None and the cell must not show a degenerate
+    CI95[x, x] as if it meant something."""
+    db.init_db()
+    exp = _make_experiment_with_metrics(
+        [{"id": "a", "factors": {}, "baseline": True}],
+        {"primary": ["cost_usd"]},
+    )
+    with db.cursor() as cur:
+        _seed_run(cur, exp, "a", "ra1", 1, 1.0, 2)
+        comparison = render.compare_experiment(cur, exp)
+        content = render.render_html(comparison, cur)
+
+    assert "CI95[" not in content
