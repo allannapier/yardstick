@@ -898,3 +898,179 @@ def test_run_cmd_repeats_flag_overrides_experiment_repeats(monkeypatch, run_cmd_
     result = runner.invoke(app, ["run", "--exp", exp, "--arm", "only-arm", "--repeats", "3"])
     assert result.exit_code == 0, result.stdout
     assert "3/3" in unwrapped(result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: ys export
+# ---------------------------------------------------------------------------
+
+
+def test_export_requires_at_least_one_output_format(tmp_path):
+    exp = _write_exp(tmp_path)
+    result = runner.invoke(app, ["export", "--exp", exp])
+    assert result.exit_code == 1
+    assert "at least one of --csv or --json" in unwrapped(result.stdout)
+
+
+def test_export_writes_csv_and_json_for_recorded_runs(tmp_path):
+    exp = _write_exp(tmp_path)
+    start = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm"])
+    assert start.exit_code == 0, start.stdout
+    end = runner.invoke(app, ["end"])
+    assert end.exit_code == 0, end.stdout
+
+    csv_path = tmp_path / "out.csv"
+    json_path = tmp_path / "out.json"
+    result = runner.invoke(
+        app, ["export", "--exp", exp, "--csv", str(csv_path), "--json", str(json_path)]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "1 row(s)" in unwrapped(result.stdout)
+
+    assert csv_path.exists()
+    assert json_path.exists()
+
+    rows = json.loads(json_path.read_text())
+    assert len(rows) == 1
+    assert rows[0]["experiment"] == "cli-test-exp"
+    assert rows[0]["arm"] == "only-arm"
+    assert rows[0]["status"] == "success"
+
+    csv_lines = csv_path.read_text().splitlines()
+    assert "experiment" in csv_lines[0]
+    assert "cli-test-exp" in csv_lines[1]
+
+
+def test_export_reports_no_runs_without_erroring(tmp_path):
+    exp = _write_exp(tmp_path)
+    csv_path = tmp_path / "out.csv"
+    result = runner.invoke(app, ["export", "--exp", exp, "--csv", str(csv_path)])
+    assert result.exit_code == 0, result.stdout
+    assert "no recorded runs" in unwrapped(result.stdout)
+    assert csv_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: ys start --budget
+# ---------------------------------------------------------------------------
+
+
+def _end_with_recorded_cost(exp, arm_id, cost, cost_source="litellm"):
+    """Start+end one run of `arm_id`, inserting a single priced (or
+    deliberately unpriced) request so the run has a real `cost_usd` -- same
+    pattern `test_compare_prints_cost_unknown_warning_for_unpriced_model`
+    uses."""
+    start = runner.invoke(app, ["start", "--exp", exp, "--arm", arm_id])
+    assert start.exit_code == 0, start.stdout
+    run_id = re.search(r"run (\S+)", plain(start.stdout)).group(1)
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO requests (run_id, seq, ts, model, input_tokens, output_tokens, "
+            "response_cost, cost_source) VALUES (?,1,?,?,?,?,?,?)",
+            (run_id, "2026-01-01T00:00:00Z", "test-model", 10, 5, cost, cost_source),
+        )
+    end = runner.invoke(app, ["end"])
+    assert end.exit_code == 0, end.stdout
+    return run_id
+
+
+def test_start_budget_has_nothing_to_check_before_any_finished_run(tmp_path):
+    exp = _write_exp(tmp_path)
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm", "--budget", "5.00"])
+    assert result.exit_code == 0, result.stdout
+    assert "no finished runs recorded yet" in unwrapped(result.stdout)
+    runner.invoke(app, ["end"])
+
+
+def test_start_budget_warns_but_does_not_abort_when_under_budget(tmp_path):
+    exp = _write_exp(tmp_path)
+    _end_with_recorded_cost(exp, "only-arm", 1.00)
+
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm", "--budget", "5.00"])
+    assert result.exit_code == 0, result.stdout
+    output = unwrapped(result.stdout)
+    assert "budget guard" in output
+    assert "$1.00" in output
+    assert "$5.00" in output
+    runner.invoke(app, ["end"])
+
+
+def test_start_budget_aborts_when_recorded_history_already_meets_it(tmp_path):
+    """The budget guard's "fires" case: a run refuses to start (exit 1,
+    active slot never claimed) once the arm's own already-recorded cost
+    history meets or exceeds --budget. Reverting the check in `start` (i.e.
+    not calling `runs.arm_cost_summary`/never raising typer.Exit) would let
+    this proceed to exit 0 -- this test fails without the guard in place."""
+    exp = _write_exp(tmp_path)
+    _end_with_recorded_cost(exp, "only-arm", 6.00)
+
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm", "--budget", "5.00"])
+    assert result.exit_code == 1
+    output = unwrapped(result.stdout)
+    assert "refusing to start" in output
+    assert "$6.00" in output
+    assert "$5.00" in output
+
+    status = runner.invoke(app, ["status"])
+    assert "no active run" in unwrapped(status.stdout)
+
+
+def test_start_budget_surfaces_unpriced_history_instead_of_claiming_under_budget(tmp_path):
+    """Finding 9's honest problem, applied to the budget guard: a run whose
+    cost is $0 because nothing could price it must never read as "under
+    budget" -- that's indistinguishable, from the guard's own numbers, from
+    a run that was genuinely free. This test fails if the guard only checks
+    total_cost_usd >= budget without also checking has_unknown_cost."""
+    exp = _write_exp(tmp_path)
+    _end_with_recorded_cost(exp, "only-arm", 0.0, cost_source="unknown")
+
+    result = runner.invoke(app, ["start", "--exp", exp, "--arm", "only-arm", "--budget", "5.00"])
+    assert result.exit_code == 0, result.stdout
+    output = unwrapped(result.stdout)
+    assert "cost_source='unknown'" in output or "unknown" in output
+    assert "not 'under budget'" in output
+    runner.invoke(app, ["end"])
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: ys leaderboard
+# ---------------------------------------------------------------------------
+
+
+def test_leaderboard_ranks_arms_within_each_experiment_and_flags_noise(tmp_path):
+    """Cross-experiment leaderboard, end to end: two experiments (two
+    tasks), each contributing its own baseline + one other arm. The
+    non-baseline arm is cheaper on paper but n=3 vs n=3 can never reach
+    exact-test significance (see feature 3's min_two_sided_p(3, 3) == 0.1),
+    so the table must mark it as not distinguishable from noise rather than
+    silently reporting its better rank as a settled win."""
+    exp = _write_two_arm_exp(tmp_path)
+    costs = {"arm-a": [1.02, 0.98, 1.00], "arm-b": [0.80, 0.85, 0.81]}
+    for arm_id, arm_costs in costs.items():
+        for cost in arm_costs:
+            start = runner.invoke(app, ["start", "--exp", exp, "--arm", arm_id])
+            assert start.exit_code == 0, start.stdout
+            run_id = re.search(r"run (\S+)", plain(start.stdout)).group(1)
+            with db.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO requests (run_id, seq, ts, model, input_tokens, output_tokens, "
+                    "response_cost, cost_source) VALUES (?,1,?,?,?,?,?,?)",
+                    (run_id, "2026-01-01T00:00:00Z", "test-model", 10, 5, cost, "litellm"),
+                )
+            end = runner.invoke(app, ["end"])
+            assert end.exit_code == 0, end.stdout
+
+    result = runner.invoke(app, ["leaderboard", "--exp", exp, "--metric", "cost_usd"])
+    assert result.exit_code == 0, result.stdout
+    output = unwrapped(result.stdout)
+    assert "cross-experiment leaderboard" in output
+    assert "arm-b" in output and "arm-a" in output
+    assert "not distinguishable from noise" in output
+    assert "is the ranking real?" in output
+    assert "repeats needed" in output
+
+
+def test_leaderboard_reports_errors_for_experiments_with_no_comparable_runs(tmp_path):
+    exp = _write_exp(tmp_path)  # never started -- no runs recorded at all
+    result = runner.invoke(app, ["leaderboard", "--exp", exp])
+    assert result.exit_code == 1

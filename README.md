@@ -253,6 +253,46 @@ time. A response landing just after `ys end` still attributes to the run
 that just finished for a short drain window (60s), so the tail of a run
 isn't dropped into `unattributed` just because it arrived a moment late.
 
+## Export, budget guard, and leaderboard
+
+```bash
+ys export --exp experiments/example.yaml --csv runs.csv --json runs.json
+```
+
+Writes one row per recorded run of the experiment (every arm, every repeat —
+including unfinished/abandoned runs and ones recorded under an older config,
+each tagged with its own `status` and `config_matches_current` so the file is
+interpretable without the database beside it). `ys compare`/`ys report`
+narrow to the gate-passing, current-config population on purpose (see
+`aggregate_run_metrics`); `ys export` hands over everything so you can narrow
+it yourself.
+
+```bash
+ys start --exp experiments/example.yaml --arm arm-a --budget 5.00
+```
+
+`--budget` checks the arm's own already-*recorded* run history against the
+threshold — `ys start` returns before the harness sends a single request, so
+it cannot know this run's own cost yet. If the arm's finished runs already
+total at or above the budget, `ys start` refuses to begin another repeat
+(exit 1); if any of that history has a request neither LiteLLM nor a
+declared `pricing:` override could price (`cost_source='unknown'`, see
+finding 9), it says so explicitly rather than reporting "under budget" on
+spend it can't actually verify. The run you're about to start still gets its
+own real `cost_usd` only once it finishes — that's `ys end`'s printed summary,
+unchanged.
+
+```bash
+ys leaderboard --exp exp-a.yaml --exp exp-b.yaml --metric cost_usd
+```
+
+Ranks each experiment's arms on one metric, side by side. Rank is scoped
+*within* each experiment — two experiments are two different tasks, so a
+mean on one isn't comparable in magnitude to a mean on the other — and every
+non-baseline row reuses feature 3's significance test against its own
+experiment's baseline, so an arm that merely looks best isn't presented as a
+settled win when it isn't distinguishable from noise.
+
 ## Development
 
 ```bash

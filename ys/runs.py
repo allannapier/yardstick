@@ -371,6 +371,57 @@ def delete_run(run_id: str) -> DeleteResult:
 
 
 @dataclass
+class ArmCostSummary:
+    total_cost_usd: float
+    n_runs: int
+    has_unknown_cost: bool
+
+
+def arm_cost_summary(cur, experiment_name: str, arm_id: str) -> ArmCostSummary:
+    """Sum of `cost_usd` across every *finished* run already recorded for
+    this arm (`task_success IS NOT NULL` -- the same "finished" test
+    `aggregate_run_metrics` uses for `n_runs`, finding 13) -- feature 6's
+    `ys start --budget` pre-flight check.
+
+    Deliberately the arm's own *history*, not a prediction about the run
+    about to start: `ys start` returns before the harness sends a single
+    request, so it cannot know this run's own cost yet, and this module
+    isn't the place to make it block and poll (see finding 11's `ys end`
+    precedent for why a synchronous CLI command sleeping to wait out real
+    traffic is a real UX cost, ruled out there for the same reason). The
+    actual per-run number is still only available once the run finishes --
+    `ys end` already prints `cost_usd` in its headline metrics unchanged --
+    this just gives `ys start` something honest to check before committing
+    to another repeat.
+
+    `has_unknown_cost` mirrors finding 9's `cost_source`: True if any
+    counted run has a request neither LiteLLM nor a declared `pricing:`
+    override could price. A budget check that can't tell "$0 because free"
+    from "$0 because unpriced" is worse than none -- so a caller sees this
+    flag and can refuse to trust `total_cost_usd` as a real total rather
+    than silently reporting "under budget" on exactly the runs where spend
+    is unmeasured.
+    """
+    from ys import metrics as metrics_mod
+
+    row_id = arm_row_id(experiment_name, arm_id)
+    run_ids = [
+        r["id"]
+        for r in cur.execute(
+            "SELECT id FROM runs WHERE arm_id = ? AND task_success IS NOT NULL", (row_id,)
+        ).fetchall()
+    ]
+    total = 0.0
+    has_unknown = False
+    for rid in run_ids:
+        m = metrics_mod.compute_run_metrics(cur, rid)
+        total += m.get("cost_usd") or 0.0
+        if metrics_mod.unpriced_models(cur, rid):
+            has_unknown = True
+    return ArmCostSummary(total_cost_usd=total, n_runs=len(run_ids), has_unknown_cost=has_unknown)
+
+
+@dataclass
 class UnattributedSummary:
     count: int
     since: Optional[str]  # "HH:MM" (UTC) of the earliest unattributed request, or None if count == 0

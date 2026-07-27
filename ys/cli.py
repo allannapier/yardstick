@@ -354,6 +354,20 @@ def start(
     exp: str = typer.Option(..., "--exp", help="path to the experiment YAML"),
     arm: str = typer.Option(..., "--arm", help="arm id to run"),
     force: bool = typer.Option(False, "--force", help="override an already-active run"),
+    budget: Optional[float] = typer.Option(
+        None,
+        "--budget",
+        help=(
+            "USD budget guard for this arm (feature 6 in IMPROVEMENTS.md). `ys start` "
+            "returns before the harness sends a single request, so this can't check the "
+            "run about to happen -- it checks the arm's own recorded history instead: "
+            "refuses to start (exit 1) if that history alone already meets or exceeds "
+            "the budget, and warns rather than claiming 'under budget' if any of that "
+            "history couldn't be priced at all (cost_source='unknown', finding 9). The "
+            "run's own actual cost is still only known once it finishes -- see cost_usd "
+            "in `ys end`'s printed summary, unchanged by this flag."
+        ),
+    ),
 ):
     """Begin a run of one arm and mark it active."""
     experiment = load_experiment(exp)
@@ -370,6 +384,46 @@ def start(
         for problem in path_problems:
             console.print(f"[red]{problem}[/red]")
         raise typer.Exit(1)
+
+    # Feature 6: the budget guard. See the --budget help text above for why
+    # this checks the arm's history rather than the run about to start --
+    # a run that predicted the future would be a different, much bigger
+    # feature (live enforcement inside the proxy/collector, which is out of
+    # scope here). Checked before begin_run claims the active slot, same as
+    # the path-problems check above, so a refusal doesn't leave anything to
+    # clean up.
+    if budget is not None:
+        with db.cursor() as cur:
+            cost_summary = runs.arm_cost_summary(cur, experiment.experiment, arm)
+        if cost_summary.n_runs == 0:
+            console.print(
+                f"[dim]budget guard: no finished runs recorded yet for arm '{arm}' -- "
+                f"nothing to check against the ${budget:.2f} budget until at least one "
+                "finishes.[/dim]"
+            )
+        elif cost_summary.has_unknown_cost:
+            console.print(
+                f"[yellow]budget guard: arm '{arm}' has {cost_summary.n_runs} recorded "
+                f"run(s) totalling ${cost_summary.total_cost_usd:.2f} against a "
+                f"${budget:.2f} budget -- but at least one of those runs has a request "
+                "neither LiteLLM nor a declared `pricing:` override could price "
+                "(cost_source='unknown', finding 9), so that total is a floor, not a "
+                "real total. Treating this as unknown, not 'under budget'.[/yellow]"
+            )
+        elif cost_summary.total_cost_usd >= budget:
+            console.print(
+                f"[red]budget guard: arm '{arm}' has already recorded "
+                f"${cost_summary.total_cost_usd:.2f} across {cost_summary.n_runs} "
+                f"finished run(s), at or over the ${budget:.2f} budget -- refusing to "
+                "start another repeat.[/red]"
+            )
+            raise typer.Exit(1)
+        else:
+            console.print(
+                f"[dim]budget guard: arm '{arm}' has recorded "
+                f"${cost_summary.total_cost_usd:.2f} of a ${budget:.2f} budget across "
+                f"{cost_summary.n_runs} finished run(s).[/dim]"
+            )
 
     try:
         result = runs.begin_run(experiment, config_yaml, arm, force=force)
@@ -860,6 +914,86 @@ def doctor(
     console.print(f"\n{len(results)} check(s): {n_fail} failed, {n_warn} warning(s)")
     if n_fail:
         raise typer.Exit(1)
+
+
+@app.command(name="export")
+def export_cmd(
+    exp: str = typer.Option(..., "--exp", help="path to the experiment YAML"),
+    arm: Optional[str] = typer.Option(None, "--arm", help="limit to one arm id (default: every arm)"),
+    csv_path: Optional[str] = typer.Option(None, "--csv", help="write CSV to this path"),
+    json_path: Optional[str] = typer.Option(None, "--json", help="write JSON to this path"),
+):
+    """Export every recorded run of an experiment (all repeats/arms,
+    including unfinished/abandoned ones and runs from an older config) as
+    CSV and/or JSON -- see ys/export.py for why the row is one run, not one
+    arm-aggregate or one request."""
+    from ys import export as export_mod
+
+    if not csv_path and not json_path:
+        console.print("[red]give at least one of --csv or --json.[/red]")
+        raise typer.Exit(1)
+
+    experiment = load_experiment(exp)
+    with db.cursor() as cur:
+        rows = export_mod.export_rows(cur, experiment, arm_id=arm)
+
+    if not rows:
+        console.print(
+            f"[yellow]no recorded runs for experiment '{experiment.experiment}'"
+            + (f" arm '{arm}'" if arm else "")
+            + " -- writing an empty file.[/yellow]"
+        )
+
+    if csv_path:
+        with open(csv_path, "w", newline="") as f:
+            f.write(export_mod.to_csv(rows))
+        console.print(f"wrote [bold]{csv_path}[/bold] ({len(rows)} row(s))")
+    if json_path:
+        with open(json_path, "w") as f:
+            f.write(export_mod.to_json(rows))
+        console.print(f"wrote [bold]{json_path}[/bold] ({len(rows)} row(s))")
+
+
+@app.command()
+def leaderboard(
+    exp: list[str] = typer.Option(
+        ..., "--exp", help="experiment YAML whose arms to include (repeatable across experiments/tasks)"
+    ),
+    metric: str = typer.Option("cost_usd", "--metric", help="metric to rank arms by, within each experiment"),
+):
+    """Rank arms across multiple experiments (different tasks) on one
+    metric. Ranking is scoped within each experiment -- two experiments are
+    two different tasks, so a mean on one isn't comparable in magnitude to
+    a mean on the other -- and reuses feature 3's significance test so an
+    arm that merely *looks* best isn't presented as a settled win when it
+    isn't distinguishable from its own baseline's noise."""
+    from ys import render
+
+    comparisons = []
+    errors = []
+    for path in exp:
+        experiment = load_experiment(path)
+        with db.cursor() as cur:
+            try:
+                comparisons.append(render.compare_experiment(cur, experiment))
+            except render.CompareError as e:
+                errors.append(str(e))
+
+    if not comparisons:
+        for e in errors:
+            console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    rows = render.build_leaderboard(comparisons, metric=metric)
+    table = render.build_leaderboard_table(rows, metric)
+    console.print(table)
+    for e in errors:
+        console.print(f"[yellow]{e}[/yellow]")
+    notes = render.leaderboard_notes(rows)
+    if notes:
+        console.print("\n[bold]is the ranking real?[/bold]")
+        for note in notes:
+            console.print(f"  {note}")
 
 
 if __name__ == "__main__":
