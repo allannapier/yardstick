@@ -44,6 +44,27 @@ class Task(BaseModel):
     repo: Optional[str] = None
     ref: Optional[str] = None
     prompt_file: Optional[str] = None
+    # Feature 2 (IMPROVEMENTS.md, ys/workspace.py): where/how each run's
+    # success_check -- and, for feature 1's `ys run`/ys/runner.py, task.setup,
+    # the agent itself, and task.teardown -- execute, instead of "whatever
+    # directory the command happened to be invoked from" with no reset
+    # between repeats.
+    #
+    #   - workdir: with `repo` set, a relative subdirectory *within* the
+    #     per-run clone to actually run in (e.g. a monorepo package).
+    #     Without `repo`, an existing directory the caller manages
+    #     (typically a real project checkout) -- used as-is, never created
+    #     or deleted by yardstick (see ys/workspace.py's safety rule: only a
+    #     directory yardstick itself created may ever be deleted). Without
+    #     either `repo` or `workdir`, falls back to the invoking process's
+    #     own cwd -- unchanged pre-feature-2 behaviour.
+    #   - setup / teardown: shell strings run once per repeat, before/after
+    #     the agent, in that workspace -- same trust model as
+    #     success_check below (shell=True was already true of it, so this
+    #     doesn't widen what a config file can do, only how often it runs).
+    workdir: Optional[str] = None
+    setup: Optional[str] = None
+    teardown: Optional[str] = None
     success_check: str
     timeout_s: int = 1800
 
@@ -94,12 +115,21 @@ def validate_task_paths(task: "Task") -> list[str]:
     usage will be a remote git URL, and confirming a remote repo/ref
     actually exists needs a network call (`git ls-remote`) that belongs to
     feature 2's own implementation, not this stopgap.
+
+    `task.workdir` is checked the same way, but only when `task.repo` isn't
+    set -- with a repo, `workdir` names a subdirectory inside a clone that
+    doesn't exist yet, so there's nothing on disk to check until
+    `ys/workspace.py` actually clones it.
     """
     problems = []
     if task.prompt_file and not os.path.isfile(task.prompt_file):
         problems.append(f"task.prompt_file '{task.prompt_file}' does not exist")
     if task.repo and "://" not in task.repo and "@" not in task.repo and not os.path.exists(task.repo):
         problems.append(f"task.repo '{task.repo}' looks like a local path but does not exist")
+    if task.workdir and not task.repo and not os.path.isdir(task.workdir):
+        problems.append(
+            f"task.workdir '{task.workdir}' does not exist (and no task.repo to create it from)"
+        )
     return problems
 
 

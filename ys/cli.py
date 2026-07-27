@@ -515,6 +515,115 @@ def end(
         )
 
 
+@app.command("run")
+def run_cmd(
+    exp: str = typer.Option(..., "--exp", help="path to the experiment YAML"),
+    arm: str = typer.Option(..., "--arm", help="arm id to run"),
+    repeats: Optional[int] = typer.Option(
+        None, "--repeats", help="number of repeats (default: the experiment's own `repeats:`)"
+    ),
+    agent: Optional[str] = typer.Option(
+        None,
+        "--agent",
+        help=(
+            "claude-code | opencode | codex-cli | aider -- which non-interactive CLI to "
+            "invoke each repeat with (default: the arm's factors.agent, if it has one)"
+        ),
+    ),
+    port: int = typer.Option(proxy.DEFAULT_PORT, "--port"),
+    max_consecutive_failures: Optional[int] = typer.Option(
+        None,
+        "--max-consecutive-failures",
+        help=(
+            "hard-stop after this many consecutive agent-invocation failures (not task "
+            "failures -- a repeat that ran fine but failed its own success_check doesn't "
+            "count). The guard against burning paid requests on a broken setup, e.g. the "
+            "proxy going down mid-run. Default: 3."
+        ),
+    ),
+    settle_s: Optional[float] = typer.Option(
+        None,
+        "--settle-s",
+        help=(
+            "pause between repeats so a straggling response from one repeat's agent can't "
+            "be misattributed to the next repeat's run (finding 11's drain window, raced "
+            "by a fast automated loop -- see IMPROVEMENTS.md feature 1). Default: 2.0."
+        ),
+    ),
+):
+    """Drive an agent non-interactively through --repeats repeats of an arm's
+    task, scoring each one (IMPROVEMENTS.md feature 1: unattended runs)."""
+    from ys import runner
+
+    experiment = load_experiment(exp)
+    with open(exp) as f:
+        config_yaml = f.read()
+
+    # Finding 15-18 / feature 1&2: same filesystem checks `ys start` already
+    # runs before claiming the active slot -- a typo'd prompt_file/repo
+    # should fail loudly here too, before the loop even starts, not
+    # mid-repeat. runner.preflight (below) additionally checks the agent
+    # binary and the proxy, since run_experiment can in principle be called
+    # without going through this CLI path first.
+    path_problems = validate_task_paths(experiment.task)
+    if path_problems:
+        for problem in path_problems:
+            console.print(f"[red]{problem}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        arm_obj = experiment.get_arm(arm)
+    except KeyError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    agent_name = agent or arm_obj.factors.get("agent")
+    if not agent_name:
+        console.print(
+            "[red]no --agent given and arm has no 'agent' factor -- pass --agent "
+            "explicitly (claude-code | opencode | codex-cli | aider).[/red]"
+        )
+        raise typer.Exit(1)
+
+    master_key = os.environ.get("LITELLM_MASTER_KEY") or ""
+    repeats_n = repeats if repeats is not None else experiment.repeats
+    kwargs = {}
+    if max_consecutive_failures is not None:
+        kwargs["max_consecutive_failures"] = max_consecutive_failures
+    if settle_s is not None:
+        kwargs["settle_s"] = settle_s
+
+    def _on_event(evt):
+        style = {"info": "dim", "warning": "yellow", "error": "red", "success": "green"}.get(evt.level)
+        console.print(f"[{style}]{evt.message}[/{style}]" if style else evt.message)
+
+    try:
+        summary = runner.run_experiment(
+            experiment,
+            config_yaml,
+            arm,
+            agent_name=agent_name,
+            repeats=repeats_n,
+            port=port,
+            master_key=master_key,
+            on_event=_on_event,
+            **kwargs,
+        )
+    except runner.RunnerError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    n_success = sum(1 for o in summary.outcomes if o.task_success)
+    n_fail = sum(1 for o in summary.outcomes if o.task_success is False)
+    console.print(
+        f"\n[bold]{summary.repeats_completed}/{summary.repeats_requested}[/bold] repeat(s) "
+        f"attempted -- {n_success} succeeded, {n_fail} failed"
+    )
+    if summary.aborted_reason:
+        console.print(f"[red]stopped early: {summary.aborted_reason}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command()
 def delete(
     run_id: str = typer.Argument(..., help="run id to delete"),

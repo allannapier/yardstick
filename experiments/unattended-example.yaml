@@ -1,0 +1,54 @@
+experiment: unattended-mock-01
+question: >
+  Does `ys run` (feature 1: unattended runs) drive a repeat loop end to end
+  against a mocked model, with each repeat isolated in its own fresh
+  workspace (feature 2) instead of a directory that accumulates state
+  across repeats? Mocked, so it costs nothing to run -- but `ys run` still
+  needs a real, installed agent CLI on PATH (e.g. `claude`) to actually
+  invoke; without one it fails preflight loudly, by design, rather than
+  starting and failing mid-repeat.
+
+task:
+  id: unattended-000
+  # `ys run` invokes the agent non-interactively -- there's no human to
+  # type a prompt, so prompt_file is required for it (ys/runner.py's
+  # preflight checks this before the first repeat starts).
+  prompt_file: experiments/unattended-example.prompt.md
+  # A fresh `git clone` of `repo`@`ref` per repeat (feature 2), instead of
+  # every repeat running in whatever directory `ys run` was invoked from
+  # and inheriting the last repeat's leftover state. `.` (this repo,
+  # cloned locally -- never touches the network) is a stand-in; point this
+  # at your own project's repo/ref instead.
+  repo: .
+  ref: main
+  # Run once per repeat, before/after the agent, in that repeat's cloned
+  # workspace -- e.g. `npm ci` for setup, cleaning up a container for
+  # teardown. $YS_WORKDIR (also the cwd) is how a script can refer to the
+  # workspace without yardstick ever interpolating the path into the shell
+  # string itself.
+  setup: "echo setup ran in $YS_WORKDIR"
+  teardown: "echo teardown ran in $YS_WORKDIR"
+  success_check: "true"
+  timeout_s: 60
+
+factors:
+  agent: [claude-code]
+  model: [probe-claude-mock]
+
+models:
+  probe-claude-mock:
+    model: anthropic/claude-3-5-sonnet-20241022
+    mock_response: "This is a mock response used for yardstick's unattended-run smoke test."
+
+arms:
+  - id: arm-a
+    factors: {agent: claude-code, model: probe-claude-mock}
+    notes: "unattended smoke test -- mock_response short-circuits the real API"
+    baseline: true
+
+repeats: 2
+
+metrics:
+  gate: task_success
+  primary: [cost_usd, billable_tokens, turns, wall_clock_s]
+  secondary: [tool_calls, redundant_tool_calls, tool_error_rate]
