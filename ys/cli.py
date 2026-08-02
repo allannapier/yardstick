@@ -10,7 +10,7 @@ from ys import db, dropped, harness, paths, proxy, runs, state, webserver
 from ys.experiment import load_experiment, validate_task_paths
 
 app = typer.Typer(help="yardstick -- measure agent/harness/model efficiency")
-proxy_app = typer.Typer(help="manage the LiteLLM measurement proxy")
+proxy_app = typer.Typer(help="manage the yardstick measurement proxy (litellm or portkey backend)")
 app.add_typer(proxy_app, name="proxy")
 web_app = typer.Typer(help="manage the yardstick dashboard")
 app.add_typer(web_app, name="web")
@@ -99,14 +99,24 @@ def proxy_up_cmd(
         ..., "--exp", help="experiment YAML whose models to serve (repeatable)"
     ),
     port: int = typer.Option(proxy.DEFAULT_PORT, "--port"),
+    backend: str = typer.Option(
+        proxy.DEFAULT_BACKEND,
+        "--backend",
+        help=(
+            "'litellm' (default, a locally-run multi-provider router) or 'portkey' "
+            "(reverse-proxies to your own hosted Portkey Cloud account instead -- see "
+            "ys/portkey_backend.py). Remembered on disk, so `ys start`/`ys end`/`ys "
+            "proxy down` don't need to be told again."
+        ),
+    ),
 ):
     """Generate a proxy config from experiments and start the proxy."""
     try:
-        url = proxy.proxy_up(exp, port=port)
+        url = proxy.proxy_up(exp, port=port, backend=backend)
     except proxy.ProxyError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
-    console.print(f"proxy ready at [bold]{url}[/bold]")
+    console.print(f"proxy ready at [bold]{url}[/bold] (backend: {backend})")
 
 
 @proxy_app.command("down")
@@ -124,11 +134,30 @@ def proxy_status_cmd():
     """Report whether the proxy is running."""
     alive, pid = proxy.proxy_status()
     if alive:
-        console.print(f"proxy running (pid {pid})")
+        console.print(f"proxy running (pid {pid}, backend: {proxy.read_backend()})")
     elif pid is not None:
         console.print(f"proxy not running (stale pidfile, pid {pid})")
     else:
         console.print("proxy not running")
+
+
+@proxy_app.command("pull-logs")
+def proxy_pull_logs_cmd(
+    run_id: str = typer.Argument(..., help="run id to pull Portkey logs for"),
+):
+    """Portkey backend only: fetch a run's request/response data back from
+    Portkey's Logs Export API and write it into the database. `ys end`
+    already tries this automatically once a run finishes -- use this to
+    retry if Portkey's own log pipeline hadn't finished indexing the run
+    yet (safe to re-run; see ys/portkey_collector.py's `ingest`)."""
+    from ys import portkey_collector
+
+    try:
+        n = portkey_collector.ingest(run_id)
+    except portkey_collector.PortkeyCollectorError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"pulled {n} request(s) from Portkey for run [bold]{run_id}[/bold]")
 
 
 def _agent_names(agent: str, skip_env_only: bool = False) -> list:
@@ -449,7 +478,12 @@ def start(
     )
 
     model = experiment.get_arm(arm).factors.get("model")
-    if model and master_key:
+    # The registered-model_list check below is a LiteLLM-only concept --
+    # Portkey routes by the model string + virtual key at request time, with
+    # no pre-registration step to verify against (see
+    # ys/portkey_backend.py's module docstring), so there is nothing
+    # meaningful to check here for that backend.
+    if model and master_key and proxy.read_backend() == proxy.BACKEND_LITELLM:
         port = proxy.read_port()
         available = proxy.model_available(model, port, master_key)
         if available is False:
@@ -524,6 +558,20 @@ def end(
         raise typer.Exit(1)
     except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
         _report_write_failed(e)
+
+    if proxy.read_backend() == proxy.BACKEND_PORTKEY:
+        from ys import portkey_collector
+
+        console.print("pulling request logs from Portkey...")
+        try:
+            n = portkey_collector.ingest(result.run_id)
+            console.print(f"pulled {n} request(s) from Portkey for this run")
+        except portkey_collector.PortkeyCollectorError as e:
+            console.print(
+                f"[yellow]warning: could not pull Portkey logs for this run yet ({e}) -- "
+                f"retry with `ys proxy pull-logs {result.run_id}` once Portkey has "
+                "finished indexing it.[/yellow]"
+            )
 
     verdict = "[green]SUCCESS[/green]" if result.task_success else "[red]FAIL[/red]"
     console.print(

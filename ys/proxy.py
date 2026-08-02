@@ -10,6 +10,17 @@ from ys.experiment import load_experiment
 
 DEFAULT_PORT = 4000
 
+# `ys proxy up --backend` (feature: Portkey backend). LiteLLM stays the
+# default -- every existing workflow/doc/test that doesn't pass --backend
+# keeps behaving exactly as before. "portkey" dispatches to
+# ys/portkey_backend.py instead, which points the harness at the caller's
+# own hosted Portkey Cloud account rather than a locally-run multi-provider
+# router -- see that module's docstring for how (and why) it differs from
+# everything below.
+BACKEND_LITELLM = "litellm"
+BACKEND_PORTKEY = "portkey"
+DEFAULT_BACKEND = BACKEND_LITELLM
+
 # Any model id not covered by an experiment's `models:` block or arm
 # `factors.model` convention still needs somewhere to go -- Claude Code's
 # background/title-generation traffic in particular carries model ids the
@@ -157,7 +168,40 @@ def generate_config(experiment_paths: list[str]) -> str:
     return paths.PROXY_CONFIG_PATH
 
 
-def proxy_up(experiment_paths: list[str], port: int = DEFAULT_PORT) -> str:
+def read_backend() -> str:
+    """Which backend the currently-running (or last-run) proxy is -- read by
+    `ys start`/`ys end`/`ys doctor` so they don't have to be told --backend
+    again on every command after `ys proxy up`. Defaults to LiteLLM, same as
+    `proxy_up` itself, for a proxy started before this flag existed (no
+    PROXY_BACKEND_PATH on disk yet) or one started by a caller that never
+    passed --backend."""
+    if not os.path.exists(paths.PROXY_BACKEND_PATH):
+        return DEFAULT_BACKEND
+    with open(paths.PROXY_BACKEND_PATH) as f:
+        return f.read().strip() or DEFAULT_BACKEND
+
+
+def _write_backend(backend: str):
+    with open(paths.PROXY_BACKEND_PATH, "w") as f:
+        f.write(backend)
+
+
+def proxy_up(experiment_paths: list[str], port: int = DEFAULT_PORT, backend: str = DEFAULT_BACKEND) -> str:
+    if backend not in (BACKEND_LITELLM, BACKEND_PORTKEY):
+        raise ProxyError(f"unknown backend '{backend}' -- choose from: {BACKEND_LITELLM}, {BACKEND_PORTKEY}")
+
+    if backend == BACKEND_PORTKEY:
+        # Deliberately not passed `experiment_paths`: unlike LiteLLM,
+        # Portkey Cloud routes by the model string + virtual key at request
+        # time rather than a pre-registered model_list, so there is no
+        # config to generate up front -- see ys/portkey_backend.py.
+        from ys import portkey_backend
+
+        url = portkey_backend.proxy_up(port=port)
+        paths.ensure_home()
+        _write_backend(BACKEND_PORTKEY)
+        return url
+
     if not os.environ.get("LITELLM_MASTER_KEY"):
         raise ProxyError(
             "LITELLM_MASTER_KEY is not set. Export a key of your choosing before "
@@ -200,6 +244,7 @@ def proxy_up(experiment_paths: list[str], port: int = DEFAULT_PORT) -> str:
             f"Check the log at {paths.PROXY_LOG_PATH}"
         )
 
+    _write_backend(BACKEND_LITELLM)
     return f"http://localhost:{port}"
 
 
@@ -254,7 +299,9 @@ def read_port(default: int = DEFAULT_PORT) -> int:
 
 
 def proxy_down(force: bool = False) -> str:
-    return procutil.stop(paths.PROXY_PID_PATH, paths.PROXY_PORT_PATH, force=force)
+    result = procutil.stop(paths.PROXY_PID_PATH, paths.PROXY_PORT_PATH, force=force)
+    procutil.remove_if_exists(paths.PROXY_BACKEND_PATH)
+    return result
 
 
 def proxy_status() -> tuple[bool, int | None]:

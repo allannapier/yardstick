@@ -9,6 +9,12 @@ PROXY_CONFIG_PATH = os.path.join(YARDSTICK_HOME, "proxy_config.yaml")
 PROXY_PID_PATH = os.path.join(YARDSTICK_HOME, "proxy.pid")
 PROXY_PORT_PATH = os.path.join(YARDSTICK_HOME, "proxy.port")
 PROXY_LOG_PATH = os.path.join(YARDSTICK_HOME, "proxy.log")
+# Which backend (ys/proxy.py's "litellm" or ys/portkey_backend.py's
+# "portkey") the currently-running proxy is -- written by `ys proxy up`,
+# read by `ys start`/`ys end`/`ys proxy pull-logs` so they know which one
+# they're talking to without the caller having to say --backend again on
+# every subsequent command.
+PROXY_BACKEND_PATH = os.path.join(YARDSTICK_HOME, "proxy_backend.txt")
 EXPERIMENTS_DIR = os.path.join(YARDSTICK_HOME, "experiments")
 
 WEB_PID_PATH = os.path.join(YARDSTICK_HOME, "web.pid")
