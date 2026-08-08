@@ -69,7 +69,7 @@ class RunnerError(Exception):
     pass
 
 
-def build_agent_command(agent_name: str, prompt: str) -> list:
+def build_agent_command(agent_name: str, prompt: str, workdir: Optional[str] = None) -> list:
     """The exact non-interactive invocation for each supported coding tool
     -- the single place in the codebase that constructs one (see the module
     docstring for why, and the PR body for what's verified vs. not).
@@ -92,6 +92,18 @@ def build_agent_command(agent_name: str, prompt: str) -> list:
     if agent_name == "claude-code":
         return ["claude", "-p", prompt]
     if agent_name == "opencode":
+        # `--dir` is not redundant with the subprocess `cwd` the caller sets.
+        # opencode resolves its own project root rather than trusting the
+        # directory it was launched from, and was observed running every
+        # repeat against the directory `ys run` itself was invoked from --
+        # i.e. the user's real project -- while the per-repeat workspace
+        # clone sat untouched and scored FAIL for a file the agent had
+        # written somewhere else entirely. That is workspace isolation
+        # (feature 2) silently not holding for this agent, with the agent
+        # mutating a real checkout as the failure mode, so the workspace is
+        # passed explicitly here as well as via `cwd`.
+        if workdir:
+            return ["opencode", "run", "--dir", workdir, prompt]
         return ["opencode", "run", prompt]
     if agent_name == "codex-cli":
         return ["codex", "exec", prompt]
@@ -341,11 +353,25 @@ def _run_one_repeat(experiment, config_yaml, arm_id, task, agent_name, agent_env
                 error=err, manual_score=0, on_event=on_event,
             )
 
-    cmd = build_agent_command(agent_name, prompt)
+    cmd = build_agent_command(agent_name, prompt, workdir=ws.path if ws else None)
     on_event(RunEvent("info", f"repeat {repeat_num}: invoking {cmd[0]} ..."))
     env = dict(os.environ)
     env.update(agent_env)
     env["YS_RUN_ID"] = run_id
+    if ws:
+        # `cwd=` below sets the child's real working directory, but it does
+        # NOT update the inherited PWD environment variable -- that still
+        # points at wherever `ys run` itself was launched from. A shell would
+        # recompute PWD on startup and hide this; the agent CLIs are invoked
+        # directly, with no shell in between, so whatever they read wins.
+        # opencode reads PWD, which is why every repeat ran against the
+        # invoking project (the user's real checkout) while its per-repeat
+        # workspace clone sat untouched -- feature 2's isolation silently not
+        # holding, with an agent writing into a live repo as the failure mode.
+        # Keeping PWD consistent with cwd costs nothing for the agents that
+        # correctly use cwd, and is the difference between isolation and data
+        # loss for the ones that don't.
+        env["PWD"] = ws.path
 
     invocation_ok = True
     error = None

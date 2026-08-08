@@ -1,0 +1,123 @@
+experiment: opencode-gemini-vs-deepseek-01
+question: >
+  Driving opencode unattended (`ys run`) over the same task, how do Gemini
+  3.6 Flash and DeepSeek V4 Flash (via OpenRouter) compare on cost, tokens,
+  turns and tool-call efficiency? Both arms hold the agent (opencode), the
+  task, and the workspace fixed -- model is the only factor that varies.
+  Spends real API budget on both arms.
+
+task:
+  id: garys-gardens-onepager
+  # `ys run` invokes the agent non-interactively, so prompt_file is required
+  # (ys/runner.py preflights this before the first repeat starts).
+  prompt_file: experiments/opencode-gemini-vs-deepseek.prompt.md
+  # A greenfield task needs an empty workspace, not this repo: cloning
+  # `measure` would put the success_check script itself in front of the
+  # agent, letting it target the gate instead of the task. blank-web is a
+  # scaffold repo holding nothing but a .gitkeep, so each repeat starts from
+  # a genuinely empty tree -- and `repo` (rather than bare `workdir`) is the
+  # only mode that actually re-isolates between repeats.
+  repo: /home/allan/.yardstick/scaffolds/blank-web
+  ref: main
+  # Absolute path because cwd is the repeat's workspace, not this repo. See
+  # the script's header for what each clause gates on; the key property is
+  # that it fails on an untouched workspace, so an agent that does nothing
+  # scores failure rather than success.
+  success_check: "bash /home/allan/code/measure/experiments/opencode-gemini-vs-deepseek.check.sh"
+  # cleanup_workspace deletes each repeat's clone once it's scored, so the
+  # six generated sites would otherwise be unrecoverable. Copy each one out
+  # first, tagged by arm and timestamp. $YS_WORKDIR is how a teardown refers
+  # to the workspace without yardstick interpolating the path into this
+  # string (ys/workspace.py).
+  teardown: 'd="$HOME/garys-gardens-output/$(date +%Y%m%d-%H%M%S)-$$"; mkdir -p "$d"; cp -R "$YS_WORKDIR"/. "$d"/ && echo "preserved output in $d"'
+  timeout_s: 600
+
+factors:
+  agent: [opencode]
+  model: [gemini-3.6-flash, deepseek-v4-flash]
+
+# The `model` field's own `<provider>/<id>` prefix is what ys/proxy.py reads
+# to stay provider-agnostic -- `split("/", 1)[0]`, so OpenRouter's two-segment
+# ids (`openrouter/~deepseek/...`) parse correctly. Note the leading `~` is
+# genuinely part of OpenRouter's id for the `-latest` alias, not a typo.
+#
+# Both entries are declared explicitly rather than relying on the fallback
+# convention: `openrouter` is not in ys/proxy.py's _SIMPLE_API_KEY_ENV_VAR
+# map, so an undeclared `openrouter/...` factor value would register with no
+# api_key at all.
+#
+# Gemini is routed via OpenRouter rather than gemini/... direct. The direct
+# Gemini API key is on the free tier, whose quota for this model is 20
+# requests/day -- an agent run burns that in a single repeat, and the 429
+# arrives *mid-stream* (after content_block_start), so opencode receives a
+# truncated stream followed by an untyped {"error": ...} object and dies on a
+# zod "No matching discriminator" with no mention of quota anywhere. Same
+# model, same list price ($1.50/$7.50 per Mtok) via OpenRouter, and it has the
+# side benefit of putting both arms behind one gateway so the comparison isn't
+# confounded by provider-side differences.
+models:
+  gemini-3.6-flash:
+    model: openrouter/google/gemini-3.6-flash
+    api_key: os.environ/OPENROUTER_API_KEY
+  deepseek-v4-flash:
+    model: openrouter/~deepseek/deepseek-v4-flash-latest
+    api_key: os.environ/OPENROUTER_API_KEY
+
+# LiteLLM's cost map has an entry for gemini-3.6-flash but none for any
+# OpenRouter DeepSeek id -- `get_model_info` raises for
+# `openrouter/~deepseek/deepseek-v4-flash-latest`, which means response_cost
+# comes back 0.0 despite real token usage (finding 9 in IMPROVEMENTS.md).
+# ys/collector.py's _resolve_cost only falls back to these declared numbers
+# when LiteLLM's own cost is zero, so declaring both is safe: Gemini keeps
+# using LiteLLM's map ("litellm"), DeepSeek uses these ("declared").
+#
+# Figures below are OpenRouter's own published per-token prices for this
+# model (prompt 9e-8, completion 1.8e-7, input_cache_read 1.8e-8), converted
+# to USD per million tokens; Gemini's mirror LiteLLM's current map entry.
+# OpenRouter bills no separate cache-write price for this model.
+#
+# The DeepSeek entry is deliberately declared under TWO keys. ys/collector.py
+# looks pricing up by the *recorded* model string via resolve_model_key
+# (ys/experiment.py:9), which tries the exact string and then only the part
+# after the FIRST `/`. OpenRouter ids have two segments, so
+# `openrouter/~deepseek/deepseek-v4-flash-latest` reduces to
+# `~deepseek/deepseek-v4-flash-latest` and never matches a bare
+# `deepseek-v4-flash` key -- verified, not theorised. The factor-value key is
+# kept because that is the documented convention (and what anything keying off
+# `factors.model` expects); the two-segment key is what actually matches at
+# lookup time. Remove the duplicate if resolve_model_key ever learns to strip
+# provider prefixes beyond the first segment.
+pricing:
+  gemini-3.6-flash:
+    input_per_mtok: 1.50
+    output_per_mtok: 7.50
+    cache_read_per_mtok: 0.15
+  google/gemini-3.6-flash:
+    input_per_mtok: 1.50
+    output_per_mtok: 7.50
+    cache_read_per_mtok: 0.15
+  deepseek-v4-flash:
+    input_per_mtok: 0.09
+    output_per_mtok: 0.18
+    cache_read_per_mtok: 0.018
+  ~deepseek/deepseek-v4-flash-latest:
+    input_per_mtok: 0.09
+    output_per_mtok: 0.18
+    cache_read_per_mtok: 0.018
+
+arms:
+  - id: arm-gemini
+    factors: {agent: opencode, model: gemini-3.6-flash}
+    notes: "Gemini 3.6 Flash via the Gemini API"
+    baseline: true
+  - id: arm-deepseek
+    factors: {agent: opencode, model: deepseek-v4-flash}
+    notes: "DeepSeek V4 Flash (latest alias) via OpenRouter"
+
+repeats: 3
+
+metrics:
+  gate: task_success
+  primary: [cost_usd, billable_tokens, turns, wall_clock_s]
+  secondary: [tool_calls, redundant_tool_calls, tool_error_rate, cache_read_ratio, fixed_overhead_tokens, context_high_water, compaction_events]
+  derived: [cost_per_success, tokens_per_turn]

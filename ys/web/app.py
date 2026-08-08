@@ -19,6 +19,10 @@ from ys.web import store
 
 app = FastAPI(title="yardstick")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+# Share `ys compare`/`ys report`'s metric formatting rather than re-deriving it
+# in Jinja: the templates used a bare "%.4g", which printed six-figure token
+# counts as "1.024e+05". See ys/render.py's format_metric.
+templates.env.filters["metric"] = render.format_metric
 
 
 def _write_failed_message(e: Exception) -> str:

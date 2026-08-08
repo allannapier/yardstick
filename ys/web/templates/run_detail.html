@@ -34,7 +34,7 @@
     {% if metrics.get(key) is not none %}
     <div>
       <div class="muted">{{ key }}</div>
-      <div><strong>{{ "%.4g"|format(metrics[key]) if metrics[key] is number else metrics[key] }}</strong></div>
+      <div><strong>{{ metrics[key]|metric }}</strong></div>
     </div>
     {% endif %}
     {% endfor %}

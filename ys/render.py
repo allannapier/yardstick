@@ -293,14 +293,42 @@ def compare_experiment(cur, experiment: Experiment) -> Comparison:
 # ---------------------------------------------------------------------------
 
 
-def _fmt(value, spec: str = "") -> str:
+def format_metric(value, spec: str = "") -> str:
+    """Render one metric value for humans. The single place metric formatting
+    is defined, so `ys compare` (text), `ys report` (HTML) and the dashboard
+    can't drift apart -- they each used to reach for ".4g" independently.
+
+    ".4g" alone is wrong for this rig's count metrics: billable_tokens and
+    context_high_water routinely reach five and six figures, where "%.4g"
+    switches to scientific notation and prints a token count as "1.024e+05".
+    Counts are therefore grouped with thousands separators and no exponent,
+    while ratios and costs (cache_read_ratio, tool_error_rate, cost_usd --
+    all small and genuinely fractional) keep the 4-significant-digit form
+    that suits them. An explicit `spec` always wins, so existing callers
+    that ask for e.g. ".4f" on cost_per_success are unaffected.
+    """
     if value is None:
         return "-"
     if isinstance(value, bool):
         return "yes" if value else "no"
+    if spec:
+        return format(value, spec)
+    if isinstance(value, int):
+        return f"{value:,}"
     if isinstance(value, float):
-        return format(value, spec or ".4g")
+        # Integral values are counts (tokens, turns, tool calls, whole
+        # seconds); a trailing ".0" on them is noise, and the big ones need
+        # grouping rather than an exponent.
+        if value == int(value):
+            return f"{int(value):,}"
+        if abs(value) >= 10000:
+            return format(value, ",.0f")
+        return format(value, ".4g")
     return str(value)
+
+
+# Back-compat alias: `_fmt` is used throughout this module's own renderers.
+_fmt = format_metric
 
 
 def _delta_str(value: Optional[float], baseline: Optional[float]) -> str:

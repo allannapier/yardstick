@@ -330,6 +330,24 @@ def extract_record(kwargs: dict, response_obj, start_time, end_time) -> dict:
     usage = metadata.get("usage_object") or {}
 
     complete_input = (kwargs.get("additional_args") or {}).get("complete_input_dict") or {}
+    # Despite the name, complete_input_dict is not always a dict. On LiteLLM's
+    # Anthropic passthrough route (`/v1/messages` -- the one opencode and
+    # Claude Code both speak, as opposed to the OpenAI-shaped route this
+    # extractor was originally captured against) it arrives as the raw JSON
+    # request-body *string*. Calling .get() on it raised AttributeError inside
+    # the callback, which LiteLLM swallows per-request -- so every successful
+    # proxied opencode request was silently dropped instead of recorded, while
+    # the failing ones still landed via the error path. A measurement rig
+    # losing exactly the traffic it exists to measure is worse than a loud
+    # crash, hence: parse it, and treat anything still not a dict as absent
+    # rather than letting the shape blow up extraction again.
+    if isinstance(complete_input, (str, bytes)):
+        try:
+            complete_input = json.loads(complete_input)
+        except (ValueError, TypeError):
+            complete_input = {}
+    if not isinstance(complete_input, dict):
+        complete_input = {}
     system_text = complete_input.get("system") or kwargs.get("system") or ""
     if isinstance(system_text, list):
         system_text = " ".join(
