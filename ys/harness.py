@@ -412,6 +412,28 @@ def point(
         _deep_set(config, ["provider", "anthropic", "options", "apiKey"], api_key)
         if model:
             _deep_set(config, ["model"], f"anthropic/{model}")
+            # Setting `model` alone is not enough: opencode resolves model ids
+            # against its own registry (models.dev), and an arm's model_name is
+            # by definition not in it -- it's whatever the experiment called
+            # the entry `ys proxy up` registered. opencode then fails to
+            # resolve it and aborts with an opaque
+            # `UnknownError: Unexpected server error` *before* issuing any
+            # request, so nothing reaches the proxy at all. Declaring it under
+            # the provider's own `models` map is what makes an arbitrary
+            # proxied model_name resolvable.
+            _deep_set(config, ["provider", "anthropic", "models", model], {})
+            if pin_background:
+                # opencode's equivalent of Claude Code's
+                # ANTHROPIC_SMALL_FAST_MODEL (see _claude_code_env_vars): the
+                # model it sends title-generation/summarisation traffic to.
+                # Left unpinned it defaults to a Claude id the experiment never
+                # declared, which the proxy's `model_name: "*"` catch-all
+                # routes straight to the real Anthropic API -- off-arm traffic,
+                # billed outside the measurement and defeating a mock
+                # experiment entirely. Same trade-off finding 27 documents for
+                # claude-code: pinned background traffic inflates the arm's own
+                # cost/token totals, and that's still the safer default.
+                _deep_set(config, ["small_model"], f"anthropic/{model}")
 
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, "w") as f:

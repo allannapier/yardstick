@@ -1,0 +1,1 @@
+create a one page website for a gardening business called Gary's Gardens, Gary is a self employed gardener based in Bonnyrigg, Midlothian and covers the whole midlothian area. Create a seperate css file and keep the html page clean, use placeholder info if you don't have it for now and report back when page is loading and complete based on the info you have.

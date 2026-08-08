@@ -11,3 +11,8 @@ __pycache__/
 # Generated website artifacts from experiment task runs (e.g. joes-shears-*),
 # not source.
 output/
+
+# Claude Code local state: agent worktrees are full checkouts, never source.
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
